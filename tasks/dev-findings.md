@@ -2507,3 +2507,162 @@ const LIVING_DOCS = [
   - `win32` / `linux` 真仓库 → 同数（证明当前无平台相关注册）。
 
 - **建议归属**：独立任务（已完成）。
+
+---
+
+### DF-050 [open] 硬门会在**被检查的项目**里创建 `tasks/runs/`，第二次跑再报它违规
+
+- 发现于：2026-11-21 框架现状测绘（主线程复算）
+- 位置：`scripts/entry-symlink.test.mjs:38-46` 的 `makeTmp()` → `mkdirSync(join(ROOT,'tasks','runs'), {recursive:true})`；
+  经 `scripts/check-structure.mjs` 的 `checkTestCount()`（`:498`）→ `regression-count.mjs` 的 `probeScript()`（`:116`）
+- 证据（在 `/tmp/owport` 复现，一个只有 `scripts/` + `README.md` + `.git` 的外来项目）：
+  ```
+  跑门前：ls -d tasks        → No such file or directory
+  node scripts/check-structure.mjs → EXIT=1，59 项违规
+  跑门后：ls -d tasks        → tasks/runs/ 被创建（空）
+  再跑一次 → [tasks/runs] 私有路径未在 .gitignore 中排除，可能被误提交
+             [tasks/runs] 空目录不会被 git 跟踪，clone 后会消失
+  ```
+- **注意因果链的边界**：探针只 `import()` 模块、不执行 `test()` 体，所以**不是** `makeTmp` 直接触发。
+  成立的是更弱但同样致命的一条：门在别人项目里跑完会留下 `tasks/runs/`，而这个残留恰好触发自己的
+  `emptyDirs` 与 `privatePaths` 两条检查。触发点未定位到具体一行，**标为已验证现象、未定位机制**。
+- 影响：一个只读性质的检查工具修改了被检查方。在别人的项目里跑一次门，等于给那个项目留了一个红。
+- 建议归属：独立任务（与 DF-051 同批）
+
+### DF-051 [open] 硬门把「本仓库的文档长相」当成「任何项目的合格线」：54 / 59 条违规是这个
+
+- 发现于：2026-11-21 框架现状测绘（主线程复算）
+- 位置：`scripts/check-structure.mjs` 全文；25 条 `CHECKS`（`:2706-2732`）里 17 条无任何「规则怎么算」的配置键
+- 证据：`/tmp/owport` 实跑 59 条违规，其中 `grep -c "规定产物" = 54`。原文形如
+  `[tasks/dev-findings.md] 不存在 —— 它是本仓库的规定产物，缺了说明仓库结构已损坏`。
+  写死清单经 `check-config.mjs:51-106` 的 10 个键**无法表达**：两本台账路径（`:292`）、
+  `README.md` 那句中文能力边界（`:446-452`）、测试数 5 个取数点各自的**中文正则**（`:536-545`）、
+  `docs/{CHANGELOG,design,research,CAPABILITIES}.md`（`:1915,2278,2524,2562`）、
+  `install/start-watch.vbs.template`（`:2134`）。
+- 影响：`.untildone/checks.json` 只参数化到「目录名」，没到「什么算合格」。别人要么整份复制本仓文档，
+  要么把 13 条整体 `disabledChecks` —— 那时真正还剩判据的只有 `syntax/importable/emptyDirs/links` 四条，
+  而 `importable/unregisteredExports` 的探针表（`PROBE_ARGS` 646 条、`REGISTERED` 583 个名字）
+  还写死本仓 48 个模块的导出名。
+- 建议归属：独立任务（本轮不做，见给用户的结论）
+
+### DF-052 [open] 台账 50 条 finding 里，只有 4 条真的属于「框架表达力不足」
+
+- 发现于：2026-11-21 批判 Agent 归类 + 主线程复核
+- 证据：批判 Agent 逐条点名归类（A 框架表达力 4 / B 接线缺失 2 / C 实现 bug 24 / D 自检失真 8 / E 过程纪律 11），
+  复算脚本留在临时目录（`unclassified: none`）。A 类 4 条 = DF-043/044/045/046，**全部发现于 2026-11-21 同一天**。
+- **这条的正确读法是反过来的**：它不证明「框架方向错」，它证明「继续做框架」在台账里**没有支撑**——
+  占了 30.5% 行数的 E 类（编造数字、纪律靠人）是任何抽象层都拦不住的。
+- **已知偏差（批判 Agent 自己声明）**：A 类的分母是它自己定的判据，±3 条的摆动就等于整个论点的分量。
+  若把 DF-003/014/030 划进 A，则变成 7/49。
+- 建议归属：记录，供决策；不作为施工项
+
+### DF-053 [open] 文档里的「检查条数」写 23，实际 25，且没有任何检查在对账这个数
+
+- 发现于：2026-11-21 批判 Agent 点名 + 主线程复核
+- 位置：`README.md:68`（`- **结构硬门** —— 23 项检查…`）、`README.md:365`（`# 结构硬门：23 项检查，0 违规才绿`）；
+  另 `scripts/check-config.mjs:101` 与 `scripts/check-structure.mjs:2763` 的注释写「24 条」
+- 证据：
+  ```
+  grep -n "23 项" README.md README-EN.md CLAUDE.md docs/GUIDE.md   → 命中 2 处，均在 README.md
+  grep -n "24 条" scripts/check-config.mjs scripts/check-structure.mjs → 命中 2 处注释
+  node -e 读 check-config.mjs 的 CHECK_NAMES → 25   读 check-structure.mjs 的 CHECKS 表 → 25
+  grep -rn "23 项" scripts/*.mjs → 零命中（没有任何检查在核对这个数字）
+  ```
+- 影响：这道门有 `checkTestCount()` 专门防「文档里的测试数漂了」，却没有一条防「文档里的检查数漂了」，
+  而它自己是本仓最常被引用的自证。**这是本轮唯一一条「门在描述自己时就已过期」的实证。**
+- 建议归属：独立任务（小，可立刻做）
+
+### DF-054 [open] 守护进程静默死亡 22.6 小时，`--health` 报得准，但没人被通知到
+
+- 发现于：2026-11-21 批判 Agent 顺手跑 `--health` 发现；主线程复核
+- 位置：`scripts/watch.mjs`（3174 行，`grep -c "uncaughtException|unhandledRejection"` = 0，无全局兜底）；
+  `scripts/asked.mjs:257` 的 `readFileSync(filePath,'utf8')` 整文件读
+- 证据（主线程 2026-11-21 实测输出）：
+  ```
+  ✗ jobs   上次 22.6 小时前   周期 0 分钟（上限 1 分钟）
+  ✗ probe  上次 22.7 小时前   周期 5 分钟（上限 15 分钟）
+  ✗ proc   进程已退出（PID 24908 已不在）
+  判定：**没有在工作**。
+  ```
+  `runner.log` 末尾三段同源崩溃：`scan-failed project=…dsh-fcl-android-launcher: 扫描输出不是 JSON（exit=134）`，
+  栈顶是 V8 原生分配失败 → `readFileSync` → `asked.mjs:257 readRecords` → `watch.mjs:2444 runTick`。
+- **机制未定位**：批判 Agent 复算全量 `scanAll` 一次扫 977 份 transcript 成功（34s / heap 182MB / rss 393MB），
+  所以触发条件是某个瞬时组合，**不可稳定复现**，本条只作为「已发生一次的事故」登记。
+- 与既有条目的关系：`DF-028` 已记「死后自动重启，没做」（`:574`），本条是它再次发生的实例。
+- 影响：`--health` 能判准，但**没有任何东西把「不健康」送到人眼前**。判得准 = 没人知道。
+- 建议归属：独立任务
+
+### DF-055 [open] `verdictFor()` 硬编码 `truncated: false`，`classifyEvidence` 里那条分支成了死代码
+
+- 发现于：2026-11-21 红队 Agent 实测；主线程读码复核
+- 位置：`scripts/stop-verify-hook.mjs:431` `return classifyEvidence({ claim, evidence, truncated: false, records });`
+- 证据（主线程读码确认）：同一函数上游 `readBack` 的窗口是 8MB（`DEFAULT_BACKTRACK_MB=8`，`:75`），
+  而红队实测的 target transcript 是 149MB，台账记 `"transcriptTruncated": true, "transcriptBytesRead": 8388608`。
+  但 reason 里印出的是「**整个文件范围内**没有任何『测试运行』调用」。
+- 影响：只读了 5.6% 的文件却断言「整个文件范围内没有」。这不是精度问题，是**陈述失实**。
+  `classifyEvidence` 里 `truncated ? UNKNOWN : NO_EVIDENCE` 的分支因此永不执行。
+  `docs/research/2026-11-13-critique-stop-hook-product.md` 已由红队指出同类问题，**未修**。
+- 建议归属：独立任务（小修，可立刻做）
+
+### DF-056 [open] 台账里 `action:"block"` 有 8 条，真实项目真实拦截 0 次——`block` 字段会骗人
+
+- 发现于：2026-11-21 红队 Agent 声称；**主线程独立复算并修正了它的数字**
+- 证据（主线程复算 `tasks/runs/stop-hook` + `%LOCALAPPDATA%/Overwatch/stop-hook` 全部 376 条记录）：
+  ```
+  总记录 376
+  action=block 8
+    其中 mode:"off"（只观察、没拦）6 条：sim-c-stop / final-c / FINAL-c-stop / subperf×3
+    其中 mode:"block" + outcome:"blocked" 2 条：live-probe-2（合成）、106aa1ae-…（真 UUID）
+  106aa1ae-4070-4d81-97e0-ff057613dc0a 的 transcript 唯一命中位置：
+    …\AppData\Local\Temp\hook-e2e-sandboxes\PC3\proj\106aa1ae-….jsonl  ← e2e 沙箱，不是真实项目
+  → 真实项目、真实会话上的真实拦截 = 0
+  ```
+- **比红队给的数字更锋利的一层**：8 条 block 里 6 条是 `mode:"off"` 的观察记录，
+  把它们算成「拦截了」会凭空多出 6 倍。
+- 旁证（红队实测）：`stop-verify-hook.mjs` 对「UI 已经重做完成」放行（`all-claims-supported`），
+  对「全部测试通过，1626/1626」拦截。同一个会话、同一个门。
+- 影响：产品主张「一次做完」在「做没做完」这个维度上，实测拦截次数为 0。
+  它验的是「你说过要验证的话有没有验证过」，不是「你说做完了到底做没做完」。
+- 建议归属：**产品方向决策**，不是施工项
+
+### DF-057 [open] `Stop` hook 对「诚实地停下来」零杠杆：`no-checkable-claim` 占台账 40%
+
+- 发现于：2026-11-21 红队 Agent 实测
+- 证据：台账 376 条里 `no-checkable-claim` **131 条（34.8%）**、`unparsable-input` 214 条（56.9%）。
+  红队把真实收尾文本喂给 `decide()`：「代码**零改动**…round9 仍停在 HALTED_AT_WAVE1，等你定的方案喵」
+  → `action=allow, reason=no-checkable-claim`。
+- 影响：一个只惩罚「说做完了」的门，对「诚实地说还没做完、请你定方向」完全无效。
+  而用户经历的痛恰恰是后者（三轮问「还有哪些没做完」，代码零改动）。
+- **红队的自我限定**：它没能做反向抽样，「真失败率」没有基线，所以只能说「在这 3 个案例上没拦住」，
+  不能说「拦不住 X% 的失败」。这一条按该限定收录。
+- 建议归属：产品方向决策
+
+### DF-058 [open] 验证白名单靠**脚本名**判断，`exit 0` 的空脚本可骗过；空输出也算通过
+
+- 发现于：2026-11-21 红队 Agent 负向测试
+- 位置：`scripts/verify-claims.mjs` 的 `SCRIPT_VERIFY_NAME_WORDS`（含 lint/test/check/verify/validate 等词）与 `buildEvidenceIndex`
+- 证据（红队实测）：`check-nothing.mjs`（内容为空、立即 exit 0）+「三个 bug 都修好了」→ `allow, all-claims-supported`；
+  `cmd="node --test nonexistent-empty-dir/"` 输出为空 → `allow, all-claims-supported`。
+  `ok` 由**退出码**而非输出内容决定。
+- 影响：`docs/research/` 里已由红队点过同一个洞（「写个 exit 0 的空脚本就永远通过」），**至今未堵**。
+- 建议归属：独立任务
+
+### DF-059 [open] 台账状态的正则只认 `[a-z]+`：写 `[bogus-state]` 能整条逃过枚举检查
+
+- 发现于：2026-11-21 主线程对 `checkLedger` 做负向测试时发现
+- 位置：`scripts/check-structure.mjs:2082`（`text.split(/^### /m)` 后的 `head` 匹配）
+  与 `:2093`（`entries` 的 `matchAll`），两处正则都是 `\[([a-z]+)\]`
+- 证据（主线程实测两次）：
+  ```
+  写 ### DF-050 [bogus-state]  → ✓ 25 条全部通过，EXIT 0   ← 逃过
+  写 ### DF-050 [bogus]        → ✗ DF-050 的状态 "bogus" 不在枚举内   ← 拦住
+  两者只差一个连字符。
+  ```
+- 根因：`bogus-state` 里的 `-` 不满足 `[a-z]+`，`match` 返回 `null`，
+  `head` 分支 `continue`、`entries` 的 `matchAll` 也整条不命中 —— **非法状态因此连「非法」都算不上，
+  它变成了「不存在」**。而 `real.length` 仍有 50 条，`warn` 分支也不触发。全程无声。
+- 影响：题目本意是「非法状态必须报出来」，实际效果是「非法状态只要长得不像合法状态就免检」。
+  台账是「还有多少债」的唯一来源，状态字段是它的判据。
+- 正确修法方向：把枚举判定**前移**，先匹配 `^### (DF-\d{3}) \[([^\]]+)\]` 拿到任意方括号内容，
+  再判是否在枚举内；而不是先用窄正则筛、再判筛出来的东西。
+- 建议归属：独立任务（小修）
