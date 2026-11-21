@@ -2666,3 +2666,50 @@ const LIVING_DOCS = [
 - 正确修法方向：把枚举判定**前移**，先匹配 `^### (DF-\d{3}) \[([^\]]+)\]` 拿到任意方括号内容，
   再判是否在枚举内；而不是先用窄正则筛、再判筛出来的东西。
 - 建议归属：独立任务（小修）
+
+### DF-060 [open] 交付载荷里没有 `scripts/`，而 SKILL.md 有 14 处 `node scripts/*.mjs`
+
+- 发现于：2026-11-21 方案 Agent 实测；主线程复核
+- 位置：`scripts/build-payload.mjs` 的生成范围；`.claude/skills/oversight/SKILL.md`；`dist/payload/`
+- 证据（主线程实测）：
+  ```
+  find dist/payload -maxdepth 2
+    dist/payload/.claude-plugin/plugin.json
+    dist/payload/agents/oversight-*.md      ← 12 个
+    dist/payload/skills/oversight
+    dist/payload/payload-manifest.json
+  → 没有任何 scripts/
+
+  grep -c "node scripts/" .claude/skills/oversight/SKILL.md    → 14
+  grep -o "node scripts/[a-z-]*.mjs" … | sort -u               → 7 个：
+    asked / check-structure / claim-ledger / compose-agent-prompt /
+    scan-sessions / validate-run / watch
+  ```
+  方案 Agent 在 `D:\Projects\BlackBoxPro` 实测 `node scripts/watch.mjs --health` → `MODULE_NOT_FOUND`，exit 1；
+  SKILL 引用的 7 个脚本在该项目里 7/7 不存在。
+- **这是设计者自己写下的取舍，但只覆盖了一半**：`build-payload.mjs:35` 原文
+  「本生成器只产出 **agents + skills** 两段。hooks 故意不在载荷里……这就要求载荷把
+  **脚本及其 import 闭包**一起带走。」——同一段论证对 SKILL 里的 14 处命令**同样成立**，
+  但 SKILL 照常进了载荷。结果：交付出去的那份东西，说明书里 14 条命令全部 404。
+- 影响：这个「框架」只有在 `cwd=本仓库` 时才成立。别人 `--plugin-dir` 加载后拿到的角色说明里全是死命令。
+  这是比 DF-051（门在别人项目里报红）更前置的问题：**门还没跑，说明书已经失效了。**
+- 建议归属：独立任务（本轮登记，未修）
+
+### DF-061 [open] 加第二份 SKILL 对硬门不可见：`checkDocCommands` 只扫 `LIVING_DOCS`
+
+- 发现于：2026-11-21 方案 Agent 实测；主线程复核
+- 位置：`scripts/check-structure.mjs:2442` `checkDocCommands()` 的 `for (const relPath of LIVING_DOCS)`；
+  同理 `checkInboxWiring:2173` / `checkPromptWiring:2239` / `checkAgentReachability:2318` 都只读单个 `CFG.skillPath`
+- 证据（主线程在 `/tmp/wf2` 复现，仓库副本 + 新增 `.claude/skills/hotfix/SKILL.md`）：
+  ```
+  SKILL.md 内容含：node scripts/this-does-not-exist.mjs --bogus
+  node scripts/check-structure.mjs → 57 项违规（全是 DF-051 那些「规定产物」）
+  grep -c "this-does-not-exist" 违规输出 → 0        ← 那个不存在的脚本，零命中
+  ```
+  另据方案 Agent 实测（`/tmp/fwclone`）：新增角色若只被第二份 SKILL 派发，
+  会红在「这些角色定义了却从不被派发」，必须写 `dispatched-by: other` 才能过。
+- 影响：「框架 vs 工作流」的可检验判据是「加一份新工作流能不能被校验」。
+  实测答案是：**加了没人管，而且反而被罚**。角色已经改成扫目录发现（`70a4098`），入口还停在单文件。
+- 与 DF-051 的区别：DF-051 是「检查内容绑死本仓文档」，本条是「检查范围只认一个入口」。
+  前者让别人项目报红，后者让本仓自己加东西不被校验 —— 两个方向都漏。
+- 建议归属：独立任务（方案 A 的主体，未做）
