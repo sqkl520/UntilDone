@@ -27,6 +27,22 @@
  * 两个数之间差几条、为什么差，而差值是会变的——一个需要解释两遍的数字，最后会被
  * 读者当成噪音。数真实值只留一句话：「文档里那个数就是 `node --test` 报的那个数」。
  *
+ * ## 这个数是不是平台相关（2026-11-21 复核，结论：不是）
+ *
+ * 一度怀疑它平台相关，理由是仓库里有 `{ skip: process.platform !== 'win32' }` 这类用例。
+ * **那是误判**：`skip` 只影响**跑不跑**，不影响**注册不注册** —— 被 skip 的用例照样
+ * 在 import 时 `test()` 一次，所以照样进 `ℹ tests` 的总数，只是同时进 `ℹ skipped`。
+ * 实测：三条夹具（1 条无条件 + 1 条只在 win32 + 1 条只在非 win32）→ 探针数 **3**。
+ *
+ * 真正会引入平台相关性的只有**条件注册**（`if (process.platform === …) test(…)`，
+ * 或 `for` 的迭代集合依赖平台）。本仓当前**零处**。为了不让这条结论只靠「我扫了一遍」，
+ * `countRegisteredTests()` 支持把 `process.platform` 钉成任意值，`regression-count.test.mjs`
+ * 用它断言 `win32` 与 `linux` 两个平台注册出**同一个数** —— 真跑两次注册再比，不是静态猜。
+ * 将来谁写了条件注册，那条用例会先红，而不是等 CI 与本地对不上才发现。
+ *
+ * 实际的红来自另一件事：**加了一条测试却没改四份文档里的数字**（`979097c`）。
+ * 门报的是「文档 1905 vs 实跑 1906」，与平台无关 —— 本地和 CI 上这个数**都是 1906**。
+ *
  * ## 判据住在这里、不住在硬门里
  *
  * 与 `link-check.mjs` / `published-paths.mjs` 同一个理由：`check-structure.mjs` 是
@@ -93,9 +109,18 @@ export function nodeTestFiles(dir) {
 
 /** 子进程里跑的探针脚本。**逐行成串**（而不是写成文件、也不是一整段模板字符串）：
  *  它与取数逻辑同生共死，改的永远只有这一处；逐行还顺带避开了「模板字符串里
- *  再写反引号注释」这个坑 —— 它让本文件连续两次编译失败，而报错位置指向的是注释。 */
-function probeScript(dir) {
+ *  再写反引号注释」这个坑 —— 它让本文件连续两次编译失败，而报错位置指向的是注释。
+ *
+ *  @param {string} dir      测试目录
+ *  @param {string|null} platform  伪造 `process.platform`（null = 用真实平台） */
+function probeScript(dir, platform = null) {
+  const fakePlatform = platform === null ? [] : [
+    // **必须在任何测试文件 import 之前**：条件注册读的就是这个值。
+    // 这是「平台无关」这道门的取数手段 —— 真跑两次注册再比，不是静态猜。
+    `Object.defineProperty(process, "platform", { value: ${JSON.stringify(platform)}, configurable: true });`,
+  ];
   return [
+    ...fakePlatform,
     'import { mkdtempSync, rmSync } from "node:fs";',
     'import { tmpdir } from "node:os";',
     'import { join } from "node:path";',
@@ -187,10 +212,14 @@ function probeScript(dir) {
 /**
  * 数 `dir` 下所有 `*.test.mjs` **真实注册**的测试条数。
  *
+ * @param {string} dir
+ * @param {{ timeoutMs?: number, platform?: NodeJS.Platform|null }} [opts]
+ *        `platform` 非 null 时，探针在任何测试文件 import 之前把 `process.platform`
+ *        钉成该值。用途是**证明平台无关**：同一份源码在两个平台上注册出同一个数。
  * @returns {{ count: number, files: number, method: string, errors: Array<[string,string]> }
  *          | { error: string, detail?: string }}
  */
-export function countRegisteredTests(dir, { timeoutMs = 60000 } = {}) {
+export function countRegisteredTests(dir, { timeoutMs = 60000, platform = null } = {}) {
   // **目录不存在 ≠ 0 条测试。** 不先分开这两件事，探针会把「我什么都没找到」
   // 报成一个确定的 0，而调用方拿到 0 就静默放行 —— 那正是本缺陷的同一种形态。
   let st = null;
@@ -198,7 +227,7 @@ export function countRegisteredTests(dir, { timeoutMs = 60000 } = {}) {
   if (!st || !st.isDirectory()) {
     return { error: `测试目录不存在或不是目录：${dir}` };
   }
-  const r = spawnSync(process.execPath, ['--input-type=module', '-e', probeScript(dir)], {
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', probeScript(dir, platform)], {
     encoding: 'utf8',
     timeout: timeoutMs,
     cwd: dirname(dir),

@@ -128,8 +128,10 @@ function syncTestCount(dir) {
     ['CLAUDE.md', /全量回归测试（(\d+)\s*条/g],
     ['docs/GUIDE.md', /(\d+)\s*项全绿/g],
     ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/g],
-    // README 的徽章与正文各有一处，两个正则都覆盖
-    ['README.md', /regression%20tests-(\d+)%20passing/g],
+    // README 的徽章与正文各有一处，两个正则都覆盖。
+    // 徽章不带 `passing` 字样：本仓有 2 条按平台 skip 的用例，写 `passing` 会把
+    // 「注册 1908 条」说成「1908 条通过」，而 `ℹ pass` 少于它。
+    ['README.md', /regression%20tests-(\d+)/g],
   ];
   for (const [rel, re] of sites) {
     const p = join(dir, rel);

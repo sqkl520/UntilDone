@@ -153,6 +153,45 @@ throw new Error('模块顶层就炸了');
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
+// ── 2b. 平台无关性：skip 不影响注册、两个平台数出同一个数 ──────────────
+//
+// 2026-11-21 的一次 CI 红被归因成「`skip: process.platform !== 'win32'` 让真实注册数
+// 平台相关」。那个归因**是错的**，而它错得很有说服力 —— 本仓确实有 6 处按平台 skip 的
+// 用例。两条用例把这件事钉死，免得下一次又靠推理去判定。
+
+test('skip 只影响跑不跑，不影响注册数——被 skip 的用例照样进总数', () => {
+  const d = tmpRepo();
+  try {
+    const scripts = join(d, 'scripts');
+    mkdirSync(scripts, { recursive: true });
+    writeFileSync(join(scripts, 'plat.test.mjs'), [
+      "import { test } from 'node:test';",
+      "test('无条件的', () => {});",
+      "test('只在 win32', { skip: process.platform !== 'win32' }, () => {});",
+      "test('只在非 win32', { skip: process.platform === 'win32' }, () => {});",
+    ].join('\n'));
+    const r = countRegisteredTests(scripts);
+    // 三条都被注册：`node --test` 的 `ℹ tests` 同样是 3（其中 2 条进 `ℹ skipped`）。
+    assert.equal(r.count, 3,
+      `skip 不影响注册，应数到 3 条，实际 ${r.count}。`
+      + '若这里是 1 或 2，说明取数把 `skip` 当成「没注册」—— 那会让条数随平台变化');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('win32 与 linux 注册出同一个数——条件注册才会破坏这条，本仓当前没有', () => {
+  // 这条跑**真仓库**：它守的是「文档写一个数」这件事成立的前提。
+  // 将来谁写了 `if (process.platform === …) test(…)`，这里会先红，
+  // 而不是等 CI 与本地对不上、再被人归因成别的东西。
+  const win = countRegisteredTests(join(REPO, 'scripts'), { platform: 'win32' });
+  const linux = countRegisteredTests(join(REPO, 'scripts'), { platform: 'linux' });
+  assert.equal(win.error, undefined, `win32 取数失败：${JSON.stringify(win)}`);
+  assert.equal(linux.error, undefined, `linux 取数失败：${JSON.stringify(linux)}`);
+  assert.equal(win.count, linux.count,
+    `两个平台注册数不同（win32 ${win.count} / linux ${linux.count}）——`
+    + '仓里出现了平台相关的**条件注册**，而文档里只有一个数字。'
+    + '要么去掉条件注册（用 skip 代替），要么文档与硬门都得改口径');
+});
+
 // ── 3. 负向：加了测试却忘改文档 → 硬门红；改文档 → 那一条消失 ─────────
 
 /** 跑硬门真身。临时仓库根只放这一件事需要的东西（`scripts/` + `README.md`），

@@ -478,6 +478,17 @@ function checkCapabilityDisclosure() {
  *  只记账的替身再 import 每个测试文件，数它们**真的注册了几条**。这与 `node --test`
  *  的 `ℹ tests` 逐条相等，且不用真跑用例。
  *
+ *  ## 这个数平台相关吗（2026-11-21 复核：不相关）
+ *
+ *  一次 CI 红被归因成「`skip: process.platform !== 'win32'` 让真实注册数平台相关」。
+ *  那个归因是错的：`skip` 只决定**跑不跑**，被 skip 的用例照样在 import 时注册、
+ *  照样进 `ℹ tests` 总数。实测 CI（Ubuntu/Node 20）与本地（Windows/Node 26）报的
+ *  都是 **1906**；伪造 `process.platform` 逐个平台复数也全是 1906。
+ *  真正的成因是**加了一条测试没改四份文档**。
+ *
+ *  与代码同生的那条不变性断言在 `regression-count.test.mjs`（跨平台同数）；
+ *  本门在判红时把另一平台的实测数写进报错，免得下一次又被归因成平台差异。
+ *
  *  ## 代价（实测，不是估计）
  *
  *  结构门 3.1s → 3.8s（+0.7s，一次子进程；跑全量测试要 52s，所以不能那么做）。
@@ -517,29 +528,61 @@ function checkTestCount() {
 
   // 每份文档里「N 条回归测试」这一句的取数位置。只查**声明基线**的那一处，
   // 不查历史条目（CHANGELOG 与 research 里的旧数字是事实记录，不该被改）。
+  //
+  // 第三列 `required`：**声明了就必须对**，但没声明不报违规。
+  // 这个区分来自 DF-046（「6 个常量把本仓库的形状当成了判据」）：别人项目里没有徽章，
+  // 强制它「必须有一个」会在那个项目里造一条与本门目的无关的红。
+  // 前四处仍是必需的 —— 它们是本仓规定的自证位置，缺了等于没人再核这个数。
   const sites = [
-    ['README.md', /（(\d+)\s*条回归测试/],
-    ['CLAUDE.md', /全量回归测试（(\d+)\s*条/],
-    ['docs/GUIDE.md', /(\d+)\s*项全绿/],
-    ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/],
+    ['README.md', /（(\d+)\s*条回归测试/, true],
+    // README 的徽章是**第五处**，原先完全不在核对范围内 —— 只能靠人记得手改，
+    // 而它恰恰是访客最先看到的那个数。加进来之后它与其余四处同源（漂了会红），
+    // 但对没有徽章的项目不作要求。
+    ['README.md', /regression%20tests-(\d+)/, false],
+    ['CLAUDE.md', /全量回归测试（(\d+)\s*条/, true],
+    ['docs/GUIDE.md', /(\d+)\s*项全绿/, true],
+    ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/, true],
   ];
-  for (const [file, re] of sites) {
+
+  // **平台无关性**：这道门必须在任何 runner 上数出同一个数，否则「文档写一个数」
+  // 这件事就没法成立。2026-11-21 修 CI 红时的一度误判是「这个数平台相关」，理由是
+  // 仓库里有 `{ skip: process.platform !== 'win32' }` 的用例 —— 但 `skip` 只决定
+  // **跑不跑**，被 skip 的用例照样在 import 时注册一次，照样进总数（实测 3 条夹具
+  // 里 2 条被 skip，探针仍数 3）。真正会引入平台差异的只有**条件注册**，本仓当前零处。
+  //
+  // 这里**不在绿的路上复数**：本门会在 `dispatch-coverage.test.mjs` 的副本里跑很多次，
+  // 每次多一个子进程正是上一轮超时的来源。改成判红时才测 —— 红的那一刻多花约 1 秒，
+  // 换来的是报错里直接写着「另一个平台也是这个数」，读的人不必翻代码去猜是不是平台差异。
+  const otherPlatform = process.platform === 'win32' ? 'linux' : 'win32';
+  let crossPlatform = null;
+  const crossPlatformNote = () => {
+    if (crossPlatform === null) {
+      crossPlatform = countRegisteredTests(dir, { timeoutMs: 180000, platform: otherPlatform });
+    }
+    if (crossPlatform.error) return `；换成 ${otherPlatform} 平台复数失败（${crossPlatform.error}）`;
+    return crossPlatform.count === actual
+      ? `；换成 ${otherPlatform} 平台也是 ${crossPlatform.count} 条 → 与平台无关，是漏改文档`
+      : `；换成 ${otherPlatform} 平台是 ${crossPlatform.count} 条 → **两平台不同，存在平台相关的条件注册**`;
+  };
+
+  for (const [file, re, required] of sites) {
     const p = join(ROOT, file);
-    // 这四份是**规定了要声明测试数**的文件（sites 是手写清单）。
+    // 前四处是**规定了要声明测试数**的文件（sites 是手写清单）。
     // 缺了不是「它不声明」而是「它不该缺」—— 报违规，否则「四份都对上了」可以是
-    // 「三份不见了、一份对了」的同形表述。
+    // 「三份不见了、一份对了」的同形表述。第三列为 false 的那处（徽章）例外：
+    // 它在别的项目里不存在是正常的，只在「写了」的时候核对。
     if (!requirePath(p, file)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     const m = text.match(re);
     if (!m) {
-      fail(file, `找不到回归测试数声明（应形如「${actual} 条」）—— 删掉声明等于没人再核它`);
+      if (required) fail(file, `找不到回归测试数声明（应形如「${actual} 条」）—— 删掉声明等于没人再核它`);
       continue;
     }
     const claimed = Number(m[1]);
     if (claimed !== actual) {
-      fail(file, `回归测试数写的是 ${claimed}，实跑注册 ${actual} 条（${measured.files} 个文件）。`
-        + `改成 ${actual}，或先确认新加的测试真的被注册了`);
+      fail(file, `回归测试数写的是 ${claimed}，实跑注册 ${actual} 条（${measured.files} 个文件）`
+        + `${crossPlatformNote()}。改成 ${actual}，或先确认新加的测试真的被注册了`);
     }
   }
 }
