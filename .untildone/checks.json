@@ -1,0 +1,49 @@
+{
+  "publishedDirs": [
+    "docs",
+    "templates",
+    "rules",
+    "scripts",
+    "spec-adr"
+  ],
+  "privatePaths": [
+    "tasks/runs",
+    "local",
+    ".claude/settings.local.json",
+    "CLAUDE.local.md"
+  ],
+  "runsDir": "tasks/runs",
+  "gitignoreFatal": [
+    ".claude",
+    "rules",
+    "docs",
+    "templates",
+    "scripts",
+    "tasks"
+  ],
+  "livingDocs": [
+    "README.md",
+    "CLAUDE.md",
+    "docs/README.md",
+    "docs/GUIDE.md",
+    "docs/CAPABILITIES.md",
+    "docs/design/README.md",
+    "docs/research/README.md",
+    "docs/spec/state-model.md",
+    "docs/spec/dispatch-contract.md",
+    "docs/spec/evidence-discipline.md",
+    "docs/spec/relay-protocol.md",
+    "docs/spec/output-format.md",
+    "docs/spec/tui-visual.md",
+    "docs/adr/0001-config-only.md",
+    "docs/adr/0002-honest-degradation.md"
+  ],
+  "agentsDir": ".claude/agents",
+  "skillPath": ".claude/skills/oversight/SKILL.md",
+  "scriptsDir": "scripts",
+  "livingDocsScan": {
+    "include": [],
+    "exclude": []
+  },
+  "disabledChecks": []
+}

@@ -16,18 +16,93 @@ import { join, relative, extname, dirname, resolve } from 'node:path';
 import { publishedPathViolations, findKnownIdentifiers } from './published-paths.mjs';
 import { scanLinks, KIND_TEXT } from './link-check.mjs';
 import { discoverRoles, parseFrontmatter, readonlyOf } from './roles.mjs';
+import {
+  loadChecks, livingDocsGap, CONFIG_REL, CHECK_NAMES, DEFAULTS as CHECKS_DEFAULTS,
+} from './check-config.mjs';
+import { countRegisteredTests } from './regression-count.mjs';
 
 const ROOT = process.cwd();
 const violations = [];
 const warnings = [];
 
+/** 「本条没跑」的收集器。**必须与 violations / warnings 分开** ——
+ *  它既不是违规（缺的东西如果是可选的，仓库没坏），也不是提示（提示会淹没在
+ *  一堆「导出未登记」里）。 */
+const skipped = [];
+
 const fail = (file, msg) => violations.push({ file, msg });
 const warn = (file, msg) => warnings.push({ file, msg });
+
+/** 报「某条检查没跑」。这条记录会出现在输出末尾单独一节，**不会**被 `✓` 掩盖。 */
+const notRun = (check, why) => skipped.push({ check, why });
+
+/** 「这个产物是仓库的规定产物，缺了说明仓库坏了」。
+ *
+ *  ## 为什么需要这个函数（DF-047）
+ *
+ *  本文件历史上散着 30 处 `if (!existsSync(x)) return;`。它们的共同点是
+ *  **缺失即放行**：门打印 `✓ 结构检查全部通过` 而那条检查一个字都没查。
+ *  实测（2026-11-21）把 `checkChangelog()` 与 `checkLedger()` 两个 dispatch 调用
+ *  从运行块里删掉，硬门照样 `✓` + exit 0，1874 条回归测试全过 ——
+ *  **没有任何机制发现这两条检查被删了**。
+ *
+ *  修法不是把 `return` 一把改成 `fail`：那会让「用户还没有 docs/design/」这类
+ *  合法场景变红。语义被拆成两个名字，**调用方必须显式选一个**：
+ *
+ *    · `requirePath()` —— 这是本仓库的规定产物，缺了 `fail`；
+ *    · `optionalPath()` —— 缺了合法，但**必须在输出里留下「本轮没跑」**。
+ *
+ *  两个名字都是返回 boolean，调用方照旧写 `if (!requirePath(...)) return;`。
+ *  名字本身就是「缺了会怎样」的文档，读代码的人不用去猜。 */
+function requirePath(abs, label) {
+  if (existsSync(abs)) return true;
+  fail(label, '不存在 —— 它是本仓库的规定产物，缺了说明仓库结构已损坏（这条检查因此没跑）');
+  return false;
+}
+
+/** 「缺了是合法的（用户没建 / 可选能力），但**不许静默**」。
+ *
+ *  返回 false 时同时登记一条「本轮没跑」，于是读者的输出里会看到
+ *  `— 2 条检查未跑`，而不是误以为那一条也通过了。 */
+function optionalPath(abs, check, why) {
+  if (existsSync(abs)) return true;
+  notRun(check, why);
+  return false;
+}
+
+// ── 形状配置（`.untildone/checks.json`，可缺省）──────────────────────────
+//
+// 「哪些目录算可发布 / 哪些是私有 / 角色目录在哪」原先全是常量。那让本仓库以外
+// 的项目**跑一次就红一片**，而红的不是它们的问题（实测见
+// `tasks/dev-findings.md` DF-046）。这里改成：**没有配置文件 = 用默认值 = 本仓库现状**，
+// 所以本仓库一个字节都不用写；别人写一份就换掉形状。
+//
+// 配置本身非法时**不静默回落**：报违规、继续用默认值跑 —— 这样其余 23 条检查
+// 照样能报出别的错，而「配置坏了」这件事不会被一条无关的红盖住。
+const CHECKS_LOAD = loadChecks(ROOT);
+const CFG = CHECKS_LOAD.config;
+for (const e of CHECKS_LOAD.errors) {
+  fail(e.path ? `${CONFIG_REL}: ${e.path}` : CONFIG_REL, `配置非法：${e.msg}`);
+}
+// 只有当配置**改变了行为**时才打印一行：本仓库那份配置与默认值逐字相同，
+// 所以这一行在本仓不出现 —— 这是「本仓输出字节级不变」的一部分（可验证，不是承诺）。
+// 换掉形状的项目则一定看得见「配置在生效」，否则「我写了配置却没生效」无从分辨。
+//
+// 比较用**排序后的键**：`validateChecks()` 补默认值时按自己的遍历顺序塞键，
+// 与 `DEFAULTS` 的字面顺序不同（实测第一次写成直接 stringify，本仓因此多打一行）。
+const canon = (o) => JSON.stringify(o, (_k, v) => (
+  v && typeof v === 'object' && !Array.isArray(v)
+    ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, v[k]]))
+    : v));
+const cfgChanged = canon(CFG) !== canon(CHECKS_DEFAULTS);
+if (CHECKS_LOAD.source === 'file' && cfgChanged) {
+  console.log(`配置：${CHECKS_LOAD.path}（形状与默认值不同，以下检查按它执行）\n`);
+}
 
 // ── 规则定义 ──────────────────────────────────────────────────────────
 
 /** 可发布区：出现本机盘符即为违规（ADR-0001 §发布区零盘符） */
-const PUBLISHED_DIRS = ['docs', 'templates', 'rules', 'scripts', 'spec-adr'];
+const PUBLISHED_DIRS = CFG.publishedDirs;
 /** 根级文件同属可发布区。
  *
  *  `SECURITY.md` 曾不在这里 —— 它是**最该被扫的那一份**：安全披露文档天然会把
@@ -36,17 +111,27 @@ const PUBLISHED_DIRS = ['docs', 'templates', 'rules', 'scripts', 'spec-adr'];
  *
  *  修法不是「把 SECURITY.md 加进这个数组」，而是**根级 `.md` 一律自动纳入**：
  *  手写清单的失效方式是结构性的 —— 下一次有人加一份根级文档，它照样不在名单里，
- *  而门照样绿。这与 `checkTestCount()` 拒写死数字、选择数源码是同一个理由。
+ *  而门照样绿。这与 `checkTestCount()` 拒写死数字是同一个理由。
  *  这个数组只留「非 `.md` 但必须扫」的例外。 */
 const PUBLISHED_FILES_EXTRA = ['LICENSE'];
 /** 根级目录不扫（产物 / 依赖 / 私有台账），其余根级文件按扩展名决定。 */
 const ROOT_SCAN_SKIP = new Set(['node_modules', 'dist', 'tasks', 'local', '.git']);
 
 /** 私有区：允许出现本机路径，但必须被 .gitignore 排除 */
-const PRIVATE_PATHS = ['tasks/runs', 'local', '.claude/settings.local.json', 'CLAUDE.local.md'];
+const PRIVATE_PATHS = CFG.privatePaths;
 
 /** 允许出现盘符的文件（本机私有、运行时产物） */
-const PATH_EXEMPT = /^(scripts\/.*\.test\.mjs)$/;
+const PATH_EXEMPT = new RegExp(`^(${CFG.scriptsDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/.*\\.test\\.mjs)$`);
+
+/** 角色目录与脚本目录。**所有用到它们的地方都从这里取** —— 写死一处就等于没参数化：
+ *  `%TEMP%` 里那个项目把脚本放在 `src/`，写死 `join(ROOT,'scripts')` 的 6 处检查会
+ *  对着一个不存在的目录静默 `return`，门报绿而一个字都没查。 */
+const AGENTS_DIR = join(ROOT, CFG.agentsDir);
+const SCRIPTS_DIR = join(ROOT, CFG.scriptsDir);
+/** 报告里用的相对路径（`scripts/x.mjs` 这种），**所有报错文案都从这里取** ——
+ *  文案里写死的 `scripts/` 在别人的项目里是一条指向错地方的指示。 */
+const SCRIPTS_REL = CFG.scriptsDir;
+const AGENTS_REL = CFG.agentsDir;
 
 const AGENT_REQUIRED_FIELDS = ['name', 'description'];
 const WRITE_TOOLS = ['Edit', 'Write', 'NotebookEdit', 'Bash'];
@@ -54,6 +139,9 @@ const WRITE_TOOLS = ['Edit', 'Write', 'NotebookEdit', 'Bash'];
 // ── 工具函数 ──────────────────────────────────────────────────────────
 
 function walk(dir, out = []) {
+  // 遍历器本身不是检查：调用方**必须**先判「这个目录该不该存在」再调它。
+  // 留静默是因为它对「已确认存在的目录」是纯工具函数 —— 但正因如此，
+  // 用它之前不许用 `existsSync` 当守卫（那会把「不存在」变成空结果，与「目录是空的」同形）。
   if (!existsSync(dir)) return out;
   for (const entry of readdirSync(dir)) {
     if (entry === 'node_modules' || entry === '.git') continue;
@@ -83,6 +171,10 @@ const CLI_SCRIPTS = new Set(['check-structure.mjs', 'check-links.mjs', 'verify-b
 
 function isGitignored(path) {
   const gi = join(ROOT, '.gitignore');
+  // 返回 false = 「没有任何规则忽略它」。**这个默认值本身是一条判断**：
+  // `.gitignore` 缺失时，`checkGitignoreSanity()` 会 fail（它是规定产物），
+  // 所以这里不需要重复报错；但把「读不到规则」当成「没被忽略」是**保守方向**
+  // 的正确选择 —— 它会让 `checkPrivatePaths()` 更可能报红，而不是更不可能。
   if (!existsSync(gi)) return false;
   const lines = readFileSync(gi, 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
   return lines.some((rule) => {
@@ -134,7 +226,11 @@ function checkAbsolutePaths() {
   const targets = [];
 
   for (const d of PUBLISHED_DIRS) {
-    if (!existsSync(join(ROOT, d))) continue;
+    // 可发布区里的目录**不是每条都必须存在**：`rules/` 与 `spec-adr/` 是
+    // 从参考项目继承来的名字，本仓库从来没有过这两个目录（`ls` 实测）。它们是
+    // 「若存在就扫」的集合，不是「必须存在」的清单 —— 缺了不报违规，但也**不静默**：
+    // 记一条「本轮没扫它」，让读者知道覆盖面比名单窄。
+    if (!optionalPath(join(ROOT, d), `absolutePaths:${d}`, `可发布目录 ${d}/ 不存在，未扫`)) continue;
     targets.push(...walk(join(ROOT, d)));
   }
   // 根级文件：会随仓库发出去的那些，全部自动纳入（含 SECURITY.md / README-EN.md）。
@@ -150,12 +246,16 @@ function checkAbsolutePaths() {
     : readdirSync(ROOT).filter((f) => !ROOT_SCAN_SKIP.has(f) && !isGitignored(f));
   for (const f of [...PUBLISHED_FILES_EXTRA, ...rootFiles]) {
     const p = join(ROOT, f);
+    // 这一处的 `continue` **不是**静默短路：`f` 来自 git 的可发布清单，
+    // 名字出现在清单里而盘上不在，只可能是「已跟踪但被删且未提交」。
+    // 那种情况由 git 自己报，且它**不是本检查的判据**（本检查判的是泄漏）。
+    // `PUBLISHED_FILES_EXTRA`（`LICENSE`）同理：它是「若存在就必须扫」的例外名。
     if (!existsSync(p) || !statSync(p).isFile()) continue;
     if (!['.md', '.mjs', '.js', '.json', '.yml', '.yaml', '.txt'].includes(extname(f))) continue;
     targets.push(p);
   }
-  if (existsSync(join(ROOT, '.claude', 'agents'))) {
-    targets.push(...walk(join(ROOT, '.claude', 'agents')));
+  if (existsSync(AGENTS_DIR)) {
+    targets.push(...walk(AGENTS_DIR));
   }
 
   for (const file of targets) {
@@ -191,7 +291,9 @@ function checkAbsolutePaths() {
   // 搬到另一份。这一条由 `DF-039` 第二轮的实事故钉住。
   for (const f of ['tasks/dev-findings.md', 'tasks/accepted-deviations.md']) {
     const p = join(ROOT, f);
-    if (!existsSync(p)) continue;
+    // 两本台账是**本仓库的规定产物**（CLAUDE.md 目录归属表把它们列为可发布区）。
+    // 缺了不是「可跳过」，是「台账没了，纪律的载体也没了」—— 报违规。
+    if (!requirePath(p, f)) continue;
     let text;
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     for (const v of findKnownIdentifiers(text)) {
@@ -206,7 +308,10 @@ function checkAbsolutePaths() {
 function checkPrivatePaths() {
   for (const p of PRIVATE_PATHS) {
     const full = join(ROOT, p);
-    if (!existsSync(full)) continue;
+    // 私有路径**本来就可能不存在**：`local/`、`CLAUDE.local.md` 是「如果你建了它，
+    // 它必须被忽略」的规则，不是「你必须建它」。缺了合法 —— 但缺的每一条都要说出来，
+    // 否则「4 条私有路径全部合规」与「4 条里有 3 条根本不在盘上」在屏幕上同形。
+    if (!optionalPath(full, 'privatePaths', `私有路径 ${p} 不存在，跳过它的 gitignore 判定`)) continue;
     if (!isGitignored(p)) {
       fail(p, `私有路径未在 .gitignore 中排除，可能被误提交`);
     }
@@ -217,12 +322,15 @@ function checkPrivatePaths() {
 
 function checkGitignoreSanity() {
   const gi = join(ROOT, '.gitignore');
-  if (!existsSync(gi)) { fail('.gitignore', '缺失'); return; }
+  // `.gitignore` 缺失 = 仓库坏了（`git add -A` 会把本机私有物全提交）。
+  // 这一处**原本就是 fail**，保留其语义，只是改用统一的名字，让「缺了会红」
+  // 在调用点一眼可见，而不需要读函数体。
+  if (!requirePath(gi, '.gitignore')) return;
   const text = readFileSync(gi, 'utf8');
   const lines = text.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
 
   // 参考项目的 .gitignore 忽略 .claude/ rules/ tasks/ —— 对本仓库是致命的
-  const fatal = ['.claude', 'rules', 'docs', 'templates', 'scripts', 'tasks'];
+  const fatal = CFG.gitignoreFatal;
   for (const dir of fatal) {
     const offending = lines.find((l) => {
       const r = l.replace(/^\//, '').replace(/\/$/, '');
@@ -233,19 +341,26 @@ function checkGitignoreSanity() {
     }
   }
 
-  if (!lines.some((l) => l.includes('tasks/runs'))) {
-    fail('.gitignore', '未排除 tasks/runs/（运行台账可能含会话 ID）');
+  // 「台账必须被 gitignore 排除」这条同样要跟着配置走：写死 `tasks/runs` 时，
+  // 别人的项目会为**本仓库的台账目录**报红，而它自己真正的台账目录没人看。
+  if (!lines.some((l) => l.includes(CFG.runsDir))) {
+    fail('.gitignore', `未排除 ${CFG.runsDir}/（运行台账可能含会话 ID）`);
   }
 }
 
 // ── 检查 4：agent frontmatter ─────────────────────────────────────────
 
 function checkAgents() {
-  const dir = join(ROOT, '.claude', 'agents');
-  if (!existsSync(dir)) { warn('.claude/agents', '目录不存在（本轮允许，Phase B 之后必须有）'); return; }
+  const dir = AGENTS_DIR;
+  // 角色目录是**本仓库的规定产物**（12 份定义是被 git 跟踪的交付物）。
+  // 旧版的 `warn(...)` + `return` 是本文件里最典型的一次「静默短路」：
+  // 提示不阻塞，而提示出现在末尾那一节，读者扫一眼 `✓` 就走了。
+  // 更糟的是它写着「本轮允许」—— 那句话是历史遗留（Phase B 之前的临时状态），
+  // 现在它只会让「角色定义全部消失了」看起来像一条无害的提示。
+  if (!requirePath(dir, AGENTS_REL)) return;
 
   const files = readdirSync(dir).filter((f) => f.endsWith('.md'));
-  if (!files.length) fail('.claude/agents', '目录存在但没有任何 agent 定义');
+  if (!files.length) fail(AGENTS_REL, '目录存在但没有任何 agent 定义');
 
   for (const f of files) {
     const p = join(dir, f);
@@ -329,7 +444,9 @@ function checkEmptyDirs(dir = ROOT, depth = 0) {
 
 function checkCapabilityDisclosure() {
   const readme = join(ROOT, 'README.md');
-  if (!existsSync(readme)) { warn('README.md', '尚不存在'); return; }
+  // `README.md` 是本仓库的规定产物：它是唯一一条对外入口。
+  // 旧版 `warn('尚不存在')` 让这个门在「README 被删了」时仍然印 `✓`。
+  if (!requirePath(readme, 'README.md')) return;
   const text = readFileSync(readme, 'utf8');
   if (!/不能自动接力|无法自动接力|manual/.test(text)) {
     fail('README.md', '缺少能力边界声明（必须写明本库不能自动接力，见 ADR-0002 §4）');
@@ -342,20 +459,54 @@ function checkCapabilityDisclosure() {
  *  实测 793。四份文件四个值，而 CI 里那个 81 停在一年前的量级。
  *
  *  这不是笔误，是**同类缺陷的结构性复发**：只要数字是手写的，下一次加测试又会漂。
- *  所以这里不写死任何一个数字，而是**数源码**（`^\s*test(` 的条数）再与文档比对。
- *  文档里写错了硬门直接红 —— 那种红是好事：它把「改文档」变成一次必做的动作。
+ *  所以这里不写死任何一个数字，而是**取实测值**再与文档比对。写错了硬门直接红 ——
+ *  那种红是好事：它把「改文档」变成一次必做的动作。
  *
- *  为什么数源码而不是跑 `node --test`：硬门要能在一秒内跑完，且不能因为某条测试
- *  真的挂了就报「数字不对」。测试是不是全绿由 CI 的 Tests 那一步负责，两件事分开。 */
+ *  ## 口径换过一次：数源码 → 数真实注册（2026-11-21）
+ *
+ *  旧版数的是源码里 `^\s*test(` 的字面量。它守的是「文档与**源码字面量**一致」，
+ *  而文档声称的是「N 条回归测试」—— 两件事在有循环注册时不是一回事：
+ *
+ *      for (const cmd of ['scan', 'verify', 'tui', 'watch']) test(`ro 路由：${cmd} …`, …);
+ *
+ *  `overwatch.test.mjs:305` 就是这一行，一个 `test(` 字面量注册出 **4** 条测试。
+ *  于是旧门坚持 1873，而 `node --test scripts/` 报 1876：**这道门在逼文档写一个错的数**，
+ *  读者照着文档核对时会以为自己数错了。`count-equals-source` 这条原语当天就产出了
+ *  一句假话（红队原话）。
+ *
+ *  现在改成 `regression-count.mjs` 里的 `countRegisteredTests()`：把 `node:test` 换成一个
+ *  只记账的替身再 import 每个测试文件，数它们**真的注册了几条**。这与 `node --test`
+ *  的 `ℹ tests` 逐条相等，且不用真跑用例。
+ *
+ *  ## 代价（实测，不是估计）
+ *
+ *  结构门 3.1s → 3.8s（+0.7s，一次子进程；跑全量测试要 52s，所以不能那么做）。
+ *  `countRegisteredTests()` 自己的返回值里带 `errors`，**import 失败必须报红**：
+ *  一个 import 就炸的测试文件，全量测试里那几条根本不会出现，静默把它算成 0 条
+ *  会让这道门从「守数字」退化成「守一个更小的数字」。 */
 function checkTestCount() {
-  const dir = join(ROOT, 'scripts');
-  if (!existsSync(dir)) return;
-  let actual = 0;
-  for (const f of readdirSync(dir).filter((f) => f.endsWith('.test.mjs'))) {
-    let text = '';
-    try { text = readFileSync(join(dir, f), 'utf8'); } catch { continue; }
-    actual += (text.match(/^\s*test\(/gm) || []).length;
+  const dir = SCRIPTS_DIR;
+  // 脚本目录是规定产物：缺了说明仓库坏了，不是「没有可数的东西」。
+  // 旧版的 `return` 在这里有一个更尖锐的后果 —— 数不出条数时门会**照样绿**，
+  // 而「回归测试数对账」正是本仓库最常被引用的那一条自证。
+  if (!requirePath(dir, SCRIPTS_REL)) return;
+  // 超时给足：注册 48 个文件、1900+ 条测试是一次真实的全量 import，
+  // 在并发负载下（多个 agent 同时跑测试）实测会超过 60 秒的默认值。
+  // 超时的表现是「探针没有回话」，与「探针坏了」同形 —— 那会让人去修一个没坏的东西。
+  const measured = countRegisteredTests(dir, { timeoutMs: 180000 });
+  if (measured.error) {
+    // 「数不出来」不等于「数出来是 0」。旧版在这条路上 `return`（静默放行），
+    // 那正是最坏的失效方式：门绿了，而它什么都没核。
+    fail(SCRIPTS_REL + '/', `数不出回归测试条数：${measured.error}`
+      + (measured.detail ? `（${measured.detail}）` : ''));
+    return;
   }
+  if (measured.errors && measured.errors.length) {
+    for (const [f, msg] of measured.errors) {
+      fail(`${SCRIPTS_REL}/${f}`, `import 时就抛错，它的测试一条都不会被注册：${msg}`);
+    }
+  }
+  const actual = measured.count;
   if (!actual) return;
 
   // 每份文档里「N 条回归测试」这一句的取数位置。只查**声明基线**的那一处，
@@ -368,7 +519,10 @@ function checkTestCount() {
   ];
   for (const [file, re] of sites) {
     const p = join(ROOT, file);
-    if (!existsSync(p)) continue;
+    // 这四份是**规定了要声明测试数**的文件（sites 是手写清单）。
+    // 缺了不是「它不声明」而是「它不该缺」—— 报违规，否则「四份都对上了」可以是
+    // 「三份不见了、一份对了」的同形表述。
+    if (!requirePath(p, file)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     const m = text.match(re);
@@ -378,8 +532,8 @@ function checkTestCount() {
     }
     const claimed = Number(m[1]);
     if (claimed !== actual) {
-      fail(file, `回归测试数写的是 ${claimed}，源码实测 ${actual}。改成 ${actual}，`
-        + '或先确认新加的测试真的被注册了');
+      fail(file, `回归测试数写的是 ${claimed}，实跑注册 ${actual} 条（${measured.files} 个文件）。`
+        + `改成 ${actual}，或先确认新加的测试真的被注册了`);
     }
   }
 }
@@ -389,8 +543,9 @@ function checkTestCount() {
  *  曾把 `const WINDOW = ;` 写进 scan-sessions.mjs，整个文件不可解析，
  *  但 check-structure 照样返回「全部通过」。语法检查必须进硬门。 */
 function checkSyntax() {
-  const dir = join(ROOT, 'scripts');
-  if (!existsSync(dir)) return;
+  const dir = SCRIPTS_DIR;
+  // 缺了脚本目录，语法检查无从谈起 —— 报「仓库坏了」，不是静默通过。
+  if (!requirePath(dir, SCRIPTS_REL)) return;
   const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') || f.endsWith('.js'));
   if (!files.length) return;
 
@@ -406,7 +561,7 @@ function checkSyntax() {
     const lines = (r.stderr || '').split('\n');
     const fileLine = lines.find((l) => l.includes('scripts')) || '';
     const errLine = lines.find((l) => l.includes('Error')) || '语法错误';
-    fail(fileLine.trim() || 'scripts/', `无法被 Node 解析：${errLine.trim().slice(0, 140)}`);
+    fail(fileLine.trim() || SCRIPTS_REL + '/', `无法被 Node 解析：${errLine.trim().slice(0, 140)}`);
   }
 }
 
@@ -876,6 +1031,18 @@ const PROBE_ARGS = {
   planPayload: '[{"root": "/nonexistent-ow-probe"}]',
   checkPayload: '[{"root": "/nonexistent-ow-probe"}]',
   parseArgv: '[]',
+  // check-config.mjs（2026-11-21，6 个常量参数化）：判定层全是纯函数，参数取最小
+  // 可构造输入。三处读盘的一律用不存在的路径 —— 「什么都没有」是它们的正常分支，
+  // 正好顺带把空分支验一遍，且绝不碰真实项目。
+  //   · `loadChecks('/nonexistent-ow-probe')` → 没有配置文件 → 回落 DEFAULTS；
+  //   · `livingDocsGap` 喂空 scope → 立刻返回空差集，不遍历磁盘；
+  //   · `listMarkdown` / `scopedMarkdown` 用不存在的根 → 空数组。
+  // `normRel` / `validateChecks` / `DEFAULTS` / `CHECK_NAMES` 见参数表与数据登记。
+  loadChecks: '["/nonexistent-ow-probe", { env: {} }]',
+  validateChecks: '[{}]', normRel: '"a/b"',
+  livingDocsGap: '["/nonexistent-ow-probe", { include: [], exclude: [] }, []]',
+  listMarkdown: '["/nonexistent-ow-probe"]',
+  scopedMarkdown: '["/nonexistent-ow-probe", { include: [], exclude: [] }]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -913,6 +1080,12 @@ const SANDBOX_ARGS = {
   recordSkipped: '[{ hookId: "probe", key: "k", env: { OVERWATCH_HOOK_DEDUPE_DIR: _sandbox } }]',
   sweepIfCrowded: '[_sandbox]',
 
+  // 两个文件发现判据是**纯函数**（只读目录、不执行任何东西），给一个不存在的目录
+  // 必须安全返回 false / []。它们必须真被调用一次：`isNodeTestFile` 写窄了的
+  // 表现是「数不到」，而数不到不报错（实测：新模块叫 `test-count.mjs` 被 node
+  // 当成测试真执行了一次，只认 `*.test.mjs` 的判据对此一无所知）。
+  isNodeTestFile: '["x.mjs"]', nodeTestFiles: '["/nonexistent-ow-probe"]',
+
   // make-social-preview.mjs 的渲染层（2026-11-18）：把顶层副作用收进 main() 之后
   // 才可被调用。`renderPng` 只产字节、不写盘 —— 正好用来验「点了就炸」。
   renderPng: '[]',
@@ -944,8 +1117,9 @@ const CROSS_MODULE_SKIP = Object.freeze([
  *  性能：曾对每个文件起一个 node 进程（8 文件 × 1.5s ≈ 12s）。现在一个进程跑完，
  *  单文件失败不影响其他文件。 */
 function checkImportable() {
-  const dir = join(ROOT, 'scripts');
-  if (!existsSync(dir)) return;
+  const dir = SCRIPTS_DIR;
+  // 同上：import 探针的价值全在覆盖面上，目录缺了必须是红。
+  if (!requirePath(dir, SCRIPTS_REL)) return;
 
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));
@@ -1044,7 +1218,7 @@ function checkImportable() {
     } catch {
       detail = (String(r.stderr || '').trim().split('\n').find((l) => l.trim()) || '未知错误');
     }
-    fail('scripts/', `import 或调用导出函数时失败：${detail.slice(0, 220)}`);
+    fail(SCRIPTS_REL + '/', `import 或调用导出函数时失败：${detail.slice(0, 220)}`);
   }
 }
 
@@ -1073,8 +1247,8 @@ function checkLinks() {
  *  这里把它变成可见的提示，而不是静默跳过——不阻塞（有些导出本来就是有副作用的），
  *  但每次都会列出来，提醒去登记或确认它不需要登记。 */
 function checkUnregisteredExports() {
-  const dir = join(ROOT, 'scripts');
-  if (!existsSync(dir)) return;
+  const dir = SCRIPTS_DIR;
+  if (!requirePath(dir, SCRIPTS_REL)) return;
   const REGISTERED = new Set([
     'parseArgs', 'parseKeys', 'parseKeysWithRest', 'judgeState', 'noveltyOf',
     // stop-signals.mjs（判据与汇总）
@@ -1304,6 +1478,11 @@ function checkUnregisteredExports() {
     'readTail', 'eachRecord', 'toolUsesOf', 'gateReadPaths', 'gateReadsFromToolUse',
     'pathKey', 'idNamespace', 'agentToolUseIds', 'agentIdsFromResults',
     'sectionA', 'sectionB', 'sectionC', 'sectionD', 'format', 'main',
+    // check-config.mjs（2026-11-21）：五个函数已进 PROBE_ARGS 实际调用；
+    // 两个字符串常量与两张冻结表是**数据**，checkArgs 调不动它们。
+    // `DEFAULTS` 的正确性由「本仓自检」直接对账（`.untildone/checks.json` == DEFAULTS），
+    // 那比喂个空参数强得多 —— 它验的是内容，不是「调用不炸」。
+    'CONFIG_REL', 'CONFIG_ENV', 'CHECK_NAMES', 'DEFAULTS',
   ]);
   const INTENTIONALLY_PROBED_FREE = new Set([
     'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
@@ -1339,6 +1518,11 @@ function checkUnregisteredExports() {
     // build-payload.mjs：buildPayload 会 rmSync + writeFileSync（真写盘），不能进结构门；
     // 正确性由 build-payload.test.mjs 的生成 / 可复现 / 先清空 / 源坏一件不写 四条用例覆盖。
     'buildPayload',
+    // check-config.mjs（2026-11-21）：五个函数已进 PROBE_ARGS 实际调用；
+    // 两个字符串常量与两张冻结表是数据。`DEFAULTS` 的内容正确性由
+    // `check-config.test.mjs` 的「本仓自检」直接对账，那比「调用不炸」强得多。
+    'loadChecks', 'validateChecks', 'normRel', 'livingDocsGap', 'listMarkdown',
+    'scopedMarkdown', 'CONFIG_REL', 'CONFIG_ENV', 'CHECK_NAMES', 'DEFAULTS',
   ]);
   // measure-execution-phase.mjs 的纯函数：全部已进 PROBE_ARGS 实际调用，
   // 这里显式登记，免得被上面的「未登记导出」提示刷屏。
@@ -1612,6 +1796,18 @@ function checkUnregisteredExports() {
   // 已进 PROBE_ARGS 用空 env 真调一次。行为由 stop-verify-hook.test.mjs 的三条默认路径断言守。
   REGISTERED.add('ledgerRoot');
 
+  // regression-count.mjs（2026-11-21：「回归测试到底有多少条」的唯一取数处）。
+  // **刻意不进 PROBE_ARGS**：它自己会 spawn 一个 node 子进程去 import 全部测试文件
+  // （实测 1.0s）——让 `checkImportable` 再探一次，结构门就要多付一遍这个代价，
+  // 而它此刻**正在本门里被真调用**（见 `checkTestCount()`），那才是真实覆盖。
+  // 正确性由 `regression-count.test.mjs` 的红→绿用例守（含「循环注册要多算几条」）。
+  REGISTERED.add('countRegisteredTests');
+  // 两个文件发现判据是**纯函数**（只读目录、不执行任何东西），可以安全进 PROBE_ARGS：
+  // 给一个不存在的目录，它们必须返回 false / []，不抛。
+  // 它们必须真被调用一次：`isNodeTestFile` 写窄了的表现是「数不到」，而数不到不报错。
+  REGISTERED.add('isNodeTestFile');
+  REGISTERED.add('nodeTestFiles');
+
   const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));
   if (!files.length) return;
 
@@ -1632,7 +1828,7 @@ function checkUnregisteredExports() {
     // 现在的处置分两层：
     //   · 子进程非 0 退出 → **fail**（import 都炸了，这一项根本没有结论）；
     //   · 解析不出 JSON   → **fail** 并指名是哪个文件污染了 stdout（可修的那种）。
-    fail('scripts/', `导出清单扫描的子进程以 ${r.status} 退出：${String(r.stderr || '').trim().split('\n')[0] || '无输出'}`);
+    fail(SCRIPTS_REL + '/', `导出清单扫描的子进程以 ${r.status} 退出：${String(r.stderr || '').trim().split('\n')[0] || '无输出'}`);
     return;
   }
   let all;
@@ -1641,7 +1837,7 @@ function checkUnregisteredExports() {
   } catch {
     // 指名道姓：拿不到导出清单时，最可能的原因是某个模块 import 即执行。
     // 逐个 import 太慢（那是 40 个进程），所以只报现象 + 定位办法。
-    fail('scripts/', '导出清单不是合法 JSON —— 说明某个非测试脚本在**模块顶层**就往 stdout 打印了'
+    fail(SCRIPTS_REL + '/', '导出清单不是合法 JSON —— 说明某个非测试脚本在**模块顶层**就往 stdout 打印了'
       + '（import 即执行）。这类脚本必须加「我是不是被直接执行」的入口守卫，'
       + '否则每次跑本门都会把它们真的执行一遍（副作用 + 输出污染）。'
       + ` 实测 stdout 前 80 字：${JSON.stringify(String(r.stdout || '').slice(0, 80))}`);
@@ -1668,7 +1864,11 @@ function checkUnregisteredExports() {
  *  豁免：纯 CHANGELOG 自身的提交、以及 docs/runs 下的运行台账。 */
 function checkChangelog() {
   const f = join(ROOT, 'docs', 'CHANGELOG.md');
-  if (!existsSync(f)) return;
+  // CHANGELOG 是本仓库的规定产物（它是「哪些改动没记账」的唯一判据来源）。
+  // 这条曾是**决定性实验的直接对象**：把 `checkChangelog()` 从运行块里删掉，
+  // 门照样 `✓`。文件缺失时同理 —— 旧版这里是 `return`，于是「CHANGELOG 被删」
+  // 与「每个提交都记了账」在输出上完全同形。
+  if (!requirePath(f, 'docs/CHANGELOG.md')) return;
   let text;
   try { text = readFileSync(f, 'utf8'); } catch { return; }
 
@@ -1749,7 +1949,7 @@ function checkChangelog() {
  *  那是对的：门禁的价值在于「有人想开门时它拦得住」，不在于现在报什么。
  *  硬门里已经有同类先例（`checkLauncherPlacement` / `checkInboxWiring`）。 */
 function checkStopHookKillSwitch() {
-  const file = join(ROOT, 'scripts', 'stop-verify-hook.mjs');
+  const file = join(SCRIPTS_DIR, 'stop-verify-hook.mjs');
   let src;
   try { src = readFileSync(file, 'utf8'); } catch { return; }
 
@@ -1807,7 +2007,7 @@ function checkStopHookKillSwitch() {
     if (!src.includes(needle)) missing.push(label);
   }
   if (missing.length) {
-    fail('scripts/stop-verify-hook.mjs',
+    fail(`${SCRIPTS_REL}/stop-verify-hook.mjs`,
       `modeOf() 默认返回 'block'（闸门默认开启），但缺少用户叫停路径：\n      `
       + missing.join('\n      ')
       + '\n      一个默认开启的强拦不给叫停路径 = 把用户锁在会话里。见本函数上方注释。');
@@ -1881,27 +2081,26 @@ function checkLedger() {
  *
  *  这里把位置关系变成可执行的检查，而不是靠安装文档里的一句话。 */
 function checkLauncherPlacement() {
-  const installDir = join(ROOT, 'scripts', 'install');
+  const installDir = join(SCRIPTS_DIR, 'install');
   const tpl = join(installDir, 'start-watch.vbs.template');
   const out = join(installDir, 'start-watch.vbs');
-  if (!existsSync(tpl)) {
-    fail('scripts/install/start-watch.vbs.template', '缺少启动器模板——安装器将无物可渲染');
-    return;
-  }
+  const TPL_REL = `${SCRIPTS_REL}/install/start-watch.vbs.template`;
+  // 这一处本来就是 fail，改名字让语义在调用点可见。
+  if (!requirePath(tpl, TPL_REL)) return;
   let raw;
   try { raw = readFileSync(tpl, 'utf8'); } catch (e) {
-    fail('scripts/install/start-watch.vbs.template', `读不了模板：${e.message}`);
+    fail(TPL_REL, `读不了模板：${e.message}`);
     return;
   }
   for (const ph of ['__REPO__', '__STATE_DIR__']) {
     if (!raw.includes(ph)) {
-      fail('scripts/install/start-watch.vbs.template', `模板缺少占位符 ${ph}`);
+      fail(TPL_REL, `模板缺少占位符 ${ph}`);
     }
   }
   // 模板必须纯 ASCII：VBScript 按 ANSI 读，非 ASCII 会截断字符串字面量
   const bad = [...new Set([...raw].filter((ch) => ch.charCodeAt(0) > 127))];
   if (bad.length) {
-    fail('scripts/install/start-watch.vbs.template',
+    fail(TPL_REL,
       `模板含非 ASCII 字符 ${JSON.stringify(bad.join(''))}——VBScript 会误读并截断字符串`);
   }
   // 若产物已生成，它必须在仓库内（即不在数据目录）
@@ -1923,29 +2122,29 @@ function checkLauncherPlacement() {
  *  调度侧用 `--inbox` 读同一份。这条检查保证**接口不会再次悄悄断掉**——
  *  文档写了但没人调用，和没写是一样的。 */
 function checkInboxWiring() {
-  const skill = join(ROOT, '.claude', 'skills', 'oversight', 'SKILL.md');
+  const skill = join(ROOT, CFG.skillPath);
   if (existsSync(skill)) {
     let t = '';
     try { t = readFileSync(skill, 'utf8'); } catch { /* ignore */ }
     if (!t.includes('asked.mjs')) {
-      fail('.claude/skills/oversight/SKILL.md',
+      fail(CFG.skillPath,
         '调度入口没有引用 asked.mjs —— 宿主不报的「问了没答」会话会被完全漏掉');
     }
     if (!t.includes('validate-run.mjs')) {
-      fail('.claude/skills/oversight/SKILL.md',
+      fail(CFG.skillPath,
         '规划阶段没有引用 validate-run.mjs —— planner 的产物没人校验（硬约束 4/8）');
     }
     if (!t.includes('--health')) {
-      fail('.claude/skills/oversight/SKILL.md',
+      fail(CFG.skillPath,
         '调度入口没有引用 `watch.mjs --health` —— 无法区分「进程死了」和「进程卡住了」（DF-023）');
     }
     if (!t.includes('--inbox')) {
-      fail('.claude/skills/oversight/SKILL.md',
+      fail(CFG.skillPath,
         '调度入口没有引用 `watch.mjs --inbox` —— 后台发现又接不上了（DF-015）');
     }
   }
   // 至少一个 agent 必须知道收件箱存在，否则派出去的 agent 会各自重扫。
-  const agentDir = join(ROOT, '.claude', 'agents');
+  const agentDir = AGENTS_DIR;
   if (existsSync(agentDir)) {
     const files = readdirSync(agentDir).filter((f) => f.endsWith('.md'));
     const refs = files.filter((f) => {
@@ -1955,19 +2154,19 @@ function checkInboxWiring() {
       // 数字**不写死**：`12 个角色定义` 是收敛前的快照，加一个角色它就变成假话，
       // 而它是**报错文案里**的一句 —— 假话报错比不报还糟（读者会去数，然后不再相信这个门）。
       // 实际个数从刚数出来的 `files` 取。
-      fail('.claude/agents/', `${files.length} 个角色定义里没有一个引用 --inbox —— 监控与调度脱节（DF-015）`);
+      fail(`${AGENTS_REL}/`, `${files.length} 个角色定义里没有一个引用 --inbox —— 监控与调度脱节（DF-015）`);
     }
   }
   // 脚本侧必须真的实现了这个命令
-  const w = join(ROOT, 'scripts', 'watch.mjs');
+  const w = join(SCRIPTS_DIR, 'watch.mjs');
   if (existsSync(w)) {
     let t = '';
     try { t = readFileSync(w, 'utf8'); } catch { /* ignore */ }
     if (!t.includes("flags.has('--health')")) {
-      fail('scripts/watch.mjs', '脚本没有实现 --health，但文档在引用它');
+      fail(`${SCRIPTS_REL}/watch.mjs`, '脚本没有实现 --health，但文档在引用它');
     }
     if (!t.includes("flags.has('--inbox')")) {
-      fail('scripts/watch.mjs', '脚本没有实现 --inbox，但文档在引用它');
+      fail(`${SCRIPTS_REL}/watch.mjs`, '脚本没有实现 --inbox，但文档在引用它');
     }
   }
 }
@@ -1989,28 +2188,28 @@ function checkInboxWiring() {
  *  而 Gate 判断「有没有写进示例」对「参数存不存在」没有增量信息——
  *  `checkCapabilities()` 已经在守「文档里的参数必须被脚本支持」。 */
 function checkPromptWiring() {
-  const skill = join(ROOT, '.claude', 'skills', 'oversight', 'SKILL.md');
+  const skill = join(ROOT, CFG.skillPath);
   if (existsSync(skill)) {
     let t = '';
     try { t = readFileSync(skill, 'utf8'); } catch { /* ignore */ }
     if (!t.includes('compose-agent-prompt')) {
-      fail('.claude/skills/oversight/SKILL.md',
+      fail(CFG.skillPath,
         '派发阶段没有引用 compose-agent-prompt.mjs —— 提示词又回到手填，'
         + 'FORBIDDEN_CONTEXT 与 REQUIRED_ELEMENTS 两项检查在真实调用中永不生效（DF-042）');
     }
     if (!t.includes('--context-from')) {
-      fail('.claude/skills/oversight/SKILL.md',
+      fail(CFG.skillPath,
         '没有引用 --context-from —— 「给某个角色补材料」只剩 CLI 私下的路，'
         + '而 FORBIDDEN_CONTEXT 只有这一条入口会被喂到（DF-042）');
     }
   }
   // 文档承诺必须落在代码上：SKILL.md 说支持，脚本事得真有
-  const c = join(ROOT, 'scripts', 'compose-agent-prompt.mjs');
+  const c = join(SCRIPTS_DIR, 'compose-agent-prompt.mjs');
   if (existsSync(c)) {
     let t = '';
     try { t = readFileSync(c, 'utf8'); } catch { /* ignore */ }
     if (!t.includes("args['context-from']")) {
-      fail('scripts/compose-agent-prompt.mjs',
+      fail(`${SCRIPTS_REL}/compose-agent-prompt.mjs`,
         'SKILL.md 在教人用 --context-from，但脚本没有实现它');
     }
   }
@@ -2028,12 +2227,13 @@ function checkPromptWiring() {
  */
 function checkDesignIndex() {
   const dir = join(ROOT, 'docs', 'design');
-  if (!existsSync(dir)) return;
+  // design/ 是本仓库的规定产物（15 份设计稿被跟踪且发布）。缺了 = 仓库坏了。
+  // 旧版 `return` 的后果：整个 docs/design 被删掉时，门仍然 `✓` ——
+  // 而这条检查的全部意义就是「别让读者以为设计稿描述的是已实现能力」。
+  if (!requirePath(dir, 'docs/design')) return;
   const index = join(dir, 'README.md');
-  if (!existsSync(index)) {
-    fail('docs/design/README.md', '缺少设计存档索引——读者会以为这些文档描述的是已实现能力');
-    return;
-  }
+  // 索引是规定产物，缺了必须红（本来就是 fail，改名字让语义在调用点可见）。
+  if (!requirePath(index, 'docs/design/README.md')) return;
   let idx = '';
   try { idx = readFileSync(index, 'utf8'); } catch { /* ignore */ }
   if (!/未实现/.test(idx)) {
@@ -2048,7 +2248,8 @@ function checkDesignIndex() {
   // 入口必须指向索引：否则还是没人会点进去
   for (const entry of ['README.md', 'CLAUDE.md']) {
     const p = join(ROOT, entry);
-    if (!existsSync(p)) continue;
+    // 两份入口都是规定产物：缺了要报，而不是跳过「它有没有指向索引」。
+    if (!requirePath(p, entry)) continue;
     let t = '';
     try { t = readFileSync(p, 'utf8'); } catch { /* ignore */ }
     if (!t.includes('docs/design/README.md')) {
@@ -2066,9 +2267,15 @@ function checkDesignIndex() {
  *  检查：agents/ 下每个角色，至少要在 SKILL.md 里被提到一次。
  *  豁免：明确标注「由其他 agent 派生」的角色（目前没有，但留出口）。 */
 function checkAgentReachability() {
-  const agentDir = join(ROOT, '.claude', 'agents');
-  const skill = join(ROOT, '.claude', 'skills', 'oversight', 'SKILL.md');
-  if (!existsSync(agentDir) || !existsSync(skill)) return;
+  const agentDir = AGENTS_DIR;
+  const skill = join(ROOT, CFG.skillPath);
+  // 复合守卫**必须拆开**：合成一句的话，两个缺失原因的处置被混成一个。
+  //   角色目录缺失 = 仓库坏了（规定产物）→ fail
+  //   调度入口缺失 = 规定产物 → fail
+  // 旧版把两者一起 `return`，于是「12 个角色定义了却从不被派发」这条检查在
+  // 任何一处缺失时都静默消失。
+  if (!requirePath(agentDir, AGENTS_REL)) return;
+  if (!requirePath(skill, CFG.skillPath)) return;
   let sk = '';
   try { sk = readFileSync(skill, 'utf8'); } catch { return; }
   const files = readdirSync(agentDir).filter((f) => f.endsWith('.md'));
@@ -2082,7 +2289,7 @@ function checkAgentReachability() {
     if (!sk.includes(name)) orphans.push(name);
   }
   if (orphans.length) {
-    fail('.claude/skills/oversight/SKILL.md',
+    fail(CFG.skillPath,
       `这些角色定义了却从不被派发：${orphans.join(', ')} —— 定义里写得再对，没人调用等于不存在`);
   }
 }
@@ -2099,34 +2306,60 @@ function checkAgentReachability() {
  *  计划中的路径必须**在同一行**标 `待建` / `未实现` / `不实现` 之类。
  *  这个豁免不是后门：它逼作者在写下路径的当场就说清「这东西还不存在」，
  *  而不是让读者自己去 `ls` 验证。 */
-const LIVING_DOCS = [
-  'README.md',
-  'CLAUDE.md',
-  'docs/README.md',
-  'docs/GUIDE.md',
-  'docs/CAPABILITIES.md',
-  'docs/design/README.md',
-  'docs/research/README.md',
-  'docs/spec/state-model.md',
-  'docs/spec/dispatch-contract.md',
-  'docs/spec/evidence-discipline.md',
-  'docs/spec/relay-protocol.md',
-  'docs/spec/output-format.md',
-  'docs/spec/tui-visual.md',
-  'docs/adr/0001-config-only.md',
-  'docs/adr/0002-honest-degradation.md',
-];
+/** 活文档清单：路径判据 / 命令判据 / 常量判据三道都只扫这些文件。
+ *
+ *  ── 为什么它仍是手写清单（而不是「扫所有 `.md` 减排除」）─────────────
+ *
+ *  试过，会炸。实测本仓库 177 份 `.md`，把上面几道判据套到「所有 `.md`」，
+ *  当场多出 **100+ 条**：`docs/research/` 93 份里 29 份有命中（单份最多 25 条，
+ *  `2026-11-04-dsh-superagent-analysis.md` 分析的是**别的项目**的结构），
+ *  `docs/design/` 19 份里 5 份命中（`scripts/serve.mjs`、`templates/intent.example.md`
+ *  是设计稿里的**设想路径**）。那些是**事实记录**：改写它们等于篡改历史，
+ *  在行尾补「待建」则等于把「当时确实这么想过」改写成「当时就说了没实现」。
+ *
+ *  所以缺口的真形态不是「范围太小」，是**清单靠人维护**。补法有两个：
+ *    1. **可配置**：`livingDocs` 让别人的项目换掉这份清单；
+ *    2. **可对账**：`livingDocsScan.include` 一开，清单漏了 scope 里任何一份 `.md`
+ *       就红（`checkLivingDocsCoverage()`）。默认关，因为本仓开着当场就会红 ——
+ *       现有 15 条已经漏了 `SECURITY.md` / `README-EN.md` / 8 份 `docs/spec/*`。
+ *       那个缺口由 `check-config.test.mjs` 的快照守着：**新增未登记的活文档 → 测试红**。
+ *       严格性留在测试里，门的输出不动（本轮硬要求是本仓行为字节级不变）。
+ *
+ *  一句话：参数化解决「别人项目里误报」，覆盖检查解决「新增文档不被扫」。
+ *  后者不能靠扩大范围实现，只能靠「清单必须与磁盘一致」这个可判定的命题。 */
+const LIVING_DOCS = CFG.livingDocs;
+
+/** `node <脚本目录>/x.mjs --flag`。**脚本目录从配置取** —— 写死 `scripts/` 时，
+ *  脚本在别处的项目里这条正则一条也匹配不到，于是「文档里的命令必须能跑」恒真。
+ *
+ *  两份形态是必须的，不是冗余：`matchAll` 要 `/g`，而 `String.match` 带 `/g` 时
+ *  **只返回整段匹配、丢掉捕获组**（实测在这里炸过一次 `m[1] === undefined`）。
+ *  同一个源码字符串派生两份，改一处两边同步。 */
+const NODE_CMD_SRC = `node\\s+(${CFG.scriptsDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/[A-Za-z0-9_.-]+\\.mjs)([^\\n\`|)]*)`;
+const NODE_CMD_RE = new RegExp(NODE_CMD_SRC, 'g');
+const NODE_CMD_ONE = new RegExp(NODE_CMD_SRC);
 
 /** 允许出现「尚不存在」路径的行标记。命中即跳过。 */
 const PLANNED_MARK = /待建|未实现|不实现|实现时|计划新增|零行实现|尚未创建/;
 
-/** `scripts/x.mjs` / `templates/x.md` / `.claude/...` 这类仓库相对路径。 */
-const DOC_PATH_RE = /(?:^|[\s`(+'"|])((?:scripts|templates|tasks|\.claude|docs)\/[A-Za-z0-9_./-]+\.(?:mjs|md|json|ps1|vbs|template|yml))/g;
+/** `scripts/x.mjs` / `templates/x.md` / `.claude/...` 这类仓库相对路径。
+ *
+ *  前缀从配置拼：别人的项目脚本在 `src/` 时，写死 `scripts` 的这条正则一条都匹配
+ *  不到 —— 于是「文档里的路径必须存在」对那些项目**恒真**。 */
+const docPathPrefixes = [...new Set([
+  CFG.scriptsDir, 'templates', 'tasks', '.claude', 'docs',
+])].filter(Boolean).map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+const DOC_PATH_RE = new RegExp(
+  `(?:^|[\\s\`(+'"|])((?:${docPathPrefixes.join('|')})/[A-Za-z0-9_./-]+\\.(?:mjs|md|json|ps1|vbs|template|yml))`,
+  'g');
 
 function checkDocReferences() {
   for (const relPath of LIVING_DOCS) {
     const p = join(ROOT, relPath);
-    if (!existsSync(p)) continue;
+    // 活文档清单里每一份都是**规定产物**（README / CLAUDE / spec / adr / 索引）。
+    // 缺了必须报：旧版的 `continue` 让「删掉一份 spec」变成「它里面没有坏引用」——
+    // 这两件事在输出上逐字相同，而它们的含义完全相反。
+    if (!requirePath(p, relPath)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     text.split('\n').forEach((line, i) => {
@@ -2160,12 +2393,15 @@ function checkDocReferences() {
 function checkDocCommands() {
   for (const relPath of LIVING_DOCS) {
     const p = join(ROOT, relPath);
-    if (!existsSync(p)) continue;
+    // 活文档清单里每一份都是**规定产物**（README / CLAUDE / spec / adr / 索引）。
+    // 缺了必须报：旧版的 `continue` 让「删掉一份 spec」变成「它里面没有坏引用」——
+    // 这两件事在输出上逐字相同，而它们的含义完全相反。
+    if (!requirePath(p, relPath)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     text.split('\n').forEach((line, i) => {
       if (PLANNED_MARK.test(line)) return;
-      for (const m of line.matchAll(/node\s+(scripts\/[A-Za-z0-9_.-]+\.mjs)([^\n`|)]*)/g)) {
+      for (const m of line.matchAll(NODE_CMD_RE)) {
         const script = m[1];
         if (!existsSync(join(ROOT, script))) {
           fail(relPath, `第 ${i + 1} 行命令引用了不存在的脚本：${script}`);
@@ -2194,8 +2430,8 @@ function checkDocCommands() {
  *  语义歧义导致的误报会让人把整道门关掉，得不偿失。 */
 function checkDocConstants() {
   const consts = new Map();
-  const dir = join(ROOT, 'scripts');
-  if (!existsSync(dir)) return;
+  const dir = SCRIPTS_DIR;
+  if (!requirePath(dir, SCRIPTS_REL)) return;
   for (const f of readdirSync(dir).filter((x) => x.endsWith('.mjs') && !x.endsWith('.test.mjs'))) {
     let t = '';
     try { t = readFileSync(join(dir, f), 'utf8'); } catch { continue; }
@@ -2207,7 +2443,10 @@ function checkDocConstants() {
 
   for (const relPath of LIVING_DOCS) {
     const p = join(ROOT, relPath);
-    if (!existsSync(p)) continue;
+    // 活文档清单里每一份都是**规定产物**（README / CLAUDE / spec / adr / 索引）。
+    // 缺了必须报：旧版的 `continue` 让「删掉一份 spec」变成「它里面没有坏引用」——
+    // 这两件事在输出上逐字相同，而它们的含义完全相反。
+    if (!requirePath(p, relPath)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     text.split('\n').forEach((line, i) => {
@@ -2217,7 +2456,7 @@ function checkDocConstants() {
         const claimed = Number(m[2].replace(/_/g, ''));
         if (claimed !== c.value) {
           fail(relPath, `第 ${i + 1} 行写 ${m[1]} = ${claimed}，`
-            + `而 scripts/${c.file} 里是 ${c.value}`);
+            + `而 ${SCRIPTS_REL}/${c.file} 里是 ${c.value}`);
         }
       }
     });
@@ -2234,12 +2473,10 @@ function checkDocConstants() {
  *  「已推翻的结论仍被引用」这件事就会重新发生。 */
 function checkResearchIndex() {
   const dir = join(ROOT, 'docs', 'research');
-  if (!existsSync(dir)) return;
+  // research/ 同上：本仓库的规定产物，缺了报红而不是静默通过。
+  if (!requirePath(dir, 'docs/research')) return;
   const index = join(dir, 'README.md');
-  if (!existsSync(index)) {
-    fail('docs/research/README.md', '缺少研究索引——读者无法分辨哪些结论已被推翻');
-    return;
-  }
+  if (!requirePath(index, 'docs/research/README.md')) return;
   let idx = '';
   try { idx = readFileSync(index, 'utf8'); } catch { /* ignore */ }
   for (const marker of ['有效', '已推翻', '未验证']) {
@@ -2262,23 +2499,30 @@ function checkResearchIndex() {
  *  它不能证明「命令输出能支持这句声称」——那需要人读。但它能挡住最坏的一种：
  *  某条能力对应的脚本已经被删/改名，而 README 还在承诺。
  *
- *  同时要求 README 指向这份清单。理由同 design 索引：没有入口的清单等于没有。 */
+ *  同时要求 README 指向这份清单。理由同 design 索引：没有入口的清单等于没有。
+ *
+ *  `CAPABILITIES.md` 的落点是**固定的** `docs/CAPABILITIES.md`：它是本仓库的能力
+ *  清单，不是别人的。别人的项目里它不存在时这条会红 —— 那是「真正该报的」之一：
+ *  框架装进项目之后，「能做什么」需要一个可核对的清单。不想要就
+ *  `disabledChecks` 里关掉，开关会打印一行提示。
+ *
+ *  命令里的脚本目录从配置取（脚本在 `src/` 的项目同样成立）。 */
+const CAP_CMD_ROW_RE = new RegExp(
+  '`(node (' + CFG.scriptsDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/)[A-Za-z0-9_.-]+\\.mjs[^`]*)`');
 function checkCapabilities() {
   const doc = join(ROOT, 'docs', 'CAPABILITIES.md');
-  if (!existsSync(doc)) {
-    fail('docs/CAPABILITIES.md', '缺少能力清单——README 的能力声称将无法被核对');
-    return;
-  }
+  // 这一处本来就是 fail，改名字是为了让「缺了会红」在调用点可见。
+  if (!requirePath(doc, 'docs/CAPABILITIES.md')) return;
   let text = '';
   try { text = readFileSync(doc, 'utf8'); } catch { return; }
 
   let rows = 0;
   for (const line of text.split('\n')) {
     if (!line.startsWith('|')) continue;
-    const cmd = line.match(/`(node scripts\/[A-Za-z0-9_.-]+\.mjs[^`]*)`/);
+    const cmd = line.match(CAP_CMD_ROW_RE);
     if (!cmd) continue;
     rows++;
-    const m = cmd[1].match(/node\s+(scripts\/[A-Za-z0-9_.-]+\.mjs)([^\n`|)]*)/);
+    const m = cmd[1].match(NODE_CMD_ONE);
     if (!m) continue;
     if (!existsSync(join(ROOT, m[1]))) {
       fail('docs/CAPABILITIES.md', `能力清单引用了不存在的脚本：${m[1]}`);
@@ -2305,40 +2549,187 @@ function checkCapabilities() {
   }
 }
 
+// ── 检查 16：活文档清单必须与磁盘一致（可开可关）────────────────────────
+
+/** 手写清单的失效方式是结构性的：**新增一份活文档，它不在名单里，而门照样绿**。
+ *  `check-structure.mjs` 自己在 `checkAbsolutePaths()` / `checkLinks()` 两处都用
+ *  40 行论证过这件事，而 `LIVING_DOCS` 自己就是一张手写清单 —— 矛盾是真实的。
+ *
+ *  为什么不能改成「扫所有 `.md` 减排除」：见 `LIVING_DOCS` 上方的实测（100+ 条误报，
+ *  且那些是历史记录，不该被改写）。
+ *
+ *  能做的只有一条可判定的命题：**scope 里出现的每一份 `.md` 都必须在清单里**。
+ *  它不解决「range 太小」，但它把「清单漂了」从无人知晓变成一行红。
+ *
+ *  默认 `include: []` = 不开。本仓开着当场就会红（现有 15 条漏了 `SECURITY.md` 等），
+ *  而本轮硬要求是本仓行为字节级不变。缺口的规模由 `check-config.test.mjs` 钉住。 */
+function checkLivingDocsCoverage() {
+  const scope = CFG.livingDocsScan || { include: [], exclude: [] };
+  if (!Array.isArray(scope.include) || !scope.include.length) return;
+  const gap = livingDocsGap(ROOT, scope, LIVING_DOCS);
+  for (const f of gap.unregistered) {
+    fail(f, '在 livingDocsScan 的范围内，但不在 livingDocs 清单里 —— '
+      + '这道门不会扫它。要么登记进清单（`.untildone/checks.json` 的 livingDocs），'
+      + '要么把该目录排除（livingDocsScan.exclude）');
+  }
+  for (const f of gap.missing) {
+    fail(f, 'livingDocs 清单里有这份文件，磁盘上却没有 —— 清单已漂；删掉该项或补上文件');
+  }
+}
+
+/** 元检查：**CHECKS 表里的每一条都必须真的被调用**（DF-047）。
+ *
+ *  ## 它守的是什么
+ *
+ *  决定性实验（2026-11-21）：把 `checkChangelog()` 与 `checkLedger()` 两个 dispatch
+ *  调用从运行块里删掉，硬门照样 `✓ 结构检查全部通过` + exit 0，1874 条回归测试全过。
+ *  **没有任何机制发现这两条检查被删了。**
+ *
+ *  这是本仓库最稳定的失效模式的一个特例：`CHECKS` 是一张**手写清单**，而「清单上
+ *  有它」与「它真的跑了」是两件事。手写清单的失效方式是结构性的 —— 这一条不是靠
+ *  「小心点」，而是靠一次机械比对把它变成红。
+ *
+ *  ## 为什么不直接断言「文本里出现 fn();」
+ *
+ *  那种判据会被注释、被同名字符串、被 `// checkLedger();` 命中 —— 本文件已经吃过
+ *  这类判据的亏（`checkStopHookKillSwitch()` 的头注释里记着：`src.includes('X(')`
+ *  连**定义行**自己都会命中）。
+ *
+ *  这里改为**运行时记账**：运行循环每调用一条就往 `ran` 里记一项，跑完与 `CHECKS`
+ *  逐个对账。删掉一条 dispatch，它就不在 `ran` 里，这条立刻红。
+ *  记账是运行期的观测，不是文本猜测 —— 它无法被注释骗过。
+ *
+ *  @param {string[]} ran 本轮真实执行过的检查名
+ *  @returns {void} */
+function checkDispatchCoverage(ran) {
+  const declared = CHECKS.map(([name]) => name);
+  const ranSet = new Set(ran);
+
+  // ## 为什么必须锚在 `CHECK_NAMES` 上，而不是只对 `CHECKS` 自己
+  //
+  // 第一版只做 `CHECKS` ↔ `ran` 的比对，负向测试立刻暴露了它的漏洞：
+  // **删掉 `CHECKS` 表里的一整行**（`['ledger', checkLedger],`）时，`declared` 也
+  // 跟着少一项，两边仍然一致 —— 门照绿。那正是决定性实验的原样：
+  // 拿掉一条检查，没有任何机制发现。
+  //
+  // `CHECK_NAMES` 在 `scripts/check-config.mjs` 里，是**配置的对外契约**
+  // （`disabledChecks` 的合法取值）。它是独立的一份真源，删 `CHECKS` 的行不会
+  // 同时删它。两份对不上 = 有人绕过了一次登记。这才是可判定的锚点。
+  const contract = CHECK_NAMES;
+  const contractSet = new Set(contract);
+
+  const droppedFromTable = contract.filter((n) => !declared.includes(n));
+  if (droppedFromTable.length) {
+    fail('scripts/check-structure.mjs',
+      `CHECK_NAMES 里有 ${droppedFromTable.length} 条检查在 CHECKS 表里找不到：`
+      + `${droppedFromTable.join(', ')} —— 它们既不会运行，也无法被 disabledChecks 表达。`
+      + `删掉一条检查必须同时改两处，只改一处会红在这里。`);
+  }
+  const unknownInTable = declared.filter((n) => !contractSet.has(n));
+  if (unknownInTable.length) {
+    fail('scripts/check-structure.mjs',
+      `CHECKS 表里有 ${unknownInTable.length} 条不在 CHECK_NAMES 里：${unknownInTable.join(', ')} ——`
+      + '用户在配置里写不出它的名字，等于无法关闭');
+  }
+
+  // 关掉的检查是**声明过的跳过**，不算「漏跑」—— 但它已经在别处被 warning 列出。
+  const dis = new Set(CFG.disabledChecks || []);
+  const missing = declared.filter((n) => !ranSet.has(n) && !dis.has(n));
+  if (missing.length) {
+    fail('scripts/check-structure.mjs',
+      `CHECKS 表里有 ${missing.length} 条检查本轮从未被调用：${missing.join(', ')} —— `
+      + '门会把它当成「通过」。这正是 DF-047 的决定性实验：删掉 dispatch 后门照绿。');
+  }
+
+  // 反向：跑了但登记表里没有 —— 说明有人加了调用却没登记，它不会被 disabledChecks 关掉，
+  // 也不会出现在「N 条检查」的计数里。同样是一种「不可见」。
+  const unregistered = ran.filter((n) => !declared.includes(n));
+  if (unregistered.length) {
+    fail('scripts/check-structure.mjs',
+      `运行了但不在 CHECKS 表里：${unregistered.join(', ')} —— 它无法被配置关闭，也不计入总数`);
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
+
+/** 检查名 → 实现。**名字是配置里 `disabledChecks` 的取值**，所以它是一份对外契约：
+ *  改名等于让用户的配置静默失效（`validateChecks()` 会报未知名，但那是在他们升级之后）。 */
+const CHECKS = [
+  ['absolutePaths', checkAbsolutePaths],
+  ['privatePaths', checkPrivatePaths],
+  ['gitignoreSanity', checkGitignoreSanity],
+  ['agents', checkAgents],
+  ['emptyDirs', () => checkEmptyDirs()],
+  ['capabilityDisclosure', checkCapabilityDisclosure],
+  ['testCount', checkTestCount],
+  ['syntax', checkSyntax],
+  ['importable', checkImportable],
+  ['unregisteredExports', checkUnregisteredExports],
+  ['links', checkLinks],
+  ['changelog', checkChangelog],
+  ['stopHookKillSwitch', checkStopHookKillSwitch],
+  ['ledger', checkLedger],
+  ['launcherPlacement', checkLauncherPlacement],
+  ['inboxWiring', checkInboxWiring],
+  ['promptWiring', checkPromptWiring],
+  ['designIndex', checkDesignIndex],
+  ['agentReachability', checkAgentReachability],
+  ['docReferences', checkDocReferences],
+  ['docCommands', checkDocCommands],
+  ['docConstants', checkDocConstants],
+  ['researchIndex', checkResearchIndex],
+  ['capabilities', checkCapabilities],
+  ['livingDocsCoverage', checkLivingDocsCoverage],
+];
 
 console.log('check-structure · 仓库结构硬门\n');
 
-checkAbsolutePaths();
-checkPrivatePaths();
-checkGitignoreSanity();
-checkAgents();
-checkEmptyDirs();
-checkCapabilityDisclosure();
-checkTestCount();
-checkSyntax();
-checkImportable();
-checkUnregisteredExports();
-checkLinks();
-checkChangelog();
-checkStopHookKillSwitch();
-checkLedger();
-checkLauncherPlacement();
-checkInboxWiring();
-checkPromptWiring();
-checkDesignIndex();
-checkAgentReachability();
-checkDocReferences();
-checkDocCommands();
-checkDocConstants();
-checkResearchIndex();
-checkCapabilities();
+const disabled = new Set(CFG.disabledChecks || []);
+/** 本轮**真的调用过**的检查名。元检查拿它与 `CHECKS` 表对账 —— 见
+ *  `checkDispatchCoverage()` 的头注释（DF-047）。 */
+const ran = [];
+for (const [name, fn] of CHECKS) {
+  if (disabled.has(name)) continue;
+  fn();
+  // **记账在调用之后**。写在前面的话，「登记了但被 `continue` 掉」也会被记成跑过 ——
+  // 那正是这条元检查要抓的形态。顺序本身就是判据的一部分。
+  ran.push(name);
+}
+// 元检查必须**最后跑**：它要对着完整的 `ran` 对账。
+checkDispatchCoverage(ran);
+
+// 关掉的检查必须**每次都出现在屏幕上**：静默关掉等于把「检查通过」偷偷换成「没检查」，
+// 而这句话是这道门唯一的价值。提示不阻塞（这是用户的合法选择），但不可能不被看见。
+for (const name of disabled) {
+  warn(CONFIG_REL, `检查 "${name}" 已被 disabledChecks 关闭 —— 本轮没有执行它`);
+}
+
+// ── 输出 ────────────────────────────────────────────────────────────
+//
+// **「没跑」与「通过」必须在输出上不同形**（DF-047）。旧版只有两种结尾：
+// `✓ 结构检查全部通过` 或 `✗ N 项违规`。而「某条检查因为文件不存在而提前
+// `return`」两种都不是 —— 它落进第一种，读者无从分辨。
+//
+// 现在 `✓` 那一行走的是**核实过覆盖面之后**的措辞：跑了几条、其中几条没跑完，
+// 都印在同一行里。`✓ 全部通过` 只在「24 条全跑、且没有一条报未跑」时出现。
+const skippedUniq = [...new Map(skipped.map((s) => [s.check + '\u0000' + s.why, s])).values()];
+const covered = ran.length;
+const notRunChecks = new Set(skippedUniq.map((s) => s.check));
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);
   for (const v of violations) console.log(`  [${v.file}] ${v.msg}`);
+} else if (skippedUniq.length) {
+  // 有未跑项时**不许**印「全部通过」—— 那正是本缺陷的原始形态。
+  console.log(`✓ 已执行的 ${covered} 条检查全部通过`
+    + `（其中 ${notRunChecks.size} 条只跑了一部分：另有 ${skippedUniq.length} 处因目标不存在而未覆盖）`);
 } else {
-  console.log('✓ 结构检查全部通过');
+  console.log(`✓ 结构检查全部通过（${covered} 条全部执行完毕，无跳过）`);
+}
+
+if (skippedUniq.length) {
+  console.log(`\n— ${skippedUniq.length} 处未跑（不阻塞，但**不计入「通过」**）：`);
+  for (const s of skippedUniq) console.log(`  [${s.check}] ${s.why}`);
 }
 
 if (warnings.length) {

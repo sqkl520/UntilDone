@@ -21,6 +21,236 @@
 
 ---
 
+## [Unreleased] - 2026-11-21 测试数硬门改数真实注册：文档不再被逼写一个错的数（DF-048）
+
+`check-structure.mjs` 的 `checkTestCount()` 数的是源码里 `^\s*test\(` 的字面量。
+2026-11-21 实测：字面量 1873，`node --test scripts/` 报 `ℹ tests 1876` ——
+**这道门在逼四份文档写一个错的数**。差的 3 条来自 `overwatch.test.mjs:305` 的
+`for` 循环：一个 `test(` 字面量注册出 4 条测试。
+
+### Fixed
+
+1. **取数口径改成「数真实注册」**。新增 `scripts/regression-count.mjs`：
+   用 `module.registerHooks()` 把 `node:test` 换成一个只记账的替身，再 import 每个测试文件。
+   `test()` 在 import 时就执行（回调不执行），所以数出来的是真实注册条数，
+   与 `ℹ tests` 逐条相等。老 Node（< 22.15）走 `module.register()` 的 loader 路径，两条都实测过。
+   判据搬出硬门，理由与 `link-check.mjs` / `published-paths.mjs` 相同：
+   `check-structure.mjs` 是 `CLI_SCRIPTS` 成员，判据写在里面就没法单测。
+
+2. **代价如实记**：硬门多一次子进程，计数本身 0.9–1.7 秒（48 个测试文件、并行 import）。
+   测量时机器上有并发任务（11–15 个 node 进程），五次交错对拍的中位数差约 1.2 秒。
+   没有选「保留源码计数、文档里写两个数」：那要让读者记住两个数差几条、为什么差，
+   而差值是会变的 —— 一个需要脚注解释的数字，最后会被当成噪音。
+
+3. **「数不出来」不再等于「0 条」**。旧实现在读不到文件时 `return`（静默放行）；
+   现在目录不存在、探针没回话、某个测试文件 import 就抛，三种都报红。
+   一个 import 就炸的测试文件，它的用例在全量跑里根本不会出现 —— 静默算成 0 条
+   会让这道门退化成「守一个更小的数字」。
+
+4. **顺带修掉同一类缺陷的第二个面**：新模块最初叫 `test-count.mjs`，
+   而 `test-*.mjs` 是 `node --test` 的测试文件模式 —— 全量跑时它被当成测试**真执行了一次**，
+   `ℹ tests` 因此比真实注册数多 1（1906 vs 1905）。现在 `isNodeTestFile()` 照抄 Node 的
+   完整匹配集（`*.test.*` / `*-test.*` / `*_test.*` / `test-*.*` / `test.*`，且递归子目录），
+   由测试逐文件名钉住。
+
+### 文档
+
+四份声明同步到 **1905 条 / 48 个文件**（README ×4、CLAUDE.md、docs/GUIDE.md、CI）。
+README 里那句「由硬门数源码 `test(` 调用对账」改成「由硬门数真实注册对账」——
+旧措辞本身就是在描述那个错的判据。
+
+### 测试
+
+新增 `scripts/regression-count.test.mjs`（8 条）。负向那一条**真跑硬门子进程**：
+临时仓库放 2 条测试、文档写 2 → 绿；加第 3 条测试不改文档 → 门红且报出「写的是 2，实跑注册 3」；
+文档改成 3 → 那一条消失。
+
+---
+
+## [Unreleased] - 2026-11-21 6 个常量参数化：别人项目里跑硬门，42 条红线降到「真正该报的」（DF-046）
+
+派单的红队实测：`%TEMP%` 下建一个 4 文件的真项目跑 `check-structure.mjs`，报 **42 条违规，
+其中 40 条与那个项目毫无关系** —— 缺口不是 24 个函数要重构，是 **6 个常量把本仓库的形状
+当成了判据**。
+
+### Fixed
+
+1. **形状提成配置**，落在 `.untildone/checks.json`（**可选**）。读取处唯一：
+   `scripts/check-config.mjs` 的 `loadChecks()`。**没有配置文件 = 代码里的 `DEFAULTS` = 本仓库现状**，
+   所以别人的项目不写配置时行为与现在一致，写一份就换掉形状。
+
+   | 键 | 原常量位置 | 语义 |
+   |---|---|---|
+   | `publishedDirs` | `check-structure.mjs:30` | 可发布区（出现本机盘符即违规） |
+   | `privatePaths` / `runsDir` | `:46` | 私有区与运行台账落点（必须被 `.gitignore` 排除） |
+   | `gitignoreFatal` | `:225` | `.gitignore` 里出现即「排除了产品本体」 |
+   | `livingDocs` | `:2102` | 三道文档判据扫哪些文件 |
+   | `agentsDir` | 6 处 | 角色定义目录 |
+   | `scriptsDir` | 9 处 | 脚本目录（含 `DOC_PATH_RE` / 报错文案 / 能力清单正则） |
+   | `skillPath` | 3 处 | 调度入口 SKILL.md（派单未列，见下） |
+   | `livingDocsScan` / `disabledChecks` | 新增 | 覆盖检查的范围、要关掉的检查 |
+
+2. **`skillPath` 是派单之外新增的一项**。`checkInboxWiring` / `checkPromptWiring` /
+   `checkAgentReachability` 三处都拿 `.claude/skills/oversight/SKILL.md` 判「调度入口有没有
+   提到某个脚本」。写死时别人的项目里那份文件不存在 → 三条各自静默 `return` → 门报绿而没查。
+   **静默通过比报红更坏**，且它与第 5 条是同一个失效方式，只是落在另一个路径上，所以一并提成配置。
+
+3. **配置非法即报违规，不静默回落**：未知键（拼错 `scriptsPrefix`）、类型不对、绝对路径/盘符/`..`、
+   `runsDir` 不在 `privatePaths` 里、`disabledChecks` 里的未知检查名 —— 五种都报。
+   配置坏掉时用 `DEFAULTS` **继续跑完其余检查**：`question-audit.mjs` 那次已经证明
+   「一个坏配置把无关功能全带塌」是本仓库踩过的形态。
+
+4. **`disabledChecks` 的开关每一行都打提示**。有 10 条检查是**本产品自己的规矩**
+   （README 必须声明「不能自动接力」、必须有启动器模板、能力清单必须是 `node scripts/*.mjs` 行…）。
+   别人项目里它们红是对的判据、错的适用范围，所以给开关；但**静默关掉等于把「检查通过」
+   偷偷改成「没检查」** —— 那是这道门唯一的价值，所以关掉的每一条都出现在输出里。
+
+### Added
+
+1. **第 25 条检查 `checkLivingDocsCoverage()`**：`livingDocsScan.include` 一开，
+   scope 里多出任何一份未登记的 `.md` 就红（`missing` 方向也查：清单里有、磁盘上没有）。
+   **默认关**（本仓开着当场红 8 条，见下）。
+
+2. **`scripts/check-config.mjs`**（零依赖、只读盘）：`DEFAULTS` / `validateChecks()` /
+   `loadChecks()` / `livingDocsGap()` / `scopedMarkdown()` / `listMarkdown()` / `CHECK_NAMES`。
+   `CHECK_NAMES` 是 `disabledChecks` 的**对外契约** —— 它同时被 `check-structure.mjs` 的
+   元检查 `checkDispatchCoverage()`（`DF-047`）当锚点用。
+
+3. **`scripts/check-config.test.mjs`**（18 条）：本仓自检 + 非法配置 + 覆盖检查 + no-op 对拍。
+   全部真跑硬门子进程，不复制判据。
+
+4. **`.untildone/checks.json`**：本仓库自己的形状声明，**与 `DEFAULTS` 逐字相同**（故意）。
+
+### 本仓行为字节级不变 —— 两条可复算的证据
+
+1. `.untildone/checks.json` 与 `DEFAULTS` **深度相等**，键集合也一致（`check-config.test.mjs` 前两条）。
+   这条同时挡住两个方向的漂移：改了 `DEFAULTS` 忘改配置 → 红；谁把配置改歪 → 红。
+2. **一份等于 `DEFAULTS` 的配置跑硬门，与完全不写配置跑硬门，输出逐字节相同**（第三条测试）。
+   第一条只证明数据相等，这一条才证明「数据相等 ⇒ 行为相等」；否则它只会在某次跑门时
+   以「违规数从 0 变成 3」出现。
+
+参数化前后还做过一次直接对拍（同一 HEAD 树、同一份配置挂载，两份 `check-structure.mjs`
+的输出 `diff` 为空）。本仓另有一处可见变化是有意的：`✓ 已执行的 N 条检查全部通过`
+是 `DF-047`（同期另一个提交）带来的，不是本次。
+
+### `LIVING_DOCS` 为什么仍是手写清单（披露而不是回避）
+
+派单点名要判断「能不能改成扫所有 `.md` 减显式排除」。**试过，会炸**，实测数据：
+
+| 区域 | 份数 | 命中份数 | 最大单份 | 命中的是什么 |
+|---|---|---|---|---|
+| `docs/research/` | 93 | 29 | 25 条 | 别的项目的结构、已被推翻的旧路径 |
+| `docs/design/` | 19 | 5 | 3 条 | 设计稿里的**设想路径**（`scripts/serve.mjs`） |
+| `docs/CHANGELOG.md` | 1 | 11 | — | 历史条目里的旧文件名 |
+| `SECURITY.md` / `SECURITY-EN.md` | 2 | 各 1 | — | `.claude/settings.json`（本仓从未有过这个文件） |
+
+合计 100+ 条，全是**事实记录**。改写它们等于篡改历史；在行尾补「待建」则等于把
+「当时确实这么想过」改写成「当时就说了没实现」。
+
+所以缺口的真形态不是「范围太小」，是**清单靠人维护**。补法不是扩范围，是让「清单漂了」
+可判定 —— 那正是 `checkLivingDocsCoverage()`。默认关的理由是它一开本仓就红 8 条：
+现有 15 条清单漏了 `SECURITY.md`、`SECURITY-EN.md`、`README-EN.md`、`CONTRIBUTING.md`、
+`CONTRIBUTING-EN.md`、`docs/adr/0003`、`0004`、`docs/spec/original-design.md`。
+
+**那个缺口不许变大**这件事钉在测试里（`check-config.test.mjs` 的快照断言）：
+新增一份未登记的现行文档 → `node --test` 红。严格性留在测试里，门的输出不动。
+
+### 已知代价
+
+- `DEFAULTS` 与 `.untildone/checks.json` 是两份要同步的东西 —— 参数化的固有代价。
+  防它漂的是第一条测试，不是注释。
+- 别人项目里那 10 条「本产品规矩」检查要么补齐要么显式关掉，没有第三条路。
+  这是有意的：**能关，但关掉看得见**。
+
+## [Unreleased] - 2026-11-21 「检查没跑」与「检查通过」不再同形，并加一条元检查守住 dispatch（DF-047）
+
+本仓库最稳定的失效模式：**目标不存在就静默放行**。`scripts/check-structure.mjs` 里有
+**30 处** `if (!existsSync(...)) return;` —— 门报绿，而那条检查一个字都没查。
+
+**决定性实验（2026-11-21 复现）**：把 `checkChangelog()` 与 `checkLedger()` 两个
+dispatch 调用从运行块里删掉，硬门照样 `✓ 结构检查全部通过` + exit 0，
+`node --test scripts/` 1874 条全过。**没有任何机制发现这两条检查被删了。**
+
+### Fixed
+
+1. **30 处逐处分类，而不是一把把 `return` 改成 `fail`**（那会让合法场景变红）。
+   语义拆成两个名字，**调用方必须显式选一个**，名字本身就是「缺了会怎样」的文档：
+
+   | 名字 | 语义 | 条数 |
+   |---|---|---|
+   | `requirePath()` | 本仓库的规定产物，缺了 `fail` | 15 |
+   | `optionalPath()` | 缺了合法，但**登记一条「本轮没跑」** | 3 |
+   | 保持原样（`fail` 或工具函数） | 本来就是红 / 纯遍历器 | 7 |
+   | **确实该静默** | 见下 | 5 |
+
+   **「确实该静默」的 5 条**（这是本轮的判断，理由逐条写在代码里）：
+   - `walk()` 的 `return out` —— 遍历器不是检查，调用方必须先判「该不该存在」；
+   - `isGitignored()` 的 `return false` —— 「读不到规则」当「没被忽略」是**保守方向**
+     （让 `checkPrivatePaths()` 更可能报红），且 `.gitignore` 缺失由 `checkGitignoreSanity()` 报；
+   - `checkAbsolutePaths()` 里两处「名字在 git 可发布清单里、盘上却不在」——
+     那是「已跟踪但被删且未提交」，git 自己会报，不是泄漏判据；
+   - `checkEmptyDirs()` 的深度上限守卫 —— 深度是**它自己传下去的**，不是外部缺失。
+
+2. **门的输出里明写「N 处未跑」**，且 `✓ 全部通过` 只在「全跑、无跳过」时出现：
+
+   ```
+   ✓ 已执行的 25 条检查全部通过（其中 3 条只跑了一部分：另有 4 处因目标不存在而未覆盖）
+
+   — 4 处未跑（不阻塞，但**不计入「通过」**）：
+     [absolutePaths:rules] 可发布目录 rules/ 不存在，未扫
+     [absolutePaths:spec-adr] 可发布目录 spec-adr/ 不存在，未扫
+     [privatePaths] 私有路径 local 不存在，跳过它的 gitignore 判定
+     [privatePaths] 私有路径 CLAUDE.local.md 不存在，跳过它的 gitignore 判定
+   ```
+
+   旧版只有两种结尾（`✓` / `✗`），「因文件不存在而提前 return」落进第一种 ——
+   读者无从分辨。这一条是整轮的**目的**，不是附带美化。
+
+3. **元检查 `checkDispatchCoverage()`：`CHECKS` 表里每一条都必须真的被调用。**
+
+   实现是**运行时记账**，不是文本匹配：运行循环每调用一条就往 `ran` 里记一项
+   （**记在 `fn()` 之后** —— 记在前面的话「被 `continue` 掉」也会被算成跑过），
+   跑完与 `CHECKS` 表对账。文本判据（`src.includes('checkLedger()')`）会被注释、
+   被定义行自己命中 —— 本文件在 `checkStopHookKillSwitch()` 的头注释里已经记过这个坑。
+
+   **锚点是 `CHECK_NAMES`（`scripts/check-config.mjs`），不是 `CHECKS` 自己。**
+   第一版只做 `CHECKS` ↔ `ran` 比对，负向测试立刻暴露漏洞：**删掉 `CHECKS` 表里
+   一整行**时 `declared` 也少一项，两边仍一致 —— **门照绿**，正是决定性实验的原样。
+   `CHECK_NAMES` 是 `disabledChecks` 的对外契约，是独立的一份真源；
+   删一行表项不会同时删它，于是「只改一处」立刻红。
+
+### 负向验证（三种删除形态，都在真身上跑）
+
+```
+① 删 CHECKS 表一整行 ['ledger', checkLedger],
+   → ✗ CHECK_NAMES 里有 1 条检查在 CHECKS 表里找不到：ledger … exit 1
+② 表行保留，运行循环里 if (name === 'ledger') continue;
+   → ✗ CHECKS 表里有 1 条检查本轮从未被调用：ledger … exit 1
+③ 复刻决定性实验原样：同时删 changelog 与 ledger 两行
+   → ✗ CHECK_NAMES 里有 2 条检查在 CHECKS 表里找不到：changelog, ledger … exit 1
+   （实验原样是 ✓ + exit 0）
+```
+
+三条固化成 `scripts/dispatch-coverage.test.mjs`（按「改源码 → 跑真身 → 断言非零退出
+且点名」的形态，不是从源码正则里自证）。
+
+### 顺带
+
+- **`optionalPath()` 的登记按 (检查名, 原因) 去重**：`privatePaths` 有 3 条私有路径
+  不在盘上，输出里是 `3 处` + 逐行原因，而不是把同一句话印三遍。
+- **对照组断言「输出说的条数 == CHECKS 表行数」**：否则「N 条全部通过」这个数字
+  本身可以是假话（少报几条，「全部通过」就更容易成立）。写这条时踩到一个真坑：
+  正则 `check\w+` 数不到 `emptyDirs` 那一条（它是箭头函数），数出 24 而实际 25 ——
+  **判据自己错，报出来的却是被判断对象**。已改宽并写进注释。
+
+### 没做的
+
+- **没有重构 `check-structure.mjs`**（它被 import 就 `process.exit()`，一条测试都写不了）。
+  本轮只新增了一个可测的判据函数与一份 `dispatch-coverage.test.mjs`；
+  大规模搬家留到有人真需要单测某条检查时再做。
+- **没有把 `LIVING_DOCS` 的手写清单改成自动发现**（会引出 100+ 条历史文档误报）。
+  缺口的规模由 `checkLivingDocsCoverage()` 与 `livingDocsScan` 配置表达，默认关。
+
 ## [Unreleased] - 2026-11-21 注册表「模块加载时求值」→「按根求值」（DF-045）
 
 上一轮（DF-044）把 9 处硬编码收敛成 `scripts/roles.mjs`，但留下了**同一个根因的 6 个落点**：
