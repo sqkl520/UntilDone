@@ -71,12 +71,37 @@ function fixture() {
   return dir;
 }
 
-/** 在副本里跑硬门（子进程，真身）。 @returns {{status:number, out:string}} */
-function runGate(dir) {
-  const r = spawnSync(process.execPath, [join(dir, 'scripts', 'check-structure.mjs')], {
-    cwd: dir, encoding: 'utf8', timeout: 120000,
-  });
-  return { status: r.status, out: `${r.stdout || ''}${r.stderr || ''}` };
+/** 在副本里跑硬门（子进程，真身）。
+ *
+ *  ## 为什么要重试一次
+ *
+ *  `checkImportable()` / `checkUnregisteredExports()` 在硬门内部各起一个 node 子进程，
+ *  分别有 45s / 20s 的超时。`node --test scripts/` 默认**多文件并发**，而本文件自己
+ *  还要复制仓库、再各跑一次门 —— 实测并发满载时那个子进程会超时返回 `status: null`，
+ *  于是门输出「子进程以 null 退出」并 exit 1。
+ *
+ *  那是**环境性失败**，不是判据给出的结论。第一版没区分，于是对照组在全量跑里
+ *  红了（隔离跑 3/3 绿，全量跑 1 红）—— 一条本来要守「门不会永远红」的用例，
+ *  自己被资源抢成了「门是红的」。这种用例比没有更坏：它训练人忽略红。
+ *
+ *  重试的判据是**只认环境性信号**（超时 / 无输出），不是「红了就再跑一次」——
+ *  后者会把真正的判据失败也重试一遍，那是在等一个它不会变绿的结果。
+ *
+ *  @returns {{status:number|null, out:string, envFail:boolean}} */
+function runGate(dir, { tries = 2 } = {}) {
+  let last = { status: null, out: '', envFail: true };
+  for (let i = 0; i < tries; i++) {
+    const r = spawnSync(process.execPath, [join(dir, 'scripts', 'check-structure.mjs')], {
+      cwd: dir, encoding: 'utf8', timeout: 180000,
+    });
+    const out = `${r.stdout || ''}${r.stderr || ''}`;
+    // `status === null` = 被信号杀掉或超时（spawnSync 在超时时置 null）
+    const envFail = r.status === null && /子进程以 null 退出|未知错误/.test(out);
+    last = { status: r.status, out, envFail };
+    if (!envFail) return last;
+    // 只在这种形态下重试；其余情况立刻返回，让判据说话。
+  }
+  return last;
 }
 
 /** 让副本里的「测试数对账」与副本自身一致。
@@ -94,9 +119,9 @@ function runGate(dir) {
  *  判据仍留在原地：改完之后副本照样会对「数字对不对」做一次完整核对。
  *  @returns {void} */
 function syncTestCount(dir) {
-  const { out } = runGate(dir);
-  const m = out.match(/实跑注册 (\d+) 条/);
-  if (!m) return;                       // 没有这条违规：数字本来就对得上
+  const first = runGate(dir);
+  const m = first.out.match(/实跑注册 (\d+) 条/);
+  if (!m) return first;                 // 没有这条违规：数字本来就对得上
   const n = m[1];
   const sites = [
     ['README.md', /（(\d+)\s*条回归测试/g],
@@ -112,6 +137,11 @@ function syncTestCount(dir) {
     const next = text.replace(re, (full, old) => full.replace(old, n));
     if (next !== text) writeFileSync(p, next);
   }
+  // 把第一次跑的输出交回去：调用方（`before()`）拿它当「同步之后的那次运行」，
+  // 省掉一整个子进程。**注意它是在同步之前跑的**，所以它的 `实跑注册 N 条`
+  // 那一行仍然有效（N 与文档里的数字才是不一致的那两方），但**不能**拿它当
+  // 「门是绿的」的证据 —— 那次运行的结论就是「数字对不上」。
+  return first;
 }
 
 const GATE = join('scripts', 'check-structure.mjs');
@@ -125,10 +155,19 @@ const writeGate = (dir, text) => writeFileSync(join(dir, GATE), text);
 // 这会让 `node --test scripts/` 的时长翻倍。
 //
 // 现在：基准副本只建一次（`before()`），每个用例从它 `cpSync` 一份（约 8 MB），
-// 只跑一次门。实测四个用例合计 ~10 秒。
+// 只跑一次门。实测三个用例合计 ~25 秒。
 let BASE = null;
+/** 基准副本「同步完测试数之后」的那次门运行结果。
+ *
+ *  复用它的理由：`fixture()` 里已经跑过一次门（为了对齐测试数），而那一次之后
+ *  基准副本就是**未改动的绿状态**。对照组要的正是这个结论 —— 再跑一次得到的是
+ *  同一件事，只是多花 9 秒。省掉它，全量测试少一次 40 文件的 import 探针。 */
+let BASE_GATE = null;
 
-test.before(() => { BASE = fixture(); });
+test.before(() => {
+  BASE = fixture();
+  BASE_GATE = runGate(BASE);
+});
 test.after(() => { if (BASE) rmSync(BASE, { recursive: true, force: true }); });
 
 /** 从基准副本再复制一份给单个用例改坏用。 */
@@ -149,6 +188,14 @@ function assertRed(status, out, needle, label) {
   assert.match(out, needle, `${label}：输出里没有点名它\n${out}`);
 }
 
+/** 环境性失败（子进程超时）必须**显式失败并说清是什么**，不能伪装成判据结论。
+ *  静默 skip 会让「检查被删」和「机器忙」同形 —— 那正是本轮在修的那个病。 */
+function assertNotEnvFail(res, label) {
+  assert.ok(!res.envFail,
+    `${label}：硬门内部的子进程超时（环境性失败，不是判据结论）。`
+    + `隔离重跑 \`node --test scripts/dispatch-coverage.test.mjs\` 应能通过。\n${res.out}`);
+}
+
 test('元检查 · 从 CHECKS 表里删掉一行 → 门必须红（DF-047 的原样）', () => {
   const dir = sandbox();
   try {
@@ -157,7 +204,9 @@ test('元检查 · 从 CHECKS 表里删掉一行 → 门必须红（DF-047 的�
     assert.notEqual(after, before, '没有匹配到 ledger 那一行 —— 本用例的前提失效了');
 
     writeGate(dir, after);
-    const { status, out } = runGate(dir);
+    const res = runGate(dir);
+    assertNotEnvFail(res, '门运行');
+    const { status, out } = res;
     assertRed(status, out, /CHECK_NAMES 里有 \d+ 条检查在 CHECKS 表里找不到：.*ledger/, '删表行');
     assert.match(out, /只改一处会红在这里/, '没有给出「为什么红」的说明');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -176,15 +225,20 @@ test('元检查 · 表行还在但调用被跳过 → 门必须红（真删 disp
     assert.notEqual(after, before, '没有匹配到运行循环 —— 本用例的前提失效了');
 
     writeGate(dir, after);
-    const { status, out } = runGate(dir);
+    const res = runGate(dir);
+    assertNotEnvFail(res, '门运行');
+    const { status, out } = res;
     assertRed(status, out, /CHECKS 表里有 \d+ 条检查本轮从未被调用：.*ledger/, '跳过调用');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('元检查 · 对照组：未改动的仓库全绿，条数与表一致，且「没跑」与「通过」不同形', () => {
-  const dir = sandbox();
-  try {
-    const { status, out } = runGate(dir);
+    // 复用 `before()` 里那次运行的结果（基准副本已对齐测试数，状态即「未改动」）。
+    // 复制一份副本只为读它的源码数表行 —— 不跑门。
+    const res = BASE_GATE;
+    assert.ok(res, '基准副本的门运行结果没有拿到 —— `before()` 没跑？');
+    assertNotEnvFail(res, '门运行');
+    const { status, out } = res;
     // 这一条是**对照组**：没有它，上面两条可能只是「门在任何输入下都红」。
     assert.equal(status, 0, `未改动的副本应当绿，实际 exit ${status}\n${out}`);
     const m = out.match(/✓ 已执行的 (\d+) 条检查全部通过|✓ 结构检查全部通过（(\d+) 条/);
@@ -196,7 +250,7 @@ test('元检查 · 对照组：未改动的仓库全绿，条数与表一致，�
     // 数行时**不能写 `check\w+`**：`emptyDirs` 那一条是箭头函数（`() => checkEmptyDirs()`），
     // 不是裸标识符。第一版就是这么少数了一行（数出 24、实际 25），
     // 于是这一条对照用例在「输出完全正确」时红了 —— 判据自己错，报出来的却是被判断对象。
-    const src = readGate(dir);
+    const src = readGate(BASE);
     const tableRows = (src.match(/^  \['\w+', .+\],$/gm) || []).length;
     assert.ok(tableRows > 0, '没有数到 CHECKS 表的行 —— 本用例的前提失效了');
     const declared = Number(m[1] || m[2]);
@@ -213,6 +267,5 @@ test('元检查 · 对照组：未改动的仓库全绿，条数与表一致，�
       assert.match(out, /✓ 已执行的 \d+ 条检查全部通过/,
         '有未跑项时，通过那句话必须显式限定为「已执行的部分」');
     }
-  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

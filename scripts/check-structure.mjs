@@ -507,7 +507,13 @@ function checkTestCount() {
     }
   }
   const actual = measured.count;
-  if (!actual) return;
+  if (!actual) {
+    // 「0 条」不是「没问题」：本仓库有 1900+ 条测试，数成 0 只可能是探针坏了
+    // 或文件发现判据写窄了。静默 return 会让门变绿，而它其实什么都没核。
+    fail(SCRIPTS_REL + '/', `实跑注册 0 条测试（扫到 ${measured.files || 0} 个文件）——`
+      + '这在本仓库只可能是取数坏了，不是「没有测试」');
+    return;
+  }
 
   // 每份文档里「N 条回归测试」这一句的取数位置。只查**声明基线**的那一处，
   // 不查历史条目（CHANGELOG 与 research 里的旧数字是事实记录，不该被改）。

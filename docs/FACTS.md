@@ -71,9 +71,14 @@ node --test scripts/*.test.mjs
 测试文件数：`ls scripts/*.test.mjs | wc -l` → **19**。
 最后验证时间：2026-11-12
 
-> ⚠️ 这个数字有硬门守着：`check-structure.mjs` 的 `checkTestCount()` 会数源码里 `^\s*test(` 的出现次数，
-> 与 `README.md` / `CLAUDE.md` / `docs/GUIDE.md` / `.github/workflows/validate.yml` 四处的声明对账，写错直接 fail。
-> **所以「873」现在是自洽的，但它明天就会变。**
+> ⚠️ 这个数字有硬门守着：`check-structure.mjs` 的 `checkTestCount()` 会与 `README.md` / `CLAUDE.md` /
+> `docs/GUIDE.md` / `.github/workflows/validate.yml` 四处的声明对账，写错直接 fail。
+> **所以「873」当时是自洽的，但它第二天就变了。**
+>
+> 取数口径在 2026-11-21 换过一次：**旧版数源码里 `^\s*test(` 的字面量**（本段那 873 就是那个口径），
+> 新版**import 每个测试文件数真实注册条数**（`scripts/regression-count.mjs`，与 `node --test` 的
+> `ℹ tests` 逐条相等）。旧口径在有 `for` 循环注册时会少数 —— 实测差 3 条（1873 vs 1876），
+> 见 `tasks/dev-findings.md` DF-048。本段是 2026-11-12 的快照，数字不追改；要现行值看 `README.md`。
 
 **事实：结构硬门当前全绿。**
 证据等级：T2 · 快照

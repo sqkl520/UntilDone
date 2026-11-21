@@ -38,7 +38,7 @@
    `check-structure.mjs` 是 `CLI_SCRIPTS` 成员，判据写在里面就没法单测。
 
 2. **代价如实记**：硬门多一次子进程，计数本身 0.9–1.7 秒（48 个测试文件、并行 import）。
-   测量时机器上有并发任务（11–15 个 node 进程），五次交错对拍的中位数差约 1.2 秒。
+   测量时机器上有并发任务（11–15 个 node 进程），在负载较高的时段做过 7 组交错对拍（同一份门源码，一组是开计数、一组把计数短路掉），中位数差 764ms、最大 1123ms；负载低的时段 5 组的中位数差约 300ms。不报一个更漂亮的单一数字：机器当时同时在跑别的任务，这个波形本身就是事实。
    没有选「保留源码计数、文档里写两个数」：那要让读者记住两个数差几条、为什么差，
    而差值是会变的 —— 一个需要脚注解释的数字，最后会被当成噪音。
 
@@ -178,18 +178,38 @@ dispatch 调用从运行块里删掉，硬门照样 `✓ 结构检查全部通�
 
    | 名字 | 语义 | 条数 |
    |---|---|---|
-   | `requirePath()` | 本仓库的规定产物，缺了 `fail` | 15 |
-   | `optionalPath()` | 缺了合法，但**登记一条「本轮没跑」** | 3 |
-   | 保持原样（`fail` 或工具函数） | 本来就是红 / 纯遍历器 | 7 |
-   | **确实该静默** | 见下 | 5 |
+   | `requirePath()` | 本仓库的规定产物，缺了 `fail` | **22** |
+   | `optionalPath()` | 缺了合法，但**登记一条「本轮没跑」** | **2** |
+   | 保持原样 | 见下（4 处本来就是 `fail`，2 处是工具函数） | **6** |
+   | 合计 | | **30** |
 
-   **「确实该静默」的 5 条**（这是本轮的判断，理由逐条写在代码里）：
-   - `walk()` 的 `return out` —— 遍历器不是检查，调用方必须先判「该不该存在」；
-   - `isGitignored()` 的 `return false` —— 「读不到规则」当「没被忽略」是**保守方向**
-     （让 `checkPrivatePaths()` 更可能报红），且 `.gitignore` 缺失由 `checkGitignoreSanity()` 报；
-   - `checkAbsolutePaths()` 里两处「名字在 git 可发布清单里、盘上却不在」——
-     那是「已跟踪但被删且未提交」，git 自己会报，不是泄漏判据；
-   - `checkEmptyDirs()` 的深度上限守卫 —— 深度是**它自己传下去的**，不是外部缺失。
+   逐处对照（序号 = 在被改文件里的出现顺序）：
+
+   | 原处 | 函数 | 判定 | 理由 |
+   |---|---|---|---|
+   | 1 | `walk()` | 保留 | 纯遍历器，不是检查；调用方必须先判「该不该存在」 |
+   | 2 | `isGitignored()` | 保留 | 当「没被忽略」是**保守方向**（让 `checkPrivatePaths()` 更可能报红） |
+   | 3 | `checkAbsolutePaths()` 可发布目录 | **optional** | `rules/`、`spec-adr/` 本仓从来没有过，是「若存在就扫」 |
+   | 4 | `checkAbsolutePaths()` 根级文件 | 保留 | 名字在 git 清单里、盘上却不在 = 「已跟踪但被删未提交」，git 自己会报 |
+   | 5 | `checkAbsolutePaths()` 台账循环 | require | 两本台账是规定产物（CLAUDE.md 目录归属表标「可发布」） |
+   | 6 | `checkPrivatePaths()` | **optional** | `local/`、`CLAUDE.local.md` 是「你建了它就得忽略」，不是「你必须建它」 |
+   | 7 | `checkGitignoreSanity()` | require | 本来就是 `fail`，改名让语义在调用点可见 |
+   | 8 | `checkAgents()` | require | **旧版是 `warn` + `return`** —— 最典型的一处静默短路 |
+   | 9 | `checkCapabilityDisclosure()` | require | 同上，`README.md` 被删了门仍印 `✓` |
+   | 10–14 | `checkTestCount` / `checkSyntax` / `checkImportable` / `checkUnregisteredExports` | require | 脚本目录是规定产物 |
+   | 15 | `checkChangelog()` | require | 决定性实验的直接对象 |
+   | 16 | `checkLauncherPlacement()` | require | 本来就是 `fail` |
+   | 17–19 | `checkDesignIndex()` 三处 | require | `docs/design/` 是本仓规定产物 |
+   | 20 | `checkAgentReachability()` 复合守卫 | require（**拆成两行**） | 两个缺失原因混在一个 `return` 里，处置被混成一个 |
+   | 21–24 | `checkDocReferences` / `checkDocCommands` | 2 require + 2 保留 | 活文档清单是规定产物；「引用了不存在的目标」本来就是 `fail` |
+   | 25–26 | `checkDocConstants()` 两处 | require | |
+   | 27–28 | `checkResearchIndex()` 两处 | require | |
+   | 29–30 | `checkCapabilities()` 两处 | 1 require + 1 保留 | 「能力清单引用了不存在的脚本」本来就是 `fail` |
+
+   **「确实该静默」只有 2 条**（`walk()` / `isGitignored()`），其余 4 条「保持原样」
+   本来就是红，10 条本来就是红。这个数字比派单估计的少 —— 理由是：判「该不该静默」
+   的问句是「缺了这个文件，是用户配置问题还是仓库坏了」。本仓里 30 处几乎全部指向
+   **规定产物**，所以 `fail` 是对的；真正可选的目标只有可发布目录的那两个名字。
 
 2. **门的输出里明写「N 处未跑」**，且 `✓ 全部通过` 只在「全跑、无跳过」时出现：
 

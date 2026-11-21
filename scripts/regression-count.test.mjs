@@ -103,6 +103,31 @@ for (const n of [1, 2, 3]) test('丙' + n, () => {});
 
 // ── 2. 取数的失效方式：数不出来 ≠ 0 条 ────────────────────────────────
 
+test('字符串里的 test( 不是测试——旧口径会把它数进去（多数方向）', () => {
+  // 这是我这条新测试文件在旧口径下暴露出的**第二个失效方向**：
+  // 旧判据 `^\s*test\(` 只看行首缩进，不看它在不在字符串/模板串里。
+  // 于是「把一段示例测试当夹具写进测试文件」这种完全正常的写法，会让条数**虚高**。
+  // 实测：本仓加进 regression-count.test.mjs 之后，旧口径 1913 / 真实注册 1905，差 +8。
+  const d = tmpRepo();
+  try {
+    const scripts = join(d, 'scripts');
+    mkdirSync(scripts, { recursive: true });
+    writeFileSync(join(scripts, 'fixture.test.mjs'), [
+      "import { test } from 'node:test';",
+      "test('真的这一条', () => {});",
+      'const FIXTURE = `',
+      "test('甲', () => {});",
+      "test('乙', () => {});",
+      "for (const n of [1, 2]) test('丙' + n, () => {});",
+      '`;',
+      'void FIXTURE;',
+    ].join('\n'));
+    const r = countRegisteredTests(scripts);
+    assert.equal(r.count, 1,
+      `字符串里的 4 处 test( 不该被算进来，实际 ${r.count}。`
+      + '若这里是 5，说明退回了「数字面量」——它会同时多数（字符串）和少数（循环）');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
 test('目录读不了时返回 error，而不是假装「0 条」（0 条会让门静默放行）', () => {
   const r = countRegisteredTests(join(tmpdir(), 'ow-testcount-does-not-exist-xyz'));
   assert.ok(r.error, `应报错，实际 ${JSON.stringify(r)}`);
