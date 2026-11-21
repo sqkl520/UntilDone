@@ -21,6 +21,49 @@
 
 ---
 
+## [Unreleased] - 2026-11-21 交付的载荷里终于有脚本了，SKILL 的 14 条命令不再全是 404（DF-060）
+
+`dist/payload/` 里一直是 12 个 agent + 1 个 skill、**0 个脚本**，而 `SKILL.md` 有 14 处
+`node scripts/x.mjs`（agents/ 里还有 4 处）。方案 Agent 在一个只含 `README.md` 的外部项目里实测
+`node scripts/watch.mjs --health` → `MODULE_NOT_FOUND`，7 个被引用的脚本 7/7 不存在。
+更刺人的是这行是设计者自己写的（`build-payload.mjs:35`）：「hooks 故意不在载荷里……这就要求
+载荷把脚本及其 import 闭包一起带走」——同一段论证对 SKILL 里的命令完全成立，但 SKILL 照常进了载荷。
+
+### Fixed
+
+1. **载荷按「被引用的脚本 + import 闭包」带脚本**（`build-payload.mjs`）。闭包算法从 markdown
+   正文提取 `node scripts/x.mjs`，再从入口向下展开相对导入。本仓实测：**7 个入口 → 22 个文件 / 0.97 MB**。
+   悬空引用**不生成半份载荷**（与既有的「problems 非空就停」同一策略）。
+   闭包计算先剥注释——否则 `stop-signals.mjs:34` 注释里的 `from ./m` 会被当成真导入，
+   报一个与真实问题无关的 `./m 不存在`，整份载荷生成不出来。
+
+2. **`--check` 增加第 5.5 条：载荷里的 markdown 引用的脚本必须真的在载荷里**。
+   这一条是唯一能发现 DF-060 的检查：`--check` 原有六条全绿、`plugin validate --strict` 也全绿，
+   两者都不读正文。
+
+3. **`UNTILDONE_PAYLOAD` 环境变量**（`launch.mjs` 的 `childEnv()`）。SKILL 与角色正文里的命令
+   改写为 `node "${UNTILDONE_PAYLOAD}/scripts/x.mjs"`。为什么不是 `${CLAUDE_PLUGIN_ROOT}`：
+   实测**它在 SKILL 正文里不展开**（400 次出现 vs 等长占位文本，token 字符比 4.02 : 4.01）。
+   为什么不是 `UNTILDONE_ROOT`：那个指「用户项目根」，两个根不是一回事（DF-043）。
+   注入前必须确认脚本真在那个目录里 —— `mountDir` 有两种形态（`dist/payload` 里有 `scripts/`，
+   本仓自用的 `.claude/` 里没有、脚本在兄弟目录），两处都试，都不在则不注入。
+
+4. **roster 分身必须带脚本闭包**（`applyRoster`）。`UNTILDONE_PAYLOAD` 指向的就是它，
+   而它同时是 `--plugin-dir`。原先它只拷 `agents/`，实测一条命令都跑不了。
+   现在按被启用角色的引用计算闭包；启用角色一个脚本都不引用时（实测 acceptor / planner 如此），
+   退回 SKILL 的最小可运行集 —— **不建「存在但没有脚本」的空壳**，那会让 `existsSync` 误判。
+
+### 实证
+
+- 端到端：`--print` 起会话 → hook 读 `UNTILDONE_PAYLOAD` = `dist/roster` → 从该目录跑
+  `watch.mjs --health` **成功输出报告**（exit 1 是因为守护进程真没在工作，DF-054，不是模块问题）。
+- 负向：删掉载荷里的 `scripts/watch.mjs` → `--check` 红；源里写一条 `node scripts/ghost.mjs`
+  → `buildPayload` 返回 `ok:false`、`written:0`，不生成半份载荷。
+- 测试：`build-payload.test.mjs` 新增 6 条（引用收集、悬空拦截、5.5 独立生效、注释里的假导入、
+  空路径不复发、传递闭包）。
+- 硬门抓到的两次真问题：加测试后注册数 1908 → 1914 → 1915，四份文档没同步（改了）；
+  两个新导出未登记 `PROBE_ARGS`（登记了）。
+
 ## [Unreleased] - 2026-11-21 CI 红不是平台差异：加了一条测试没改四份文档，并把「平台无关」变成可执行断言（DF-049）
 
 CI `validate` 在 `979097c` 上红，报「文档写 1905 / 实跑注册 1906」。当时的归因是

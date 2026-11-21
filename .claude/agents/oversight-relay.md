@@ -22,7 +22,7 @@ maxTurns: 20
 **先读收件箱，不要自己重新扫描**：
 
 ```bash
-node scripts/watch.mjs --inbox --json
+node "${UNTILDONE_PAYLOAD}/scripts/watch.mjs" --inbox --json
 ```
 
 后台守护进程已经知道谁在等、等了多久、宿主写了什么。你从这里拿到的 `needs` /

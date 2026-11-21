@@ -2667,7 +2667,7 @@ const LIVING_DOCS = [
   再判是否在枚举内；而不是先用窄正则筛、再判筛出来的东西。
 - 建议归属：独立任务（小修）
 
-### DF-060 [open] 交付载荷里没有 `scripts/`，而 SKILL.md 有 14 处 `node scripts/*.mjs`
+### DF-060 [fixed] 交付载荷里没有 `scripts/`，而 SKILL.md 有 14 处 `node scripts/*.mjs`
 
 - 发现于：2026-11-21 方案 Agent 实测；主线程复核
 - 位置：`scripts/build-payload.mjs` 的生成范围；`.claude/skills/oversight/SKILL.md`；`dist/payload/`
@@ -2693,7 +2693,36 @@ const LIVING_DOCS = [
   但 SKILL 照常进了载荷。结果：交付出去的那份东西，说明书里 14 条命令全部 404。
 - 影响：这个「框架」只有在 `cwd=本仓库` 时才成立。别人 `--plugin-dir` 加载后拿到的角色说明里全是死命令。
   这是比 DF-051（门在别人项目里报红）更前置的问题：**门还没跑，说明书已经失效了。**
-- 建议归属：独立任务（本轮登记，未修）
+- 建议归属：独立任务（**2026-11-21 已修**）
+
+- **修法（四条，每条都有负向证据）**：
+  1. **载荷按「被引用的脚本 + import 闭包」带脚本**。闭包从 markdown 正文提取
+     `node scripts/x.mjs`，再向下展开相对导入。本仓实测 7 个入口 → **22 个文件 / 0.97 MB**。
+     悬空引用**不生成半份载荷**。闭包计算前先剥注释 —— 否则 `stop-signals.mjs:34`
+     注释里的 `from './m'` 会被当成真导入，报一个与真实问题无关的 `./m 不存在`。
+  2. **`--check` 增加第 5.5 条**：载荷里的 markdown 引用的脚本必须真的在载荷里。
+     **只有它读正文** —— 原有六条全绿、`plugin validate --strict` 也全绿，两者都发现不了。
+  3. **`UNTILDONE_PAYLOAD` 环境变量**由 `launch.mjs` 的 `childEnv()` 注入。
+     为什么不是 `${CLAUDE_PLUGIN_ROOT}`：实测**在 SKILL 正文里不展开**
+     （400 次出现 vs 等长占位文本，token/字符比 4.02 : 4.01）。
+     为什么不是 `UNTILDONE_ROOT`：那个指用户项目根，两个根不是一回事（DF-043）。
+  4. **roster 分身带上闭包**（`applyRoster`）。原先它只拷 `agents/`，而那正是
+     `UNTILDONE_PAYLOAD` 与 `--plugin-dir` 同时指向的目录。启用角色一个脚本都不引用时
+     （实测 acceptor / planner 如此），退回 SKILL 的最小可运行集 —— **不建空壳目录**。
+
+- **负向证据（都真跑）**：
+  - 删掉载荷里的 `scripts/watch.mjs` → `--check` 红，报「载荷缺文件」。
+  - 源里写 `node scripts/ghost.mjs` → `buildPayload` 返回 `ok:false`、`written:0`。
+  - 端到端：`--print` 起会话 → hook 读到 `UNTILDONE_PAYLOAD=dist/roster` →
+    从该目录跑 `watch.mjs --health` **成功输出报告**。
+  - 新增 6 条测试（引用收集 / 悬空拦截 / 5.5 独立生效 / 注释里的假导入 / 空路径 / 传递闭包）。
+
+- **过程中我自己退化的两次，都被既有测试抓住**：
+  - 第一次让 `applyRoster` 在「payload 里没有 scripts」时**退回整目录**，
+    于是 roster 筛选整个失效 —— `launch.test.mjs` 的「roster 现在真的筛」变红。
+    改法是多试一条路径（payload 兄弟目录），而不是拿筛选换脚本。
+  - 第一次把 `childEnv(mountDir)` 在 spawn 处写成裸 `mountDir`（那个作用域里不存在），
+    `launch --print` 直接报 `mountDir is not defined`。**改了没跑就是没改。**
 
 ### DF-061 [open] 加第二份 SKILL 对硬门不可见：`checkDocCommands` 只扫 `LIVING_DOCS`
 

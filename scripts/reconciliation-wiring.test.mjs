@@ -117,7 +117,11 @@ test('7.3 两个角色都写了「claim 是加分项不是准入项」（与模�
   for (const rel of [EXECUTOR, REPAIR]) {
     const t = read(rel);
     assert.match(t, /加分项/, `${rel} 没有说明 claim 是可选项`);
-    assert.match(t, /claim-ledger\.mjs claim --run/, `${rel} 没有给出可抄的命令`);
+    // DF-060 之后命令带 `$UNTILDONE_PAYLOAD` 前缀（载荷可能不在用户项目里），
+    // 所以这里只断言「命令里确实有 claim-ledger.mjs claim --run」，
+    // 不绑死前缀 —— 前缀的形式由 launch-negatives.test.mjs 单独守。
+    assert.match(t, /claim-ledger\.mjs"?\s+claim\s+--run/, `${rel} 没有给出可抄的命令`);
+    assert.match(t, /UNTILDONE_PAYLOAD/, `${rel} 的命令没有走载荷根，在别人项目里会 404`);
   }
 });
 

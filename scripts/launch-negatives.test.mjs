@@ -177,8 +177,11 @@ test('mode=never 时 maxQuestions 允许 0（否则「关掉提问」无法表�
 
 test('launch 必须显式传 env 并补齐 PATHEXT，不能靠继承', () => {
   const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
-  assert.match(src, /function childEnv\(\)/, 'childEnv 必须存在');
-  assert.match(src, /env: childEnv\(\),/, 'spawn 必须显式传 env —— 靠继承就无法兜底');
+  // DF-060 之后 childEnv 带一个参数（载荷根，用来注入 UNTILDONE_PAYLOAD）。
+  // 断言放宽到「有 childEnv 这个函数」，把「参数必须是什么」交给下面那条 spawn 断言 ——
+  // 那条才是真正守住「靠继承会静默失效」的地方。
+  assert.match(src, /function childEnv\(/, 'childEnv 必须存在');
+  assert.match(src, /env: childEnv\(plan\.mountDir\)/, 'spawn 必须显式传 env —— 靠继承就无法兜底');
   assert.match(src, /env\.PATHEXT = '\.COM;\.EXE;\.BAT;\.CMD'/, '必须补齐 PATHEXT');
   // 只在缺失时补：覆盖用户已有值 = 越界
   assert.match(src, /!env\.PATHEXT/, '只在用户没有时才补，不覆盖');
@@ -186,10 +189,22 @@ test('launch 必须显式传 env 并补齐 PATHEXT，不能靠继承', () => {
   assert.match(src, /process\.platform === 'win32' && !env\.PATHEXT/, '只在 win32 上补');
 });
 
+test('DF-060：UNTILDONE_PAYLOAD 只在载荷确实能跑脚本时才注入', () => {
+  const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
+  const fn = src.slice(src.indexOf('function childEnv('), src.indexOf('function applyRoster('));
+  // 必须有注入
+  assert.match(fn, /env\.UNTILDONE_PAYLOAD =/, '必须注入 UNTILDONE_PAYLOAD');
+  // 必须**先判存在**再注入：指向一个没有 scripts/ 的目录，等于把 404 写进说明书
+  assert.match(fn, /existsSync\(scriptsInside\)/, '注入前必须确认载荷里有 scripts/');
+  assert.match(fn, /existsSync\(scriptsBeside\)/, '.claude/ 形态下脚本在兄弟目录，也要能找');
+  // 不能拿 UNTILDONE_ROOT 顶替：那是「用户项目根」，两个根不是一回事（DF-043）
+  assert.ok(!/env\.UNTILDONE_ROOT\s*=/.test(fn), '不许用 UNTILDONE_ROOT 指载荷根');
+});
+
 test('负向：把 env 传参去掉，测试必须红', () => {
   // 这条不是再断言一次，而是把「为什么必须有」写成可读的形式：
-  // 没有 env: childEnv() 那一行，上面三条都会失去依据。
+  // 没有 env: childEnv(...) 那一行，上面三条都会失去依据。
   const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
   const spawnBlock = src.slice(src.indexOf('proc = spawn(plan.execFile'), src.indexOf('proc = spawn(plan.execFile') + 900);
-  assert.match(spawnBlock, /env: childEnv\(\)/, 'env 必须在 spawn 的那一段里，不是写在别处');
+  assert.match(spawnBlock, /env: childEnv\(plan\.mountDir\)/, 'env 必须在 spawn 的那一段里，不是写在别处');
 });

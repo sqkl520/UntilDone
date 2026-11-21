@@ -114,6 +114,85 @@ function walkRel(dir, base = dir, out = []) {
   return out.sort();
 }
 
+// ── 脚本引用闭包 ──────────────────────────────────────────────────────
+
+/** 已经随 agents/skills 一起进载荷的 markdown 正文里，出现的 `node scripts/x.mjs`。
+ *
+ *  **必须排除带变量的写法**：SKILL 在载荷里要写成
+ *  `node "$UNTILDONE_PAYLOAD/scripts/x.mjs"`，而那串里同样含 `scripts/x.mjs`。
+ *  把紧跟在 `}` 后面的、或前面带 `$` 的排除掉 —— 它们指的是**载荷自身**，
+ *  不是本仓库里的文件；本仓库那份由同一条命令的不带前缀写法（如果有）提供。
+ */
+const SCRIPT_REF_RE = /(?<![\w${}/])\bnode\s+(scripts\/[A-Za-z0-9_.\-/]+\.mjs)\b/g;
+/** 只认相对导入。裸说明符（`node:fs`）不是仓库内的文件。 */
+const REL_IMPORT_RE = /(?:from\s*|import\s*\(\s*|import\s+)['"](\.[^'"]+)['"]/g;
+
+/** 剥掉 `//` 行注释与 `/* *\/` 块注释。
+ *
+ *  **为什么必须先剥**：`scripts/stop-signals.mjs:34` 的注释里写着
+ *  「`export { x } from './m'` 只建立导出」，正则把它当成真导入，
+ *  于是闭包计算报 `./m 不存在`，整份载荷都生成不出来。实测第一次跑就撞上。
+ *  这里不追求完美的词法分析（字符串里的 `//` 会被误剥）—— 代价是可能漏掉一条
+ *  真导入，而漏掉的后果由 `--check` 与运行期 `ERR_MODULE_NOT_FOUND` 兜底；
+ *  反过来（把注释当导入）的后果是**载荷根本生成不出来**，两者不对称。
+ */
+function stripComments(src) {
+  return String(src)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .map((line) => line.replace(/(^|[^:'"`])\/\/.*$/, '$1'))
+    .join('\n');
+}
+
+/** 从已登记的 agent/skill 正文里收集被引用的脚本相对路径（如 `scripts/watch.mjs`）。 */
+export function referencedScriptRoots(fileRows = []) {
+  const out = new Set();
+  for (const f of (Array.isArray(fileRows) ? fileRows : [])) {
+    if (!f || !f.abs || !/\.md$/i.test(String(f.path || ''))) continue;
+    let text = '';
+    try { text = readFileSync(f.abs, 'utf8'); } catch { continue; }
+    for (const m of text.matchAll(SCRIPT_REF_RE)) out.add(toPosix(m[1]));
+  }
+  return [...out].sort();
+}
+
+/** 把一组脚本展开成「它们 + 传递 import 闭包」的相对路径集合。
+ *
+ *  闭包里断一跳的后果是本文件早就记录过的事故：hook 报 `ERR_MODULE_NOT_FOUND`
+ *  而宿主退出码仍是 0，静默失去能力。所以这里**找不到的被引用脚本直接进 problems**，
+ *  让 buildPayload 停住 —— 生成一份引用坏掉的载荷比不生成更坏。
+ */
+export function scriptClosure(base, roots = [], problems = []) {
+  const seen = new Set();
+  const queue = [];
+  for (const rel of roots) {
+    if (existsSync(join(base, rel))) queue.push(toPosix(rel));
+    else problems.push(`被 markdown 引用的脚本不存在：${toPosix(rel)}`);
+  }
+  while (queue.length) {
+    const rel = queue.pop();
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    let text = '';
+    try { text = stripComments(readFileSync(join(base, rel), 'utf8')); } catch { continue; }
+    for (const m of text.matchAll(REL_IMPORT_RE)) {
+      // **用 relative()，不用字符串切片**：`resolve(dirname(rel), './x')` 在 rel 是
+      // 单段路径（如 `scripts/a.mjs`）时会解析成仓库根自身，`rel.slice(base.length + 1)`
+      // 于是退化成空串，闭包里混进一个 `''`。实测后果是 planPayload 拿 `join(base,'')`
+      // 去 readFileSync，报 `EISDIR: illegal operation on a directory`——一条与真实
+      // 问题（少一个脚本）毫无关系的报错，把真正的 problems 挤到第二位。
+      const abs = resolve(base, dirname(rel), m[1]);
+      const relPath = toPosix(relative(base, abs));
+      if (!relPath) { problems.push(`${rel} 里有一条解析到仓库根自身的导入：${m[1]}`); continue; }
+      // 只跟踪仓库内的文件；跳出根的相对导入不是本仓的东西
+      if (relPath.startsWith('..')) { problems.push(`${rel} 里有一条跳出仓库根的导入：${m[1]}`); continue; }
+      if (existsSync(abs)) queue.push(relPath);
+      else problems.push(`${rel} 导入的 ${m[1]} 不存在（解析成 ${relPath}）`);
+    }
+  }
+  return [...seen].sort();
+}
+
 /** 默认产物目录（绝对路径）。`root` 可换，测试用。 */
 export function defaultOutDir(root = REPO) {
   return resolve(String(root || REPO), DEFAULT_OUT);
@@ -183,6 +262,24 @@ export function summarizeSources(root = REPO) {
         });
       }
     }
+  }
+
+  // 3) scripts：**只带 `node scripts/*.mjs` 真的引用到的那些**，连同 import 闭包。
+  //
+  //    DF-060：载荷里曾长期没有任何脚本，而 SKILL.md 有 14 处 `node scripts/x.mjs`
+  //    （agents/ 里还有 4 处），交付出去的说明书里每一条命令都是 404。
+  //
+  //    **但把 scripts/ 整目录塞进去不是修法**：宿主的 plugin 会自动发现 `commands/`、
+  //    `agents/`、`skills/`、`hooks/` 这些目录，没有任何证据表明 `scripts/` 会被误认；
+  //    真正的问题是「带哪些」——整目录 96 个文件里只有 22 个在被引用的闭包内，
+  //    其余 74 个（含测试与一次性度量脚本）进载荷只是把别人的环境塞满。
+  //    所以这里按**引用闭包**取，且闭包一旦算不出来就报错，不生成半份。
+  const refRoots = referencedScriptRoots(files);
+  const closure = scriptClosure(base, refRoots, problems);
+  for (const rel of closure) {
+    const abs = join(base, rel);
+    if (!existsSync(abs)) { problems.push(`${rel} 在 import 闭包里但盘上不存在`); continue; }
+    files.push({ path: rel, source: rel, abs });
   }
 
   if (!files.some((f) => f.path.startsWith('agents/'))) problems.push('载荷里一个 agent 都没有');
@@ -466,6 +563,22 @@ export function checkPayload(opts = {}) {
   const expected = new Set([...declared.map((r) => String(r.path)), MANIFEST_FILE, '.claude-plugin/plugin.json']);
   for (const rel of walkRel(out)) {
     if (!expected.has(rel)) reasons.push(`载荷里有清单外的文件：${rel} —— 手工补进载荷的东西不经过 --check，等于第二真源`);
+  }
+
+  // 5.5 **引用的脚本必须真的在载荷里**
+  //
+  //     这是 DF-060 的直接回归防线：SKILL.md 曾经引用 14 条 `node scripts/x.mjs`
+  //     而载荷里一个脚本都没有，`--check` 全绿、`plugin validate --strict` 也全绿。
+  //     那两类检查都不读正文，所以只有这一条能发现它。
+  {
+    const mdRows = plan.rows.filter((r) => /\.md$/i.test(String(r.path || '')));
+    const refs = referencedScriptRoots(mdRows.map((r) => ({ ...r, abs: join(root, r.source) })));
+    const inPayload = new Set(declared.map((r) => String(r.path)));
+    for (const rel of refs) {
+      if (!inPayload.has(rel)) {
+        reasons.push(`载荷里的 markdown 引用了 ${rel}，但载荷里没有它 —— 交付出去的说明书里这条命令会 404`);
+      }
+    }
   }
 
   // 6. plugin.json 与版本一致

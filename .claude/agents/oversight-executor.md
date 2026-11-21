@@ -65,7 +65,7 @@ maxTurns: 60
 1. **只写你真的写过的路径**，路径照你实际用的那个写（绝对或相对都行，对账会归一化）。
 2. **字节数写不准就省略字节数，不要编一个**。编数字会让人以为你看过文件。
 3. 你每落一个文件后可以顺便跑一次 `claim`（`Bash` 在你的工具集里）：
-   `node scripts/claim-ledger.mjs claim --run <run-id> --task <task-id> --path <那个路径>`
+   `node "${UNTILDONE_PAYLOAD}/scripts/claim-ledger.mjs" claim --run <run-id> --task <task-id> --path <那个路径>`
    它会在那一刻记一份 sha256——**这是加分项，不是准入项**。不跑也不会漏，痕迹在 transcript 里。
 
 ## 禁止

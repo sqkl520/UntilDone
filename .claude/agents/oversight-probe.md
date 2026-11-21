@@ -5,7 +5,7 @@ description: |
   允许短生命周期，零产出不算失败。
 
   触发场景：
-  - 收件箱（`node scripts/watch.mjs --inbox`）里有 WAITING 但 needs 为空——
+  - 收件箱（`node "${UNTILDONE_PAYLOAD}/scripts/watch.mjs" --inbox`）里有 WAITING 但 needs 为空——
     宿主没说清在等什么，需要从 transcript 判断是循环、跑偏，还是真在等一个具体决定
   - 某 Agent 连续 3 窗 novelty < 0.2，需要判断是循环还是收窄
 

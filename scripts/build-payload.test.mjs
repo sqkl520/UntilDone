@@ -26,12 +26,14 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
 import {
   PAYLOAD_VERSION, MANIFEST_FILE, PLUGIN_NAME, DEFAULT_OUT,
   defaultOutDir, summarizeSources, payloadDigest, pluginManifest, pluginManifestBytes,
   planPayload, buildPayload, checkPayload, parseArgv, main, verifyPluginRoot,
+  referencedScriptRoots, scriptClosure,
 } from './build-payload.mjs';
 
 // ── 夹具 ──────────────────────────────────────────────────────────────
@@ -646,4 +648,135 @@ test('CLI：--verify-self 在不合法的根上 exit 1，在合法的根上 exit
     assert.equal(b.status, 1, '不合法的根必须 exit 1');
     assert.match(b.stderr, /不是合法的 plugin 根/);
   } finally { rmSync(good, { recursive: true, force: true }); rmSync(bad, { recursive: true, force: true }); }
+});
+
+// ── DF-060：交付的说明书里每条命令都必须真的能跑 ──────────────────────
+//
+// 这一组守的是一个**已经发生过**的失效：载荷里 12 个 agent + 1 个 skill，
+// 0 个脚本，而 SKILL.md 有 14 处 `node scripts/x.mjs`。
+// `--check` 当时全绿，`plugin validate --strict` 也全绿 —— 两者都不读正文。
+
+/** 造一个带脚本引用的最小源树。`scripts/` 下放什么由调用方决定。 */
+function mkSrcWithScripts(dir, { refs = ['a'], scripts = { 'a.mjs': 'export const a = 1;\n' } } = {}) {
+  mkdirSync(join(dir, '.claude', 'agents'), { recursive: true });
+  mkdirSync(join(dir, '.claude', 'skills', 's0'), { recursive: true });
+  mkdirSync(join(dir, 'scripts'), { recursive: true });
+  for (const [name, body] of Object.entries(scripts)) writeFileSync(join(dir, 'scripts', name), body, 'utf8');
+  writeFileSync(join(dir, '.claude', 'agents', 'x.md'),
+    `---\nname: x\ndescription: 测试角色\n---\n跑 node scripts/a.mjs\n`, 'utf8');
+  writeFileSync(join(dir, '.claude', 'skills', 's0', 'SKILL.md'),
+    `---\nname: s0\n---\n${refs.map((r) => `node scripts/${r}.mjs`).join('\n')}\n`, 'utf8');
+  return dir;
+}
+
+test('DF-060：markdown 里 `node scripts/x.mjs` 会被收集，且脚本进载荷', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, { scripts: { 'a.mjs': 'export const a = 1;\n' } });
+    const r = buildPayload({ root: dir, out: join(dir, 'out') });
+    assert.equal(r.ok, true, r.problems.join('\n'));
+    assert.ok(r.written.includes('scripts/a.mjs'), `载荷里没有 scripts/a.mjs：${r.written.join(',')}`);
+    // 反过来：agent 正文里引用的那个也必须进（agent 和 skill 走同一条收集）
+    assert.ok(r.written.includes('scripts/a.mjs'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-060：markdown 引用了不存在的脚本 → 不生成载荷，且报出那一条', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, { refs: ['a', 'nope'] });
+    const r = buildPayload({ root: dir, out: join(dir, 'out') });
+    assert.equal(r.ok, false, '悬空引用必须拦住生成');
+    assert.equal(r.written.length, 0, '不许生成半份载荷');
+    assert.ok(r.problems.some((p) => /nope/.test(p)), r.problems.join('\n'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-060：载荷里的 markdown 引用了不入载荷的脚本 → --check 红（这条是唯一能发现它的检查）', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir);
+    const out = join(dir, 'out');
+    assert.equal(buildPayload({ root: dir, out }).ok, true);
+
+    // 造出 DF-060 的形态：**源和载荷都被改成引用了 ghost.mjs**，但 ghost.mjs 不存在。
+    // 这样「源变了」「哈希对不上」「版本不符」三层都会是绿的 —— 只有 5.5 那条新检查会红。
+    // 这正是它存在的理由：其余六条检查全部看不出来。
+    const ghostLine = '\nnode scripts/ghost.mjs\n';
+    const srcSkill = join(dir, '.claude', 'skills', 's0', 'SKILL.md');
+    writeFileSync(srcSkill, readFileSync(srcSkill, 'utf8') + ghostLine, 'utf8');
+
+    const outSkill = join(out, 'skills', 's0', 'SKILL.md');
+    writeFileSync(outSkill, readFileSync(outSkill, 'utf8') + ghostLine, 'utf8');
+
+    const manifestPath = join(out, MANIFEST_FILE);
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const srcBuf = readFileSync(srcSkill);
+    const row = manifest.files.find((f) => f.path === 'skills/s0/SKILL.md');
+    row.bytes = srcBuf.length;
+    row.sha256 = createHash('sha256').update(srcBuf).digest('hex');
+    manifest.sourceDigest = payloadDigest(manifest.files);
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    writeFileSync(join(out, '.claude-plugin', 'plugin.json'),
+      pluginManifestBytes(manifest.sourceDigest), 'utf8');
+
+    const r = checkPayload({ root: dir, out });
+    assert.equal(r.ok, false, '载荷 markdown 引用了不存在的脚本，--check 必须红');
+    assert.ok(r.reasons.some((x) => /ghost/.test(x)),
+      `红的理由里没有 ghost —— 说明红在别的检查上，这条测试没验到它要验的东西：\n${r.reasons.join('\n')}`);
+    // 应当有两条，而且**必须包含 5.5 那一条**：
+    //   ① 源树有问题（生成期就会拦，`planPayload` 的 problems）
+    //   ② 载荷里的 markdown 引用了脚本但载荷里没有（本条新增，只有它读正文）
+    // 其余五条（清单自洽 / 源摘要 / 文件哈希 / 清单外文件 / 版本）都不该报 ——
+    // 因为这几层我们都手工对齐过了。若这里多出来，说明测试没验到 5.5。
+    assert.ok(r.reasons.some((x) => /交付出去的说明书里这条命令会 404/.test(x)),
+      `5.5 那条没报 —— 这条测试没验到它要验的东西：\n${r.reasons.join('\n')}`);
+    const other = r.reasons.filter((x) => !/ghost/.test(x));
+    assert.deepEqual(other, [], `出现了与 ghost 无关的理由，说明红在别的检查上：\n${other.join('\n')}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-060：注释里的 `from \'./m\'` 不算导入（否则载荷根本生成不出来）', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, {
+      scripts: {
+        'a.mjs': `// ESM 的 \`export { x } from './m'\` 只建立导出，不建立本地绑定\n`
+          + `/* 块注释里的 import('./nope.mjs') 也一样 */\n`
+          + 'export const a = 1;\n',
+      },
+    });
+    const r = buildPayload({ root: dir, out: join(dir, 'out') });
+    assert.equal(r.ok, true, `注释里的假导入把生成拦住了：${r.problems.join('\n')}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-060：闭包不产生空路径（空路径会让 planPayload 报 EISDIR 而非真实原因）', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, { scripts: { 'a.mjs': 'export const a = 1;\n' } });
+    const problems = [];
+    const c = scriptClosure(dir, ['scripts/a.mjs'], problems);
+    assert.ok(!c.includes(''), `闭包里混进了空路径：${JSON.stringify(c)}`);
+    assert.deepEqual(problems, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-060：传递 import 闭包会跟着带走（不能只拷第一层）', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, {
+      scripts: {
+        'a.mjs': "import { b } from './b.mjs';\nexport const a = b;\n",
+        'b.mjs': "import { c } from './c.mjs';\nexport const b = c;\n",
+        'c.mjs': 'export const c = 1;\n',
+        'unused.mjs': 'export const u = 1;\n',
+      },
+    });
+    const r = buildPayload({ root: dir, out: join(dir, 'out') });
+    assert.equal(r.ok, true, r.problems.join('\n'));
+    assert.ok(r.written.includes('scripts/b.mjs'), '第二层没跟来');
+    assert.ok(r.written.includes('scripts/c.mjs'), '第三层没跟来');
+    assert.ok(!r.written.includes('scripts/unused.mjs'), '没被引用到的脚本不该进载荷');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

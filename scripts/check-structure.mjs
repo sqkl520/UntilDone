@@ -1080,6 +1080,10 @@ const PROBE_ARGS = {
   planPayload: '[{"root": "/nonexistent-ow-probe"}]',
   checkPayload: '[{"root": "/nonexistent-ow-probe"}]',
   parseArgv: '[]',
+  // DF-060 引入的两个纯函数（脚本引用闭包）。同样喂不存在的路径 ——
+  // 「什么都没有」是它们的正常分支：没有 markdown → 引用集为空；闭包从空集展开也是空。
+  referencedScriptRoots: '[]',
+  scriptClosure: '["/nonexistent-ow-probe", []]',
   // check-config.mjs（2026-11-21，6 个常量参数化）：判定层全是纯函数，参数取最小
   // 可构造输入。三处读盘的一律用不存在的路径 —— 「什么都没有」是它们的正常分支，
   // 正好顺带把空分支验一遍，且绝不碰真实项目。

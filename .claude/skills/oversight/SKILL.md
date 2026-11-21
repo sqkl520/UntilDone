@@ -9,6 +9,25 @@ disable-model-invocation: true
 
 > 主线程只做三件事：**拆解、派发、汇总**。不亲自检索、分析、编码、写作。
 
+## 命令都在哪里跑
+
+本文件里所有 `node scripts/<名字>.mjs` 的形状，在**挂载了载荷的会话**里要写成
+`node "$UNTILDONE_PAYLOAD/scripts/<名字>.mjs"`。
+
+- `UNTILDONE_PAYLOAD` 是**挂载载荷的那个进程**（`overwatch launch`）注入的绝对路径，
+  指向这份载荷自身的根，所以载荷里有什么脚本，这条路径就能跑什么。
+- 它**不是** `CLAUDE_PLUGIN_ROOT`：那个变量只在 hook 命令里有值，
+  在 SKILL 正文里**不展开**（实测 400 次出现 vs 等长占位文本，token 比 4.02 : 4.01）。
+- 它**不是** `UNTILDONE_ROOT`：那个指「用户项目根」（`--root` 阶梯的第 2 级），
+  两个根不是一回事。
+- **怎么确认它是活的**：`node -e "console.log(process.env.UNTILDONE_PAYLOAD)"`。
+  打出空值说明当前会话不是经 `overwatch launch` 起的——那时本文件里的命令
+  在本仓库里直接跑就行，在别的项目里跑不了（载荷没挂上）。
+- **输出路径一律相对用户项目**（`tasks/runs/<run-id>/…`），不要写进载荷目录：
+  载荷是只读的构建产物，写进去会被下一次 `--check` 判成「被改过」。
+
+下面为了可读，命令仍写成 `node scripts/<名字>.mjs`；照上面替换前缀即可。
+
 ## 0. 先确认后台真的在工作
 
 ```bash

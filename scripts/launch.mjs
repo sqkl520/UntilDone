@@ -60,7 +60,7 @@
  * 零 npm 依赖，只用 node: 内置模块。
  */
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve, basename, isAbsolute, sep } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -68,6 +68,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { verifyPluginRoot } from './build-payload.mjs';
+import { referencedScriptRoots, scriptClosure } from './build-payload.mjs';
 import { discoverRoles } from './roles.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -428,12 +429,53 @@ function askProtocol(config, mode) {
  *  只补这一个键，别的原样传：改用户的环境是越界，补一个「没有它功能必然坏」的
  *  系统变量是兜底。非 win32 上原样返回（POSIX 没有这个概念）。
  */
-function childEnv() {
+function childEnv(mountDir = '') {
   const env = { ...process.env };
   if (process.platform === 'win32' && !env.PATHEXT) {
     env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
   }
+  // **DF-060 的解**：SKILL.md 里的命令写 `node "$UNTILDONE_PAYLOAD/scripts/x.mjs"`，
+  // 由挂载载荷的**这个进程**把绝对路径塞进子进程环境。
+  //
+  // 为什么不是 `${CLAUDE_PLUGIN_ROOT}`：那是**给 hook 命令用的**，实测 SKILL 正文里
+  // 不展开（400 次出现 vs 等长占位文本，token 比 4.02 : 4.01 —— 完全没膨胀）。
+  // 为什么不是「让模型自己找」：宿主文档查不到 SKILL 的基目录变量，`plugin details`
+  // 也不输出目录，模型没有任何可靠线索。
+  // 为什么不用 `UNTILDONE_ROOT`：那个名字在本仓已经指「用户项目根」（project-root.mjs
+  // 的阶梯第 2 级），拿它指框架根会把两个根重新混成一个 —— 那正是 DF-043 修掉的东西。
+  //
+  // 只在**真的挂了载荷**时才设：`--no-payload` 时设它等于给模型指一个不存在的目录。
+  //
+  // `mountDir` 有两种形态，脚本不一定在里面：
+  //   · 发布形态：`dist/payload/` 或 roster 分身 —— 里面有 `scripts/`（build-payload 生成）
+  //   · 本仓自用：`.claude/` —— 里面**没有** `scripts/`，脚本在仓库根的 `scripts/`
+  // 所以这里要能回答「从这个载荷根出发，脚本在哪」。答案为空时不设，
+  // 让 SKILL 里那条「打出来是空值说明没经 launch 起」的分支生效 —— 明说，不猜。
+  if (mountDir) {
+    const scriptsInside = join(resolve(String(mountDir)), 'scripts');
+    if (existsSync(scriptsInside)) env.UNTILDONE_PAYLOAD = resolve(String(mountDir));
+    else {
+      const scriptsBeside = join(resolve(String(mountDir)), '..', 'scripts');
+      if (existsSync(scriptsBeside)) {
+        // `.claude/` 这种形态：脚本在它的兄弟目录。**把 `..` 规范化掉**，
+        // 否则 SKILL 里的路径会带一段 `..`，在不同 cwd 下的相对解析容易出岔。
+        env.UNTILDONE_PAYLOAD = resolve(String(mountDir), '..');
+      }
+    }
+  }
   return env;
+}
+
+/** 收集一个 skills 目录下所有 `SKILL.md`（只要入口文件，参考文件不必扫）。 */
+function walkSkills(skillsDir, out = []) {
+  let entries = [];
+  try { entries = readdirSync(skillsDir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const full = join(skillsDir, e.name);
+    if (e.isDirectory()) walkSkills(full, out);
+    else if (e.name === 'SKILL.md') out.push({ path: `skills/${e.name}`, abs: full });
+  }
+  return out;
 }
 
 /** 按 roster 现场生成一份只含启用角色的载荷目录。返回 `null` = 不筛。
@@ -480,6 +522,59 @@ function applyRoster({ root, payload, roster }) {
     // **skills 不带**：`SKILL.md` 引用了全部 12 个角色名，
     // 只给一部分会让它派发到不存在的角色 —— 那是比「少一个角色」更坏的失败。
     // 所以分身只挂 agents，skill 留在整目录那份里（用户按需自己选）。
+    //
+    // **但 `scripts/` 必须带**（DF-060）：`UNTILDONE_PAYLOAD` 指向的就是这个分身目录，
+    // 而它同时是 `--plugin-dir`。不带脚本的话，角色正文里那些
+    // `node "$UNTILDONE_PAYLOAD/scripts/x.mjs"` 全部 MODULE_NOT_FOUND。
+    //
+    // **只带被引用的闭包，不是整个 `scripts/`**：整目录 96 个文件里含测试与一次性
+    // 度量脚本，每次启动都拷一遍既慢又把无关的东西塞进别人环境。闭包算法与
+    // `build-payload.mjs` 同源 —— 那里已经在生成载荷时算过一次，这里复用它。
+    //
+    // **脚本不一定长在 payload 目录里**：发布形态（`dist/payload/`）里它在，
+    // 本仓自用形态（`.claude/`）里它在仓库根的兄弟目录。两处都试。
+    // 「退回整目录」是**最后手段**：它会让 roster 筛选整个失效，
+    // 所以宁可多试一条路径，也不要把「带了脚本」当成「可以牺牲筛选」的交换条件。
+    const scriptsFrom = [join(payload.dir, 'scripts'), join(root, 'scripts')]
+      .find((p) => existsSync(p));
+    if (!scriptsFrom) {
+      return { dir: payload.dir, enabled, skipped, why: '找不到 scripts/，退回整目录：分身会让角色正文里的命令全部 404' };
+    }
+    const roots = referencedScriptRoots(
+      enabled.map((a) => ({ path: `agents/${a}.md`, abs: join(payload.dir, 'agents', `${a}.md`) })),
+    ).filter((rel) => rel.startsWith('scripts/'));
+    const base = resolve(scriptsFrom, '..');
+    const missing = [];
+    const closure = scriptClosure(base, roots, missing);
+    if (missing.length) {
+      return { dir: payload.dir, enabled, skipped, why: `脚本闭包算不出来（${missing[0]}），退回整目录` };
+    }
+    // **闭包为空也要建 `scripts/`**：roster 里启用的角色可能没引用任何脚本
+    // （实测 acceptor / planner 都没有），但 `UNTILDONE_PAYLOAD` 仍然指向这个目录，
+    // 而 SKILL 与后续派发的 executor 会往里找 `scripts/x.mjs`。
+    // 建一个空目录的效果是「路径存在但脚本不在」——那比「路径不存在」更容易被
+    // `childEnv` 的 `existsSync` 误判成可用，所以这里不能只建空壳。
+    // 做法：闭包为空时退回带**最小可运行集**（SKILL 用到的那 7 个顶层脚本的闭包）。
+    let finalClosure = closure;
+    if (!finalClosure.length) {
+      const skillDocs = [join(payload.dir, 'skills')]
+        .filter((p) => existsSync(p))
+        .flatMap((d) => walkSkills(d));
+      const allRoots = skillDocs.length
+        ? referencedScriptRoots(skillDocs)
+        : ['scripts/watch.mjs', 'scripts/asked.mjs', 'scripts/scan-sessions.mjs',
+          'scripts/validate-run.mjs', 'scripts/compose-agent-prompt.mjs',
+          'scripts/claim-ledger.mjs', 'scripts/check-structure.mjs'];
+      finalClosure = scriptClosure(base, allRoots.filter((r) => r.startsWith('scripts/')), missing);
+      if (missing.length) {
+        return { dir: payload.dir, enabled, skipped, why: `最小脚本集算不出来（${missing[0]}），退回整目录` };
+      }
+    }
+    for (const rel of finalClosure) {
+      const dest = join(out, rel);
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(join(base, rel), dest);
+    }
   } catch (e) {
     return { dir: payload.dir, enabled, skipped, why: `生成失败，退回整目录：${(e && e.message) || e}` };
   }
@@ -1185,7 +1280,7 @@ async function launchMain(argv, { json = false, nowMs = Date.now() } = {}) {
         // 而宿主退出码仍是 0 —— 用户看到的是「装好了、一切正常」，实际一条闸都没生效。
         // 继承 `process.env` 意味着「用户从干净环境启动时，我们把这个残缺原样传给宿主」；
         // 补齐它，是我们能替用户兜住的一件事。
-        env: childEnv(),
+        env: childEnv(plan.mountDir),
       });
     } catch (e) {
       finish({ code: null, out: '', err: String((e && e.message) || e), spawnError: true });

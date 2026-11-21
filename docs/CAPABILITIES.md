@@ -19,6 +19,7 @@
 | 先看会挂上什么，不执行 | `node scripts/overwatch.mjs launch --dry-run` | 载荷 / roster / 两条 hook / 逐字命令行 |
 | **只验载荷挂对没有**（不需登录、不需推理） | `node scripts/overwatch.mjs launch --verify` | 宿主列出的角色与 `git` 跟踪的**源定义**（12 份）逐个对；缺一个即非零退出。**验的是源目录完整，不是实际挂载数** |
 | 在你自己的项目里用（载荷不变，工作目录变） | `node scripts/overwatch.mjs launch --cwd <你的项目>` | 上面同一条，只是 `--cwd` 指过去 |
+| **会话里那些脚本命令从哪跑** | `node -e "console.log(process.env.UNTILDONE_PAYLOAD)"` | `launch` 注入的载荷根绝对路径。SKILL 与角色正文里的命令写成 `node "$UNTILDONE_PAYLOAD/scripts/<名字>.mjs"`。**打空值 = 这个会话不是经 `launch` 起的**，那些命令只在框架仓库里能跑。不用 `CLAUDE_PLUGIN_ROOT`：它在 SKILL 正文里不展开（实测） |
 | 扫全部会话，压成一张表（顺序固定：先按状态，同状态按闲置时长降序） | `node scripts/scan-sessions.mjs --days 3` | 每个会话一行：状态 / calls / novelty / idle / reason。**没有 `--sort` 参数** |
 | 看某个命令怎么用（不执行） | `node scripts/scan-sessions.mjs --help` | 用法与退出码；0.4 秒返回，**不做任何扫描** |
 | 机器可读的同一份数据 | `node scripts/scan-sessions.mjs --json` | `sessions[]`，TUI 与下游脚本的输入 |

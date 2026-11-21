@@ -69,7 +69,7 @@ maxTurns: 50
 每落一个文件后可以顺便跑一次 `claim`（`Bash` 在你的工具集里）：
 
 ```bash
-node scripts/claim-ledger.mjs claim --run <run-id> --task <task-id> --path <那个路径>
+node "${UNTILDONE_PAYLOAD}/scripts/claim-ledger.mjs" claim --run <run-id> --task <task-id> --path <那个路径>
 ```
 
 它会在那一刻记一份 sha256。**这是加分项，不是准入项**——不跑也不会漏，痕迹在 transcript 里。
