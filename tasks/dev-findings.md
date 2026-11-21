@@ -2742,3 +2742,23 @@ const LIVING_DOCS = [
 - 与 DF-051 的区别：DF-051 是「检查内容绑死本仓文档」，本条是「检查范围只认一个入口」。
   前者让别人项目报红，后者让本仓自己加东西不被校验 —— 两个方向都漏。
 - 建议归属：独立任务（方案 A 的主体，未做）
+
+### DF-062 [open] 载荷形态下没有角色目录约定：`rolesFor` 回落去找 `<payload>/.claude/agents`（0 个）
+
+- 发现于：2026-11-21 修完 DF-060 后的端到端验证
+- 位置：`scripts/roles.mjs:231` `rolesDirFor(root)` 写死 `join(root,'.claude','agents')`；
+  `:289-295` 的框架回落用模块常量 `AGENTS_DIR`（= 框架仓库的 `.claude/agents`）
+- 证据（在 `/tmp/final/proj` 这个外部项目里，载荷已按 DF-060 生成并挂上）：
+  ```
+  $ UNTILDONE_PAYLOAD=/tmp/final/plug node "$UNTILDONE_PAYLOAD/scripts/validate-run.mjs"
+  [validate-run] 角色表 → 框架角色目录 …\plug\.claude\agents（0 个；用户项目里没有 .claude/agents/）
+  ```
+  而角色实际在 `<payload>/agents/`（12 个，宿主认的正是这个布局）。
+- 影响：DF-060 修好了「脚本找得到」，但**角色找不到**。`validate-run` / `compose-agent-prompt` /
+  `render-plan` 在载荷形态下拿到的角色表是空的 —— 它们要么报错，要么按空表判定。
+  这条路在载荷形态下仍然不通，只是失败位置从「MODULE_NOT_FOUND」挪到了「0 个角色」。
+- **为什么本轮不修**：`rolesDirFor` 有三个消费者（`validate-run` / `compose-agent-prompt` /
+  `render-plan`），且它的回落逻辑对**本仓自用**形态是正确的（那里确实该找 `.claude/agents`）。
+  改法需要先定「载荷形态下 role 目录的约定是什么」，那是设计决定，不是修 bug。
+  候选：给 `rolesFor` 加一个 `payloadDir` 参数，或让它按 `UNTILDONE_PAYLOAD` 环境变量探测。
+- 建议归属：独立任务
