@@ -21,6 +21,71 @@
 
 ---
 
+## [Unreleased] - 2026-11-21 守护进程死后 43 小时，`--health` 还在打「✓ log 正常」（DF-068/069/070）
+
+现场：`watch.mjs` 死了 **43 小时**（`SIGABRT`，原生层 `node::Realloc` 断言失败，
+`asked.mjs:257` 整文件 `readFileSync`）。派测绘 + 检索两个 Agent 摸底，
+结论是：**判据层全对，呈现层全废。**
+
+| 路径 | 会看到「没有在工作」吗 | 会变成退出码吗 |
+|---|---|---|
+| `watch.mjs --health` | 是 | **是（1）** |
+| `watch.mjs --inbox` | 是 | **是（3）** |
+| `oversight-tui` | 是（首屏红字） | 否 |
+| `install-watcher.mjs status` | 是 | **否（恒 0，只看文件在不在）** |
+| `overwatch.mjs doctor` | 是 | 否（只看 `transcripts.kind`） |
+| CI | 否（没查） | — |
+
+每条呈现路径的触发条件都是「人先敲一条命令」。检索给的外部判据
+（Kubernetes 文档）说得很直白：**"A probe is a diagnostic performed periodically by the kubelet"** ——
+检查的执行者必须在被检查对象之外。而我们的 `--health` 由人手动敲，没有周期。
+
+### Fixed
+
+1. **`--health` 的 log 层加陈旧度判据（DF-069）**。原来只判 `logHealth.healthy === true`，
+   `at` 只被塞进 `layers` 却**从不与 `nowMs` 比较**。守护进程是 SIGABRT 死的，
+   logger 来不及写 `healthy:false`，盘上最后一份永远是 `healthy:true` ——
+   于是这一层在死后 43 小时还在打 `✓ log 正常`。现在上限 `PROBE_INTERVAL * 3`（15 分钟；
+   该文件每 60 秒重写一次），与 jobs/probe 的 `interval * 3` 同构。
+
+2. **`install-watcher.mjs status` 接上存活状态（DF-070）**。原来
+   `return same && existsSync(lnk) ? 0 : 1` —— 只看启动器和快捷方式在不在，
+   `h.status` 从未被读。它上一行刚打印过「判定：没有在工作」，下一行却 exit 0。
+   现在三档：1 = 安装状态坏 / **2 = 装好了但不健康** / 0 = 在跑。实测真仓库从 0 变成 2。
+
+3. **`doctor` 的总结行说真话（DF-068）**。原来逐项如实报过「health 说 没有在工作」，
+   同一屏的总结却说「**前提齐了，可以跑 scan**」。现在改为「但后台监视装着却没在工作」。
+
+### 一处改了又撤回（记在这里，比修复本身更值得留）
+
+`doctor` 的退出码我一开始也接了 watcher（返回 3），然后撤回。三条理由：
+
+1. **违背已声明的契约**：`docs/CAPABILITIES.md:17` 明写「8 项前提事实，**每行只说读到什么，
+   不出红绿灯**；空（exit 2）与坏（exit 3）分开」。退出码是「哪类前提读不出」，不是健康分。
+2. **实测把三条无关测试打红**：`overwatch.test.mjs` 里「空目录 = 有根但 0 份」等三条
+   与 watcher 毫无关系的用例全红 —— 它们跑真 `doctor`、读真 `REPO` 的启动器。
+3. **没装 watcher 是合法状态**，接了会让 CI 和新 clone 永久 exit 3。
+
+**我先动手，后查契约。** 撤回过程写进 `tasks/dev-findings.md`。
+
+### 不做：自动重启
+
+DF-028/DF-054 都记过「死后自动重启，没做」。这次明确**不做**，理由三条：
+微软已把 **VBScript 标记废弃**（Server 2028 起 `wscript` 跑不了），此时往这条链路上加重启循环
+是往死路上投资；本机 `schtasks` **已实测全面失效**（`docs/install-watcher.md:162-177`）；
+且 Windows 的失败恢复只覆盖「终止」，不覆盖「活着但不动了」——
+而我们要的恰是后者。
+
+### 验证
+
+```
+node scripts/watch.mjs --health      → ✗ log 故障（原来 ✓ log 正常）
+node scripts/install-watcher.mjs status; echo $?  → 2（原来 0）
+node scripts/overwatch.mjs  (总结行) → **但后台监视装着却没在工作**
+```
+
+负向：把 `const aged = ...` 改成 `const aged = false;` → DF-069 测试红（170/171）。
+
 ## [Unreleased] - 2026-11-21 剥注释会吞掉真导入，载荷可能交付一个一跑就崩的脚本（DF-066）
 
 审查 DF-063（`render-plan` 不在载荷里）时顺手捞到的，与 DF-063 无关，但严重得多。

@@ -180,7 +180,21 @@ function main(argv) {
     const h = spawnSync(process.execPath, [join(repo, 'scripts', 'watch.mjs'), '--health'], { encoding: 'utf8' });
     const healthOut = String(h.stdout || '').trim();
     console.log(healthOut ? healthOut.split(String.fromCharCode(10)).map((l) => '  ' + l).join(String.fromCharCode(10)) : '  （无法判定）');
-    return same && existsSync(lnk) ? 0 : 1;
+    // **退出码要接上存活状态（DF-070）。**
+    //
+    // 修前这里是 `return same && existsSync(lnk) ? 0 : 1` —— 只看启动器和快捷方式
+    // 在不在，**`h.status` 从未被读**。于是「装好了但没在跑」这个 DF-023 专门
+    // 要防的情况，恰恰被判成 0：今天启动器与快捷方式都在，它上一行刚打印过
+    // 「判定：没有在工作」，下一行却 exit 0。任何用退出码做判据的东西都读不到。
+    //
+    // 现在三档分开：
+    //   1 = 启动器/快捷方式缺失（安装状态坏了）
+    //   2 = 装好了，但 `--health` 说不健康（存活状态坏了）—— 与 1 区分，
+    //       因为处置完全不同：一个要重装，一个要重启守护进程
+    //   0 = 装好了且在跑
+    // `h.status` 为 null 表示 spawn 本身失败（node 不在 / 权限），也算不健康。
+    if (!(same && existsSync(lnk))) return 1;
+    return h.status === 0 ? 0 : 2;
   }
 
   if (cmd === 'install') {

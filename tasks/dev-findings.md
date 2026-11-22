@@ -2990,3 +2990,153 @@ const LIVING_DOCS = [
 - 为什么难自动判：脚本的合法无消费者形态有好几种（被 import 的内部模块、一次性度量、
   只给测试用的负向验证器）。**做这条检查前必须先定义「什么算孤儿」**，否则会误杀。
 - 建议归属：独立任务（先定判据，再决定要不要做成检查）
+
+### DF-068 [fixed] `doctor` 报出「watcher 没有在工作」，同一屏的总结却说「前提齐了，可以跑 scan」，退出码 0
+
+- 发现于：2026-11-21 主线程核查 DF-054 时发现
+- 证据（同一条命令、同一屏输出）：
+  ```
+  $ node scripts/overwatch.mjs
+  [ 514ms] watcher  启动器 在 · 快捷方式 在 · health 说 没有在工作 · jobs 上次 41.2前 · probe 上次 41.3前 · log 正常 …
+  …
+  合计 1079ms … —— 前提齐了，可以跑 scan      ← 与上一行直接矛盾
+
+  $ node scripts/overwatch.mjs > /dev/null; echo $?
+  0                                            ← watcher 死着，退出码仍是 0
+  ```
+- **这条比 DF-054 更精确**。DF-054 说「判得准但没人被通知到」——实际是：
+  **判得准、也印出来了，但同一屏的总结把它否掉了，而且退出码是 0。**
+  读那屏的人最后一眼看到的是「前提齐了，可以跑 scan」。
+- 影响：`doctor` 是「干净 clone 上不知道第一条命令该跑什么」的入口
+  （`docs/CAPABILITIES.md:17`：8 项前提事实）。它现在的行为是：
+  逐项如实报 → 汇总时一律说「齐了」。任何用退出码做判据的脚本都会得到「正常」。
+- 与 DF-054 的关系：DF-054 记的是「进程死了 41 小时」这个**事故**；
+  本条记的是「有检测、有输出、但结论被自己的总结覆盖」这个**机制**。
+- 建议归属：独立任务（小修：总结行要反映不健康项，退出码要非零）
+
+### DF-069 [fixed] `--health` 的 log 层没有陈旧度判据：守护进程死后 41 小时，它照样打 `✓ log 正常`
+
+- 发现于：2026-11-21 测绘 Agent 指出；主线程复核
+- 位置：`scripts/watch.mjs:2862-2879` 的 `healthCheck()` 日志层分支
+- 证据（主线程实测）：
+  ```
+  $ node scripts/watch.mjs --health
+    ✗ jobs   上次 41.2 小时前 …
+    ✗ probe  上次 41.3 小时前 …
+    ✓ log    正常                        ← 这一层是假的
+    ✗ proc   进程已退出（PID 24908 已不在）
+
+  $ ls -l %LOCALAPPDATA%/Overwatch/log-health.json
+    Nov 21 04:20                        ← 41 小时前
+  $ cat log-health.json
+    { "healthy": true, "at": "2026-11-20T20:20:37.750Z", … }
+  ```
+- 机制：代码只判 `logHealth.healthy === true`；`logHealth.at` 被塞进 `layers[].at`
+  （`:2872`）但**从不与 `nowMs` 比较**。所以「日志系统上次自报健康」这个事实
+  被当成了「日志系统现在健康」。
+- 为什么它偏偏在这时候撒谎：守护进程是 `SIGABRT` 死的（原生层 `node::Realloc` 断言失败，
+  `asked.mjs:257` 整文件 `readFileSync`），**logger 来不及写 `healthy:false`**。
+  于是盘上留下的最后一份是 `healthy:true`，永不过期。
+- 影响：这是本仓最稳定的缺陷类型（门报绿但检查没跑 / 报绿但判据是旧的）的又一实例。
+  `--health` 的四层里，**jobs 和 probe 会正确地红，log 会错误地绿** ——
+  一个检查里混着两种可信度，读者无法从格式上分辨。
+- 修法方向（不在此条内定）：log 层要么加 `at` 的陈旧度上限（与 jobs/probe 同构），
+  要么在心跳已停时直接不报这一层（因为它的信息已经过期，报绿等于撒谎）。
+- 建议归属：独立任务（小修，与 DF-068 同批）
+
+### DF-070 [partially fixed] 两个「产品自己推荐」的入口把 `--health` 的退出码丢了：判据对、外壳丢
+
+- 发现于：2026-11-21 测绘 Agent 指出；主线程逐行复核
+- 两处，都是「读了 stdout，丢掉了 code」：
+
+  **① `scripts/install-watcher.mjs:180-183`**
+  ```js
+  const h = spawnSync(process.execPath, [..., '--health'], { encoding: 'utf8' });
+  const healthOut = String(h.stdout || '').trim();
+  console.log(…);
+  return same && existsSync(lnk) ? 0 : 1;      // ← h.status 从未被读
+  ```
+  退出码只看「启动器和快捷方式在不在」。今天两个都在 → 返回 0，
+  尽管它上一行刚打印过「判定：没有在工作」。**这与 DF-023 记的是同一个坑
+  （「安装状态 ≠ 存活状态」），换了个位置复发。**
+
+  **② `scripts/overwatch.mjs:717-724`**
+  ```js
+  const code = transcripts.kind === 'absent' ? EXIT.EMPTY
+    : transcripts.kind === 'unreadable' ? EXIT.UNREADABLE : EXIT.OK;   // ← 只看 transcripts
+  ...
+  line: `… —— 前提齐了，可以跑 scan`,
+  ```
+  `checkWatcherLive()` 拿到的 `r.code`（`runNode` 在 `:228` 如实带回了）**没有进退出码**。
+
+- 证据（主线程实测）：
+  ```
+  $ node scripts/overwatch.mjs;  echo $?   → 0   （同屏印着「health 说 没有在工作」）
+  $ node scripts/install-watcher.mjs status; echo $?  → 0
+  $ node scripts/watch.mjs --health; echo $?  → 1   ← 唯一对的那个，恰是最少人直接敲的
+  ```
+- 影响：任何用退出码做判据的东西（CI、脚本、hook）从这两个入口都读不到「不健康」。
+  这两个正是 `docs/CAPABILITIES.md` 推荐给用户的第一批命令。
+- 与 DF-068 合并读：DF-068 记的是「doctor 的总结行与它自己的输出矛盾」，
+  本条记的是「两个入口的退出码都没接上」。同一个病根的两面。
+- 建议归属：独立任务（小修，与 DF-068/069 同批）
+
+---
+
+## 2026-11-21 DF-068/069/070 的修法与一处撤回
+
+### DF-069 修了：log 层加陈旧度判据
+
+`healthCheck()` 的 log 层原来只判 `logHealth.healthy === true`，`at` 只被塞进 `layers`
+却从不与 `nowMs` 比较。现在加 `LOG_LIMIT = PROBE_INTERVAL * 3`（15 分钟）——
+`log-health.json` 由 `HEALTH_EVERY_MS = 60_000`（60 秒）重写一次，45 倍余量。
+
+修后实测（同一状态）：
+```
+✗ jobs   上次 42.9 小时前
+✗ probe  上次 42.9 小时前
+✗ log    故障                                  ← 原来是 ✓ log 正常
+✗ proc   进程已退出（PID 24908 已不在）
+  - log：健康记录已 42.9 小时 未更新（上限 15 分钟）—— 最后一份写的是「健康」，
+    但那之后没有任何东西再写过它
+```
+
+**负向**：把 `const aged = ageMs != null && ageMs > LOG_LIMIT;` 改成 `const aged = false;`
+→ DF-069 测试红（170/171）。
+
+### DF-068 修了：总结行说真话
+
+`doctor` 的总结行原来无论 watcher 死活都说「前提齐了，可以跑 scan」。
+现在按 `facts.launcherPresent === true && verdict 含「没有在工作」` 判断，
+改为「**但后台监视装着却没在工作**……「没有在等你」这类结论现在不可信」。
+
+### DF-070 只修了一半：`install-watcher status` 修了，`doctor` 的退出码**撤回不改**
+
+`install-watcher.mjs:183` 那处是真 bug，修了：
+```js
+修前：return same && existsSync(lnk) ? 0 : 1;      // h.status 从未被读
+修后：if (!(same && existsSync(lnk))) return 1;     // 安装状态坏
+      return h.status === 0 ? 0 : 2;                // 存活状态坏（与 1 分开：处置不同）
+```
+实录：真仓库上 `install-watcher.mjs status` 从 **0 变成 2**。
+
+**但 `doctor` 那处我改了又撤回。** 一开始把 watcher 不健康也接进退出码（返回 3），
+然后：
+
+1. **违背已声明的契约。** `docs/CAPABILITIES.md:17` 给 `doctor` 的契约原文：
+   「8 项前提事实，**每行只说读到什么，不出红绿灯**；空（exit 2）与坏（exit 3）分开」。
+   退出码的语义是「哪一类前提读不出」，不是「整体健康分」。
+2. **实测把三条无关测试打红。** `overwatch.test.mjs` 里「空目录 = 有根但 0 份」
+   等三条与 watcher 毫无关系的用例全部失败 —— 它们跑真 `doctor`、读真 `REPO` 下的启动器，
+   一旦退出码掺了本机守护进程状态，测试就随那台机器的死活而红。
+3. **没装 watcher 是完全合法的状态**（有人就是不想让它后台跑）。
+   接进退出码会让 CI、新 clone 的仓库永久 exit 3 ——「永久报红等于没有信号」，
+   这条本仓台账里记过多次。
+
+所以本条改为 `[partially fixed]`：**外壳该修的修了，不该接的不接。**
+撤回过程记在这里，因为它比修复本身更值得留：**我先动手，后查契约。**
+
+### 新增测试
+
+`DF-069：log-health 陈旧必须判不健康`（含边界：刚好在限内 / 刚好越界 / `at` 缺失）。
+`at` 缺失时保持原判（不新增误报），但 `ageMs: null` 让读者能识别「没判过」。

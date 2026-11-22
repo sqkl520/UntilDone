@@ -2863,18 +2863,38 @@ export function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIOD
     layers.push({ name: 'log', verified: false, stale: null, reason: '尚无日志健康记录（从未出现过故障）' });
   } else if (logHealth && typeof logHealth === 'object') {
     const ok = logHealth.healthy === true;
+    // **陈旧度判据（DF-069）**：`log-health.json` 每 60 秒重写一次
+    // （`HEALTH_EVERY_MS`，见本文件写侧）。只判 `healthy === true` 而不判年龄，
+    // 等于把「上次自报健康」当成「现在健康」——守护进程是 SIGABRT 死的
+    // （原生层断言失败，logger 来不及写 healthy:false），盘上留下的最后一份
+    // 永远是 healthy:true，于是这一层在死后 41 小时还在打 `✓ log 正常`。
+    //
+    // 上限取 `PROBE_INTERVAL * 3`（15 分钟）：日志健康由同一条 tick 路径刷新，
+    // 与 probe 同周期；三倍是给慢盘和偶发卡顿留的余量，与上面 jobs/probe 的
+    // `interval * 3` 同构。
+    const LOG_LIMIT = PROBE_INTERVAL * 3;
+    const atMs = Date.parse(String(logHealth.at || ''));
+    const ageMs = Number.isFinite(atMs) ? nowMs - atMs : null;
+    const aged = ageMs != null && ageMs > LOG_LIMIT;
     layers.push({
       name: 'log',
       verified: true,
-      stale: !ok,
+      stale: !ok || aged,
       kind: logHealth.kind || null,
       detail: logHealth.detail || null,
       at: logHealth.at || null,
+      ageMs,
+      limit: LOG_LIMIT,
       sizeBytes: logHealth.sizeBytes ?? null,
     });
     if (!ok) {
       reasons.push(`log：日志系统故障（${logHealth.kind || 'unknown'}）${logHealth.detail ? `：${logHealth.detail}` : ''}` +
         `${logHealth.streak > 1 ? `（连续 ${logHealth.streak} 次）` : ''}`);
+    } else if (aged) {
+      // 用「自报健康」而不是只说「过期」，因为这句话要解释的是
+      // 「为什么那个 ✓ 不可信」：它的最后一份记录本身是绿的，只是太久没更新。
+      reasons.push(`log：健康记录已 ${fmtAge(ageMs)} 未更新（上限 ${fmtAge(LOG_LIMIT)}）`
+        + ' —— 最后一份写的是「健康」，但那之后没有任何东西再写过它');
     }
   }
   // 进程层（DF-028）。**只在心跳已经停了的时候才说话。**

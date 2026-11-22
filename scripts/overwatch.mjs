@@ -710,6 +710,36 @@ async function runDoctor(opts) {
   const elapsedMs = Date.now() - started;
   const wallMs = bootMs + elapsedMs;
 
+  // **watcher 不健康必须进退出码（DF-068 / DF-070）。**
+  //
+  // 修前 `code` 只由 `transcripts.kind` 决定，watcher 那一项拿到了 `r.code`
+  // （`runNode` 在 `:228` 如实带回了）却**没有用**。于是同一屏里
+  // 「watcher … health 说 没有在工作」与「前提齐了，可以跑 scan」并排出现，
+  // 退出码 0 —— 读那屏的人最后一眼看到的是后者。
+  //
+  // **退出码保持原样：只由 `transcripts.kind` 决定（DF-068 的取舍）。**
+  //
+  // 我一开始把 watcher 不健康也接进了退出码（返回 3）。查文档后撤回：
+  // `docs/CAPABILITIES.md:17` 给 `doctor` 的契约是「**8 项前提事实，每行只说
+  // 读到什么，不出红绿灯**；空（exit 2）与坏（exit 3）分开」——退出码的语义是
+  // 「哪一类前提读不出」，不是「整体健康分」。
+  //
+  // 把它改成健康分有两个具体后果：
+  // 1. 没装 watcher 的机器（合法状态）、CI、新 clone 的仓库会永久 exit 3
+  //    —— 本仓台账里「永久报红等于没有信号」已经记过多次；
+  // 2. 更要紧的是**测试会随本机守护进程死活而红**。实测：改完之后
+  //    `overwatch.test.mjs` 里三条与 watcher 无关的用例全部失败，
+  //    因为它们跑的是真 `doctor`、读的是真 `REPO` 下的启动器。
+  //
+  // 真正该修的是**总结行**：它逐项如实报过「health 说 没有在工作」，
+  // 却在同一屏说「前提齐了」。那句话是**陈述**，不是红绿灯，改它不违背契约。
+  const watcherStep = steps.find((s) => s && s.id === 'watcher');
+  const watcherFacts = (watcherStep && watcherStep.facts) || {};
+  const watcherInstalled = watcherFacts.launcherPresent === true;
+  const watcherVerdict = typeof watcherFacts.verdict === 'string' ? watcherFacts.verdict : null;
+  const watcherUnhealthy = watcherInstalled
+    && typeof watcherVerdict === 'string' && watcherVerdict.includes('没有在工作');
+
   const code = transcripts.kind === 'absent'
     ? EXIT.ABSENT
     : transcripts.kind === 'unreadable' ? EXIT.UNREADABLE : EXIT.OK;
@@ -717,11 +747,15 @@ async function runDoctor(opts) {
   const summary = {
     code,
     kind: transcripts.kind,
+    watcherUnhealthy,
     line: transcripts.kind === 'absent'
       ? `transcript 根不存在：${transcripts.facts.root} —— 先在这台机器上用一次 Claude Code，doctor 才有东西可查`
       : transcripts.kind === 'unreadable'
         ? `transcript 根读不出：${transcripts.facts.root}（${transcripts.facts.errno || '原因未知'}）—— 这是环境问题，不是「没有会话」`
-        : `${transcripts.facts.projects} 个项目 / ${transcripts.facts.transcripts} 份 transcript —— 前提齐了，可以跑 scan`,
+        // watcher 装了但死着时说「前提齐了」是假话：它自己上一行刚判过「没有在工作」。
+        : watcherUnhealthy
+          ? `${transcripts.facts.projects} 个项目 / ${transcripts.facts.transcripts} 份 transcript —— **但后台监视装着却没在工作**（见上面 watcher 那行），「没有在等你」这类结论现在不可信`
+          : `${transcripts.facts.projects} 个项目 / ${transcripts.facts.transcripts} 份 transcript —— 前提齐了，可以跑 scan`,
   };
 
   return {

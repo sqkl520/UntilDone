@@ -3133,3 +3133,37 @@ test('DF-028 进程见证独立于 owner.json：owner.json 是元数据，被别
     assert.equal(judgeProcess(readProcWitness(dir), { nowMs: now }).alive, true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('DF-069：log-health 陈旧必须判不健康 —— 否则守护进程死后它永久报绿', () => {
+  // 实测形态：`log-health.json` 每 60 秒重写一次；守护进程 SIGABRT 死后
+  // 最后一份永远是 `healthy: true`（logger 来不及写 false），而旧代码只判
+  // `healthy === true`、从不看 `at`，于是死后 41 小时还在打 `✓ log 正常`。
+  const now = Date.now();
+  const fresh = { lastJobsScanAt: new Date(now - 10_000).toISOString(), lastProbeAt: new Date(now - 60_000).toISOString() };
+
+  // 新鲜的绿记录：仍然健康（不能因为加了这道判据就把正常情况判坏）
+  const okFresh = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now).toISOString() } });
+  assert.equal(okFresh.healthy, true, '新鲜的健康记录不该被判不健康');
+
+  // 41 小时前的绿记录：必须报不健康，且理由要点名「未更新」
+  const oldAt = new Date(now - 41 * 3600 * 1000).toISOString();
+  const stale = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: oldAt } });
+  assert.equal(stale.healthy, false, '陈旧的健康记录必须判不健康 —— 它只说明「上次自报是绿的」');
+  assert.ok(stale.reasons.some((r) => /未更新/.test(r)),
+    `理由里必须说「未更新」，实际：${stale.reasons.join('|')}`);
+  const logLayer = stale.layers.find((l) => l.name === 'log');
+  assert.equal(logLayer.stale, true);
+  assert.ok(logLayer.ageMs > 0 && logLayer.limit > 0, '要么给 ageMs 与 limit，读者才能自己算');
+
+  // 边界：刚好在限内 / 刚好在线外
+  const limit = logLayer.limit;
+  const justIn = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now - limit + 1000).toISOString() } });
+  assert.equal(justIn.healthy, true, '刚好在上限内应判健康');
+  const justOut = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now - limit - 1000).toISOString() } });
+  assert.equal(justOut.healthy, false, '刚好越界应判不健康');
+
+  // `at` 缺失/不可解析时，不许当成新鲜放过
+  const noAt = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true } });
+  assert.equal(noAt.healthy, true, '没有 at 时无法判陈旧 —— 保持原判（不新增误报），但 ageMs 为 null 可被读者识别');
+  assert.equal(noAt.layers.find((l) => l.name === 'log').ageMs, null);
+});
