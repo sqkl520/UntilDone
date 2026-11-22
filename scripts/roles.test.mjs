@@ -6,15 +6,16 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   discoverRoles, resolveRole, roleIndex, labelOf, parseFrontmatter, readonlyOf,
-  idFromName, truthyFlag, agentPrefixFrom, AGENTS_DIR, DEFAULT_AGENT_PREFIX,
+  idFromName, truthyFlag, agentPrefixFrom, agentsDir, agentsDirCandidates, probeAgentsDir,
+  defaultRoles, displayPath, DEFAULT_AGENT_PREFIX,
   rolesFor, capabilitiesFor, rolesDirFor, sourceText,
 } from './roles.mjs';
 
@@ -352,7 +353,9 @@ test('rolesFor：项目没有角色目录 → 框架兜底，并如实标 source
     const set = rolesFor(d);
     assert.equal(set.source, 'framework');
     assert.ok(set.roles.length >= 12, `框架兜底应当拿到全部角色，实际 ${set.roles.length}`);
-    assert.equal(set.dir, AGENTS_DIR);
+    assert.equal(set.dir, agentsDir());
+    assert.deepEqual(set.tried.map((t) => t.dir), agentsDirCandidates(),
+      '`tried` 必须覆盖**全部**候选（顺序即优先级），不只是被选中的那个');
     // `null` = 只认框架，不需要任何项目在盘上
     assert.equal(rolesFor(null).source, 'framework');
   } finally { rmSync(d, { recursive: true, force: true }); }
@@ -397,6 +400,265 @@ test('rolesDirFor：纯路径拼接，空根返回 null（不拼出相对路径�
   assert.equal(rolesDirFor(null), null);
 });
 
+// ── DF-062：框架角色目录必须按**实际布局**发现，不是写死 `.claude/agents` ────
+//
+// 缺陷形态：`AGENTS_DIR` 是模块加载时求值的常量 `resolve(HERE,'..','.claude','agents')`。
+// 本仓自用形态下它是对的；plugin 载荷形态下包根是 `<payload>`，角色在 `<payload>/agents`
+// （宿主的 plugin 布局，实测只认根下一层），于是 `rolesFor()` 的框架兜底认到 **0 个角色**。
+// 实测输出（修前，外部项目里跑载荷里的 validate-run）：
+//
+//   [validate-run] 角色表 → 框架角色目录 …\payload\.claude\agents（0 个；…）
+//
+// 下面这一组**不用进程内 import 证明修复**：真正的判据是「换一个包根，它读哪个目录」。
+// 载荷形态不可能在进程内伪造（脚本位置由 `import.meta.url` 决定），所以最后一条走
+// 真子进程 + 真生成的载荷目录 —— 与端到端用例同一个理由：缺陷在模块加载时机上。
+
+test('DF-062 agentsDir/agentsDirCandidates：候选顺序即优先级，且按「有角色」挑而不是「存在」', () => {
+  const cands = agentsDirCandidates('/pkg');
+  assert.deepEqual(cands, [join('/pkg', '.claude', 'agents'), join('/pkg', 'agents')],
+    '候选顺序变了 —— 顺序即优先级，先 .claude/agents 才与本仓历史行为一致');
+  assert.deepEqual(agentsDirCandidates(''), [], '空根不许拼出相对路径');
+  assert.deepEqual(agentsDirCandidates(null), []);
+
+  const d = tmp();
+  try {
+    // 1) 只有载荷布局：<pkg>/agents
+    mkdirSync(join(d, 'agents'), { recursive: true });
+    writeFileSync(join(d, 'agents', 'oversight-qa.md'), agentMd({ name: 'oversight-qa' }));
+    assert.equal(agentsDir(d), join(d, 'agents'), '载荷布局（<pkg>/agents）没被认出来 —— DF-062 原样复发');
+
+    // 2) 两种都在、**两边都有角色**：先 .claude/agents
+    mkdirSync(join(d, '.claude', 'agents'), { recursive: true });
+    writeFileSync(join(d, '.claude', 'agents', 'oversight-qa.md'), agentMd({ name: 'oversight-qa' }));
+    assert.equal(agentsDir(d), join(d, '.claude', 'agents'), '两种都有角色时必须取 .claude/agents（顺序即优先级）');
+
+    // 3) **整改第 2 条**：`.claude/agents` 是一个空目录、`agents/` 有角色 → 必须取后者。
+    //    修前判据是 `existsSync`，于是这个形态「12 个角色 → 0 个」。
+    rmSync(join(d, '.claude', 'agents', 'oversight-qa.md'));
+    assert.equal(agentsDir(d), join(d, 'agents'),
+      '空目录把候选占了 —— 「存在」被当成「有角色」，DF-062 整改第 2 条原样复发');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+
+  // 4) 两个都不在：返回**第一个候选**而不是 null / 空串。
+  //    判据是「报错文案要指得出该去建哪个目录」—— null 会让下游打出「框架角色目录 （0 个）」。
+  const empty = tmp();
+  try {
+    assert.equal(agentsDir(empty), join(empty, '.claude', 'agents'));
+  } finally { rmSync(empty, { recursive: true, force: true }); }
+  assert.equal(agentsDir(''), null);
+});
+
+test('DF-062 整改①：sourceText 按**实际发生的事**说，且绝不打印绝对路径', () => {
+  const pkg = tmp();
+  try {
+    mkdirSync(join(pkg, 'agents'), { recursive: true });
+    writeFileSync(join(pkg, 'agents', 'oversight-qa.md'), agentMd({ name: 'oversight-qa' }));
+    mkdirSync(join(pkg, '.claude', 'agents'), { recursive: true });  // 空目录：有 0 个角色
+    const probe = probeAgentsDir(pkg);
+    assert.deepEqual(probe.tried.map((t) => [t.state, t.count]),
+      [['dir', 0], ['dir', 1]], '探测明细不对 —— sourceText 的事实来源就是它');
+    assert.equal(probe.dir, join(pkg, 'agents'), '空候选抢走了位置（整改第 2 条）');
+    // 前缀必须传进扫描（`probeAgentsDir` 的第二参数）：id 是「name 去前缀」，
+    // 前缀不同 id 就不同 —— `rolesFor()` 的框架前缀可能来自别人的 `overwatch.config.json`。
+    // 拿默认前缀扫出来的 id 会给出一份**看着正常但全错**的注册表。
+    const prefixed = probeAgentsDir(pkg, { agentPrefix: 'ow-' });
+    assert.deepEqual(prefixed.roles.map((r) => r.id), ['oversight-qa'],
+      '前缀没生效（`ow-` 对不上 `oversight-qa`，id 应当原样保留）');
+    writeFileSync(join(pkg, 'agents', 'ow-qa.md'), agentMd({ name: 'ow-qa' }));
+    assert.deepEqual(probeAgentsDir(pkg, { agentPrefix: 'ow-' }).roles.map((r) => r.id).sort(), ['oversight-qa', 'qa'],
+      '前缀 `ow-` 没被用上 —— `ow-qa` 的 id 应当变成 `qa`');
+
+    // 有角色时：不铺候选清单（噪音），且路径里不许出现绝对路径
+    const ok = sourceText({ source: 'framework', dir: probe.dir, tried: probe.tried, roles: [{ id: 'a' }] }, '/nonexistent-proj');
+    assert.ok(!/试过/.test(ok), `找到了角色还把候选铺出来（噪音）：${ok}`);
+    assert.ok(!ok.includes(pkg), `泄漏了绝对路径：${ok}`);
+    assert.match(ok, /（1 个/, ok);
+    // 这个夹具包根不在 `REPO_ROOT` 底下，所以走 `displayPath` 的第 3 级回落
+    // （既不在 root 下、也不在包根下）—— 形态必须是 `<abs>/…/agents`，不是 `C:\…`。
+    assert.match(ok, /<abs>\/[^/]+\/agents/, ok);
+
+    // 0 个角色时：逐个候选说出**实际状态**。
+    // 这里钉的是整改第 1 条 —— 修前一律说「都不存在或为空」，而实测里
+    // 「存在、有 12 个角色、只是排在后面」也被这么说，那是假话。
+    const zero = sourceText({
+      source: 'framework',
+      dir: join(pkg, '.claude', 'agents'),
+      tried: [
+        { dir: join(pkg, '.claude', 'agents'), state: 'notdir', count: 0 },
+        { dir: join(pkg, 'agents'), state: 'dir', count: 12 },
+        { dir: join(pkg, 'nowhere'), state: 'missing', count: 0 },
+      ],
+      roles: [],
+    }, '/nonexistent-proj');
+    assert.match(zero, /0 个/, zero);
+    assert.match(zero, /试过/, zero);
+    assert.match(zero, /存在但不是目录/, `把「是文件」说成了别的：${zero}`);
+    assert.match(zero, /12 个角色/, `把「有 12 个角色」说成「不存在或为空」= 假话：${zero}`);
+    assert.match(zero, /不存在/, zero);
+    assert.ok(!/都不存在或为空/.test(zero), `还在用那句一刀切的假话：${zero}`);
+    assert.ok(!zero.includes(pkg), `泄漏了绝对路径：${zero}`);
+  } finally { rmSync(pkg, { recursive: true, force: true }); }
+
+  // 项目分支：仍然相对 root 打印
+  const d = makeProject({ agents: { qa: { name: 'qa' } } });
+  try {
+    const proj = sourceText(rolesFor(d), d);
+    assert.match(proj, /项目角色目录 \.\/\.claude\/agents（1 个）/, proj);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('DF-062 整改① displayPath：三级回落，任何一级都不吐绝对前缀', () => {
+  const root = join(tmpdir(), 'ow-dp-proj');
+  // 1) 在 root 底下 → `./…`（最可执行）
+  assert.equal(displayPath(join(root, '.claude', 'agents'), root), './.claude/agents');
+  // 2) 在框架包根底下 → `<pkg>/…`。载荷形态走的就是这一级：
+  //    root 是用户项目，角色在载荷里，相对 root 会是 `../../…` 那种看不懂的串。
+  assert.equal(displayPath(join(REPO, 'agents'), root), '<pkg>/agents');
+  assert.equal(displayPath(join(REPO, '.claude', 'agents'), root), '<pkg>/.claude/agents');
+  // 3) 都不在 → `<abs>/…`，保留最后两段（足够区分两个候选）
+  const other = join(tmpdir(), 'ow-dp-elsewhere', '.claude', 'agents');
+  assert.equal(displayPath(other, root), '<abs>/.claude/agents');
+  assert.equal(displayPath(join(tmpdir(), 'ow-dp-elsewhere', 'agents'), root), '<abs>/ow-dp-elsewhere/agents');
+  // 假值不许拼出相对路径
+  assert.equal(displayPath(''), '(无)');
+  assert.equal(displayPath(null), '(无)');
+  // 相对的「候选」不参与推断：没有本机前缀可遮，原样打印
+  assert.equal(displayPath('agents', root), 'agents');
+});
+
+test('DF-062 整改④：`<pkg>/.claude/agents` 是**普通文件**时不许崩栈', () => {
+  const pkg = tmp();
+  try {
+    mkdirSync(join(pkg, '.claude'), { recursive: true });
+    writeFileSync(join(pkg, '.claude', 'agents'), '我不是目录');
+    mkdirSync(join(pkg, 'agents'), { recursive: true });
+    writeFileSync(join(pkg, 'agents', 'oversight-qa.md'), agentMd({ name: 'oversight-qa' }));
+
+    // 探测阶段不许抛，且要认出另一个候选里的角色
+    assert.equal(agentsDir(pkg), join(pkg, 'agents'), '一个文件把候选占了；修前这里会 ENOTDIR 崩栈');
+    const probe = probeAgentsDir(pkg);
+    assert.deepEqual(probe.tried.map((t) => t.state), ['notdir', 'dir']);
+
+    // `discoverRoles` 的契约是「扫不出来就返回 []」，不是「抛」。直接喂那个文件：
+    assert.deepEqual(discoverRoles(join(pkg, '.claude', 'agents')), [],
+      'ENOTDIR 没被兜住 —— 契约写着「目录不存在时返回 []」，那「存在但不是目录」更不能抛栈');
+  } finally { rmSync(pkg, { recursive: true, force: true }); }
+});
+
+// ── DF-062 整改⑤：配置坏了（候选不是目录）必须说出来，**哪怕最终拿到 12 个角色** ──
+//
+// 评审打回的那条。修前实测形态：
+//
+//   <pkg>/.claude/agents 是普通文件，<pkg>/agents 有 12 个角色
+//   → 「框架角色目录 <pkg>/agents（12 个）」、一个字都不提那个坏掉的目录
+//
+// 用户去建 `.claude/agents` 说明他**想用那个位置**；他往里加角色会发现「加了没反应」。
+// 这是本仓台账最高频的缺陷形态：**配置坏了但看起来一切正常**。
+// 噪音边界同样是判据的一部分：正常形态（目录正常 / 根本没建）**一个字都不许多**。
+
+test('DF-062 整改⑤：候选「存在但不是目录」时，角色数再正常也必须报出来', () => {
+  const pkg = tmp();
+  try {
+    // —— 框架侧：坏掉的 .claude/agents + 正常的 agents/（12 个的机会，这里用 1 个代表）——
+    mkdirSync(join(pkg, '.claude'), { recursive: true });
+    writeFileSync(join(pkg, '.claude', 'agents'), '我不是目录');
+    mkdirSync(join(pkg, 'agents'), { recursive: true });
+    writeFileSync(join(pkg, 'agents', 'oversight-qa.md'), agentMd({ name: 'oversight-qa' }));
+
+    const probe = probeAgentsDir(pkg);
+    assert.equal(probe.roles.length, 1, '前提：另一个候选里确有角色（否则这条测不到「成功了也要报」）');
+    assert.deepEqual(probe.warnings, [{
+      code: 'notdir', scope: 'framework', dir: join(pkg, '.claude', 'agents'), chosen: join(pkg, 'agents'),
+    }], '探测没带出 notdir warning —— 坏配置会继续隐身');
+
+    const text = sourceText({
+      source: 'framework', dir: probe.dir, tried: probe.tried, warnings: probe.warnings,
+      roles: probe.roles,
+    }, '/nonexistent-proj');
+    assert.match(text, /（1 个/, text);
+    assert.match(text, /⚠/, `有角色就闭眼不报坏目录 —— 配置坏了却看起来正常：${text}`);
+    assert.match(text, /存在但不是目录/, text);
+    assert.match(text, /不会被读到/, `没告诉用户「往里放角色没用」这个后果：${text}`);
+    assert.match(text, /<abs>\/\.claude\/agents/, `没说清哪个目录坏了：${text}`);
+    assert.ok(!text.includes(pkg), `泄漏了绝对路径：${text}`);
+
+    // —— 项目侧：用户项目里 `.claude/agents` 是文件 ——
+    // 此时**不能**再说「用户项目里没有 .claude/agents/」：它有，只是坏了。
+    const proj = tmp();
+    try {
+      mkdirSync(join(proj, '.claude'), { recursive: true });
+      writeFileSync(join(proj, '.claude', 'agents'), '我不是目录');
+      const s = rolesFor(proj);
+      assert.equal(s.source, 'framework', '前提：项目分支拿不到角色，回落到框架');
+      const projWarn = (s.warnings || []).find((w) => w.scope === 'project');
+      assert.ok(projWarn, '项目里那个坏目录没进 warnings —— 用户会以为「项目没建」而不是「建坏了」');
+      assert.equal(projWarn.dir, join(proj, '.claude', 'agents'));
+      const t = sourceText(s, proj);
+      assert.match(t, /⚠ 项目角色目录/, t);
+      assert.match(t, /存在但不是目录/, t);
+      assert.ok(!/用户项目里没有 \.claude\/agents\//.test(t),
+        `同时说「用户项目里没有」和「项目角色目录坏了」—— 自相矛盾：${t}`);
+    } finally { rmSync(proj, { recursive: true, force: true }); }
+  } finally { rmSync(pkg, { recursive: true, force: true }); }
+
+  // —— 噪音边界：一切正常时一个字符都不多 ——
+  const ok = probeAgentsDir(REPO);
+  assert.deepEqual(ok.warnings, [], '本仓的正常形态产生了 warning —— 每次输出都会多一句噪音');
+  const okText = sourceText(rolesFor(null), REPO);
+  assert.ok(!/⚠/.test(okText), `正常形态不该有 ⚠：${okText}`);
+  assert.ok(!/不会被读到/.test(okText), okText);
+  // 空目录（存在、是目录、只是没角色）不是「坏配置」，不许报
+  const emptyPkg = tmp();
+  try {
+    mkdirSync(join(emptyPkg, '.claude', 'agents'), { recursive: true });
+    assert.deepEqual(probeAgentsDir(emptyPkg).warnings, [],
+      '空目录被当成了坏配置 —— 那是正常形态（用户建了目录还没放角色）');
+  } finally { rmSync(emptyPkg, { recursive: true, force: true }); }
+});
+
+// ── DF-062 整改③：默认参数必须**可被证伪** ──────────────────────────────
+//
+// 红队实测：把 `discoverRoles(dir = agentsDir())` 改回模块常量
+// `resolve(HERE,'..','.claude','agents')`，`node --test scripts/` 仍然 1919 全绿。
+// 也就是「这次修复有一半改动没有任何测试守着」—— 默认参数是模块求值时机问题，
+// 任何**进程内** import 都证明不了它（那正是缺陷本身），所以必须是：
+//   · 真造一个「只有 `agents/` 布局」的包根（把 roles.mjs 拷进 `<pkg>/scripts/`）；
+//   · **零参**调用 `discoverRoles()` / `defaultRoles()`；
+//   · 在真子进程里跑（`import.meta.url` 由文件位置决定，进程内伪造不了）。
+// 这样改回常量时：`<pkg>/.claude/agents` 不存在 → 0 个角色 → 这条必红。
+
+test('DF-062 整改③：零参 discoverRoles() / defaultRoles() 必须跟着**包根**走，不是模块常量', () => {
+  const pkg = tmp();
+  try {
+    mkdirSync(join(pkg, 'scripts'), { recursive: true });
+    mkdirSync(join(pkg, 'agents'), { recursive: true });
+    writeFileSync(join(pkg, 'agents', 'oversight-qa.md'), agentMd({ name: 'oversight-qa' }));
+    writeFileSync(join(pkg, 'agents', 'oversight-planner.md'), agentMd({ name: 'oversight-planner' }));
+    writeFileSync(join(pkg, 'scripts', 'roles.mjs'), readFileSync(join(HERE, 'roles.mjs')));
+    // 前提钉住：这个包根**没有** `.claude/agents` —— 改回常量就等于指向一个不存在的目录
+    assert.ok(!existsSync(join(pkg, '.claude', 'agents')), '夹具里出现了 .claude/agents，这条用例就测不到默认参数了');
+
+    const url = pathToFileURL(join(pkg, 'scripts', 'roles.mjs')).href;
+    const script = [
+      `import { discoverRoles, defaultRoles, agentsDir } from ${JSON.stringify(url)};`,
+      'console.log(JSON.stringify({',
+      '  dir: agentsDir(),',
+      '  zeroArg: discoverRoles().map((r) => r.id).sort(),',
+      '  defaults: defaultRoles().map((r) => r.id).sort(),',
+      '}));',
+    ].join('\n');
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `零参调用崩了：\n${r.stdout}${r.stderr}`);
+    const got = JSON.parse(String(r.stdout).trim());
+    const want = ['planner', 'qa'];
+    assert.equal(got.dir, join(pkg, 'agents'), `agentsDir() 没跟着包根走：${got.dir}`);
+    assert.deepEqual(got.zeroArg, want,
+      '`discoverRoles()` 的默认参数退回成模块常量了 —— 它在载荷形态下指向不存在的 .claude/agents');
+    assert.deepEqual(got.defaults, want,
+      '`defaultRoles()` 的默认参数退回成模块常量了 —— 同上，且它还是三处消费的锚点');
+  } finally { rmSync(pkg, { recursive: true, force: true }); }
+});
+
 test('端到端：validate-run 在别人的项目里按**项目的**角色表判', () => {
   // 这一条是 D2 场景的最小复现，必须跑真子进程 —— 缺陷的形态就是
   // 「模块加载时求值」，在任何进程内调用里都看不出来（import 发生在 --root 之前）。
@@ -431,6 +693,45 @@ test('端到端：validate-run 在别人的项目里按**项目的**角色表判
     assert.equal(bad.status, 1, `项目里没有 executor，却放行了：\n${bad.stdout}${bad.stderr}`);
     assert.match(bad.stdout, /executor" 不在合法取值内（qa \/ reviewer）/, bad.stdout);
   } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+// ── DF-062 端到端：真生成一份载荷，在外部项目里跑它 ──────────────────────
+//
+// 这一条**必须 spawn 真子进程 + 真载荷目录**，不能用进程内 import 伪造：
+// 载荷形态的本质是「脚本的物理位置在 `<payload>/scripts`」，而 `import.meta.url`
+// 由文件位置决定，进程内无法伪造。同 DF-062 的原始复现路径一致。
+
+test('DF-062 端到端：载荷形态（<payload>/agents）下 validate-run 认到 12 个角色', () => {
+  const src = tmp();
+  const out = join(src, 'payload');
+  const proj = tmp();
+  try {
+    // 1) 从本仓真生成一份载荷
+    const b = spawnSync(process.execPath, [join(REPO, 'scripts', 'build-payload.mjs'), '--out', out],
+      { cwd: REPO, encoding: 'utf8' });
+    assert.equal(b.status, 0, `载荷生成失败：\n${b.stdout}${b.stderr}`);
+    assert.ok(existsSync(join(out, 'agents', 'oversight-planner.md')), '载荷里没有 agents/*.md');
+    assert.ok(existsSync(join(out, 'scripts', 'validate-run.mjs')), '载荷里没有 scripts/（DF-060 复发）');
+    // 前提钉住：载荷里**不该**有 .claude/agents —— 那会让这条用例测不到探测顺序
+    assert.ok(!existsSync(join(out, '.claude', 'agents')),
+      '载荷里出现了 .claude/agents/ —— 这条用例就不再是「载荷形态」了');
+
+    // 2) 外部项目：只有一个 README + git，没有任何角色定义
+    writeFileSync(join(proj, 'README.md'), '# 外部项目\n');
+    spawnSync('git', ['init', '-q', '.'], { cwd: proj, encoding: 'utf8' });
+
+    // 3) 跑载荷里的 validate-run（--help 之前就会打印角色表）
+    const r = spawnSync(process.execPath, [join(out, 'scripts', 'validate-run.mjs'), '--help'],
+      { cwd: proj, encoding: 'utf8' });
+    const text = `${r.stdout}${r.stderr}`;
+    assert.match(text, /角色表 → 框架角色目录/, text);
+    assert.ok(!/（0 个/.test(text), `载荷形态下角色表是空的 —— DF-062 原样复发：\n${text}`);
+    assert.match(text, /（12 个/, text);
+    assert.match(text, /框架角色目录 .*agents/, `来源没指向 <payload>/agents：\n${text}`);
+  } finally {
+    rmSync(src, { recursive: true, force: true });
+    rmSync(proj, { recursive: true, force: true });
+  }
 });
 
 test('端到端：compose 用项目的角色 + 项目的 agentPrefix，模板仍走框架', () => {

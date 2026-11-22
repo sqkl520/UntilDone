@@ -797,6 +797,16 @@ const PROBE_ARGS = {
   // 这也是它最该验的分支（框架兜底），项目分支由 roles.test.mjs 端到端覆盖。
   rolesFor: '[null]', capabilitiesFor: '[null]', rolesDirFor: '"/nonexistent-ow-root"',
   sourceText: '[{ source: "framework", dir: "/nonexistent-ow-agents", roles: [] }]',
+  // `AGENTS_DIR` 常量在 DF-062 里换成了按包根探测的两个函数：
+  //   · `agentsDirCandidates` 是纯字符串拼接，喂一个不存在的包根即可；
+  //   · `agentsDir` 在那种包根下必须返回**第一个候选**而不是 null / 抛（见它的注释）。
+  agentsDirCandidates: '["/nonexistent-ow-pkg"]', agentsDir: '["/nonexistent-ow-pkg"]',
+  // DF-062 整改（2026-11-21）：探测结果与路径遮罩。
+  //   · `probeAgentsDir` 喂不存在的包根 → 必须返回 `dir` 非空 + `tried` 两条（不许 null）；
+  //   · `displayPath` 是本仓「打印路径」的唯一出口，喂两段路径分别验三种回落：
+  //     根下（`./x`）、根外（`<abs>/x`）、空串（`(无)`）。
+  probeAgentsDir: '["/nonexistent-ow-pkg"]',
+  displayPath: '["/nonexistent-ow-probe/.claude/agents", "/nonexistent-ow-root"]',
   idFromName: '"x"', truthyFlag: '""', readonlyOf: '[{}]',
   resolveRole: '[[]]', roleIndex: '[[]]', labelOf: '[[]]', nameOf: '[[]]',
   extractCommands: '""', classifyRequirement: '""', requiredTools: '[[]]',
@@ -1768,9 +1778,17 @@ function checkUnregisteredExports() {
   // `defaultRoles` 不参加探针：它按模块顶层标志缓存，探一次之后结构门再 import
   // 拿到的就是那份缓存 —— 用缓存去证明「它能跑」是自证。它由 roles.test.mjs 的
   // 「12 份 id 逐字相同」那条用例真实调用（那条必须拿到真注册表）。
-  // 三个路径常量是数据，不是函数。
+  // 两个路径常量是数据，不是函数。
+  //
+  // 2026-11-21（DF-062）：`AGENTS_DIR` 常量**被删了**，换成 `agentsDirCandidates(pkgRoot)`
+  // 与 `agentsDir(pkgRoot)` —— 前者是两个候选的纯拼接，后者取第一个**有角色的**。
+  // 删它的理由：常量在 plugin 载荷形态下指向 `<payload>/.claude/agents`，那里**不存在**
+  // （角色在 `<payload>/agents`），于是载荷里的脚本认到 0 个角色。常量没法「按布局求值」。
+  // 同日整改补的两个：`probeAgentsDir`（探测的完整结果，`sourceText` 的事实来源）、
+  // `displayPath`（打印路径的唯一出口 —— 它替掉了 `sourceText` 里那段失效的相对化）。
   const ROLES_FNS = [
-    'AGENTS_DIR', 'DEFAULT_AGENT_PREFIX', 'REPO_ROOT',
+    'DEFAULT_AGENT_PREFIX', 'REPO_ROOT', 'agentsDirCandidates', 'agentsDir',
+    'probeAgentsDir', 'displayPath',
     'defaultRoles', 'discoverRoles', 'parseFrontmatter', 'truthyFlag', 'readonlyOf',
     'idFromName', 'resolveRole', 'roleIndex', 'labelOf', 'nameOf', 'agentPrefixFrom', 'FORBIDDEN_CONTEXT',
     // 2026-11-21（D2 验证）：按根求值的四个。`rolesFor` / `capabilitiesFor` 各进

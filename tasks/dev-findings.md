@@ -2743,22 +2743,105 @@ const LIVING_DOCS = [
   前者让别人项目报红，后者让本仓自己加东西不被校验 —— 两个方向都漏。
 - 建议归属：独立任务（方案 A 的主体，未做）
 
-### DF-062 [open] 载荷形态下没有角色目录约定：`rolesFor` 回落去找 `<payload>/.claude/agents`（0 个）
+### DF-062 [fixed] 载荷形态下没有角色目录约定：`rolesFor` 回落去找 `<payload>/.claude/agents`（0 个）
 
 - 发现于：2026-11-21 修完 DF-060 后的端到端验证
 - 位置：`scripts/roles.mjs:231` `rolesDirFor(root)` 写死 `join(root,'.claude','agents')`；
   `:289-295` 的框架回落用模块常量 `AGENTS_DIR`（= 框架仓库的 `.claude/agents`）
-- 证据（在 `/tmp/final/proj` 这个外部项目里，载荷已按 DF-060 生成并挂上）：
+- 证据（在外部项目里，载荷已按 DF-060 生成并挂上）：
   ```
-  $ UNTILDONE_PAYLOAD=/tmp/final/plug node "$UNTILDONE_PAYLOAD/scripts/validate-run.mjs"
-  [validate-run] 角色表 → 框架角色目录 …\plug\.claude\agents（0 个；用户项目里没有 .claude/agents/）
+  $ node <payload>/scripts/validate-run.mjs --help
+  [validate-run] 角色表 → 框架角色目录 …\payload\.claude\agents（0 个；用户项目里没有 .claude/agents/）
   ```
   而角色实际在 `<payload>/agents/`（12 个，宿主认的正是这个布局）。
 - 影响：DF-060 修好了「脚本找得到」，但**角色找不到**。`validate-run` / `compose-agent-prompt` /
   `render-plan` 在载荷形态下拿到的角色表是空的 —— 它们要么报错，要么按空表判定。
   这条路在载荷形态下仍然不通，只是失败位置从「MODULE_NOT_FOUND」挪到了「0 个角色」。
-- **为什么本轮不修**：`rolesDirFor` 有三个消费者（`validate-run` / `compose-agent-prompt` /
-  `render-plan`），且它的回落逻辑对**本仓自用**形态是正确的（那里确实该找 `.claude/agents`）。
-  改法需要先定「载荷形态下 role 目录的约定是什么」，那是设计决定，不是修 bug。
-  候选：给 `rolesFor` 加一个 `payloadDir` 参数，或让它按 `UNTILDONE_PAYLOAD` 环境变量探测。
-- 建议归属：独立任务
+- **修法（2026-11-21）**：`AGENTS_DIR` 常量换成按包根探测 ——
+  `agentsDirCandidates(pkgRoot)` = `[<pkgRoot>/.claude/agents, <pkgRoot>/agents]`（顺序即优先级），
+  `probeAgentsDir(pkgRoot)` 逐候选真扫并给出 `{dir, state, count}`，`agentsDir()` 是它的 `dir`。
+  `discoverRoles()` / `defaultRoles()` 的默认参数改为每次调用求值。
+  `rolesFor()` 的 `tried` 带出逐候选明细，`sourceText()` 在**角色数为 0 时**逐条打印实际状态。
+- **为什么不按 `UNTILDONE_PAYLOAD` 探测**：那个变量只在宿主会话里由 `launch.mjs` 注入，
+  而这三个消费者会在任意终端跑（`--check`、CI、测试）。环境变量当判据会让同一脚本
+  在会话里和在终端里结论不同。布局是盘上的事实，就从盘上读。
+- **三 Agent 评审后的四条整改（同一天）**：
+  1. **`agentsDir()` 判「存在」而不是「有角色」**（高）：修前 `candidates.find(existsSync)`，
+     而 `rolesFor()` 的项目分支判的是「存在且至少一个可解析 `.md`」—— 同函数两套判据。
+     实测：只多建一个空的 `.claude/agents/` → **12 个角色变 0 个**。现改为取第一个
+     `count > 0` 的候选，两个分支同构。
+  2. **`sourceText()` 撒谎 + 泄漏绝对路径**（高）：那个「都不存在或为空」把
+     「存在、有 12 个角色、只是排在后面」也说成不存在；`relOf` 只做「相对 root」，
+     而载荷形态下 `dir` **不在** `root` 底下，相对化失效 → 原样打印 `C:\Users\…\pkg\…`。
+     现在逐候选说实际状态（`存在但不是目录` / `不存在` / `N 个角色`），
+     路径统一走新的 `displayPath()` 三级回落（`./…` → `<pkg>/…` → `<abs>/…`）。
+  3. **默认参数不可证伪**（中）：红队实测，把 `discoverRoles` 的默认参数改回模块常量，
+     `node --test scripts/` 仍 **1919 全绿**。补了一条真子进程 + 只含 `agents/` 的临时包根、
+     **零参**调用 `discoverRoles()` / `defaultRoles()` 的用例 —— 改回常量必红。
+  4. **`<pkg>/.claude/agents` 是普通文件时崩栈**（中）：修前 `existsSync` 守不住普通文件
+     （它对文件返回 true），紧跟的 `readdirSync` 抛
+     `Error: ENOTDIR: not a directory, scandir '…\pkg\.claude\agents'`。
+     在 `question-audit.mjs` 模块顶层调 `discoverRoles()` 的地方，崩的是宿主 `import` 那一步。
+     现在一条 try 包住 readdir；**故意只写一处**，否则负向验证会假绿（实测：分两层时
+     只回退守卫那层仍不抛）。
+  5. **坏配置静默通过**（高，二轮评审打回）：上一版把「`.claude/agents` 是普通文件 +
+     `agents/` 有 12 个角色」当成**成功** —— 输出 `（12 个）`，一个字不提坏掉的目录。
+     那是本仓最高频的缺陷形态（配置坏了但看起来正常）。且用户去建 `.claude/agents`
+     说明他想用那个位置，静默改用 `agents/` 后他往里加角色会「加了没反应」。
+     现 `probeAgentsDir()` 产出 `warnings`（`notdir`，带 `scope` 与 `chosen`），
+     `rolesFor()` 透传（项目侧 + 框架侧**两个都报**），`sourceText()` 无条件打印。
+     噪音边界：正常形态 / 空目录 / 根本没建 → `warnings` 恒空，输出一个字符不多。
+     顺带修掉「用户项目里没有 .claude/agents/」与「项目角色目录坏了」同时出现的自相矛盾。
+- **负向证据（9/9 全红，逐条单点回退）**：候选描述退回「都不存在或为空」／`displayPath`
+  退回原样返回绝对路径／探测退回 `existsSync` 判据／`discoverRoles` 默认参数退回常量／
+  `defaultRoles` 退回常量／`scanRolesDir` 退回 `existsSync` + 裸 readdir（ENOTDIR 复现）／
+  探测不产出 `notdir` warning／`sourceText` 丢掉 `warnings`／`rolesFor` 不为项目侧坏目录报警。
+- 测试：`roles.test.mjs` 加 7 条（候选顺序 + 有角色/存在、`sourceText` 诚实措辞与零泄漏、
+  `displayPath` 三级回落、ENOTDIR 不崩、坏配置在有角色时也报 + 噪音边界、
+  零参默认参数子进程、真生成载荷 + 真子进程端到端）。
+  总数 1915 → 1922（`ℹ tests` 1922 / pass 1920 / skip 2），四份文档同步。
+- **诚实边界（未验证）**：`displayPath()` 不做 `realpath`，判据是 `path.relative()`；
+  同一目录的两种写法（`/private/tmp`、Windows 8.3 短名）会回落到 `<abs>/…`。
+  不泄漏、可区分，但前缀因机器而异；**全部实测只在 Windows 上做过，无跨平台证据**。
+- **明确不改**：`rolesDirFor()` 的项目分支不做探测（plugin 定位决定，见
+  `build-payload.mjs` 的 `PLUGIN_DESCRIPTION`）；`checks.json` 的 `agentsDir` 与
+  `roles.mjs` 两套真源是既有债（DF-064）。
+- 建议归属：独立任务（**2026-11-21 已修**）
+
+### DF-063 [open] `render-plan.mjs` 不在载荷里：SKILL 从不调用它，闭包算不到
+
+- 发现于：2026-11-21 验收 Agent 补充第 2 条；主线程复核
+- 证据：
+  ```
+  $ ls <payload>/scripts/ | wc -l          → 22
+  $ ls <payload>/scripts/render-plan.mjs   → No such file or directory
+  $ grep -rn "render-plan" .claude/ docs/CAPABILITIES.md
+    docs/CAPABILITIES.md:214  ← 只有这一处，且是在讲「会写进框架仓库」的副作用
+  ```
+  `.claude/skills/oversight/SKILL.md` 与 12 份 agent 定义里**都没有** `render-plan`。
+- 性质：DF-060 的闭包机制**按引用取**，这个设计是对的（整目录 96 个文件只带 22 个）。
+  真正的问题是 **SKILL 压根没让主线程跑 render-plan** —— 它是「计划渲染」的入口，
+  而 SKILL 的流程从头到尾没提它。所以这不是闭包漏了，是**流程漏了**。
+- 影响：交付出去的载荷里，主线程没有任何「把拆解图渲染成人能读的计划」的手段。
+  `docs/CAPABILITIES.md` 里它是一个能力，在载荷形态下 README 承诺的这条**不存在**。
+- 与 DF-062 的关系：DF-062 正文说「三个消费者」，其中 `render-plan` 在载荷形态下仍是
+  `MODULE_NOT_FOUND`。验收 Agent 指出这一点，**它是对的**，那句话在载荷形态下不成立。
+- 建议归属：独立任务（要么让 SKILL 调用它，要么明确「载荷形态不提供计划渲染」）
+
+### DF-064 [open] 「角色在哪」有三套答案、两种配置来源，互相不认
+
+- 发现于：2026-11-21 红队第 6 条；主线程复核
+- 证据：
+  ```
+  check-config.mjs:81      agentsDir: '.claude/agents'  ← checks.json 可配
+  check-structure.mjs:129  const AGENTS_DIR = join(ROOT, CFG.agentsDir)   ← 硬门用它
+  roles.mjs                agentsDir(pkgRoot) 按包根探测两条        ← 运行期用它，且不读 checks.json
+
+  $ # 项目里 checks.json = {"agentsDir":"team/agents"}，team/agents 有 qa.md
+  $ node <payload>/scripts/check-structure.mjs   → 报 team/agents/executor.md 的 frontmatter 问题（认这个配置）
+  $ node <payload>/scripts/validate-run.mjs      → 角色表来自框架的 12 个；capability "qa" 不在合法取值内
+  ```
+- 性质：这**不是 DF-062 引入的**（`roles.mjs` 从来没读过 `checks.json`），
+  但 DF-062 的修复新增了 `<pkgRoot>/agents` 这条约定，等于给「角色在哪」添了第三个答案。
+- 影响：任何用 `checks.json` 调过 `agentsDir` 的项目，硬门和派发器看的是两个不同目录。
+- 建议归属：独立任务（先定「谁是权威」，再决定要不要让 roles.mjs 读配置）
