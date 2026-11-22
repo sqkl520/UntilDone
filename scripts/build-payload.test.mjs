@@ -781,28 +781,36 @@ test('DF-060：传递 import 闭包会跟着带走（不能只拷第一层）', 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-// ── DF-066：剥注释不许吞掉真导入 ──────────────────────────────────────
-//
-// 这条守的是一个**会让交付物崩掉**的静默失效：`stripComments()` 的块注释正则
-// 遇到源码里的「斜杠加星号」字面量会提前收尾，把后面的真导入一起吞掉。
-// 实测 `tui-theme.mjs` 因此丢了 `./width-table.mjs`，闭包算出只有它自己、
-// `problems` 为空 —— 载荷会带上 `tui-theme.mjs` 却不带 `width-table.mjs`。
 
-test('DF-066：源码里有「斜杠加星号」字面量时，被吞掉的导入必须报出来', () => {
+// ── DF-066 / DF-074：剥注释必须认得出「引号里的 /* 不是注释」──────────
+//
+// 这一组守的是闭包计算的**正确性**，而不是某一处报错文案。
+// 上一版曾在这里加过一道「剥注释后导入变少就报错」的护栏，它判据不成立
+// （注释里提到真实存在的兄弟文件是常态，12/58 个脚本误报，而误报会让
+// build-payload 拒绝生成），连同这三条测试一起删掉了。
+// 现在测的是词法器本身：**它只要认对了，就不需要护栏。**
+
+test('DF-066：行注释里的「斜杠加星号」不许吞掉后面的真导入', () => {
   const dir = tmp();
   try {
     mkSrcWithScripts(dir, {
       scripts: {
-        // 要复现真实的误剥形态（`tui-theme.mjs` 那样），必须**成对**：
-        // 一个假起点（自然语言里的「斜杠加星号」）+ 后面某个 `*/` 收尾，
-        // 于是中间那段（含真导入）整块被当成注释剥掉。
+        // **这个夹具必须复刻 tui-theme.mjs:229-239 的精确时序**，否则测不到东西。
+        //
+        // 我第一版夹具把通配路径写在**块注释内部**，结果旧词法器照样通过 ——
+        // 因为块注释里的 `/*` 后面第一个 `*/` 就是块自己的结尾，非贪婪匹配没越界。
+        //
+        // 真实事故的形态是：那段通配路径在**`//` 行注释**里。旧实现**先**删块注释
+        // （此时 `//` 行还在），它的 `/*` 一路吃到**后面另一个块注释**的 `*/`，
+        // 把中间的真导入整块吞掉；**然后**才删行注释。
+        // 顺序是这个 bug 的全部原因，所以夹具必须把「后面还有一个块注释」也写出来。
         'a.mjs': [
-          '// 表由 x 从 scripts/data ' + '/*' + '.txt 生成',
-          '// 上面那个星号让下面的块注释被提前打开',
+          '// 现在表由 gen 从 `scripts/data/*.txt` 生成。',
+          '// 第二行说明。',
           "import { b } from './b.mjs';",
           'export const a = b;',
           '/**',
-          ' * 文档块的结尾（就是它的结束符把上面整段吞掉）',
+          ' * 这个块的结束符会被上面那个 /* 认领',
           ' */',
           'export const z = 1;',
           '',
@@ -812,39 +820,118 @@ test('DF-066：源码里有「斜杠加星号」字面量时，被吞掉的导�
     });
     const problems = [];
     const c = scriptClosure(dir, ['scripts/a.mjs'], problems);
-    assert.ok(!c.includes('scripts/b.mjs'), '前提：这条导入确实被吞了（否则测试没验到东西）');
-    assert.ok(problems.some((p) => /b\.mjs/.test(p) && /被剥注释吞掉了/.test(p)),
-      `被吞的导入必须报出来，实际 problems：${JSON.stringify(problems)}`);
+    assert.ok(c.includes('scripts/b.mjs'),
+      `行注释里的 /* 被当成块注释起点，吞掉了真导入 —— 闭包只有 ${JSON.stringify(c)}`);
+    assert.deepEqual(problems, [], `不该报错，根因修好后这里应该干净：${JSON.stringify(problems)}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('DF-066：注释里提到自己（自指路径）不算被吞的导入，不许误报', () => {
+test('DF-066：引号里的「双斜杠」不是行注释起点，后面的导入必须跟到', () => {
   const dir = tmp();
   try {
     mkSrcWithScripts(dir, {
       scripts: {
-        // 头部注释里提到自己 —— 剥掉它是正确行为
-        'a.mjs': '// 参见 ./a.mjs 的说明\n' + "import { b } from './b.mjs';\nexport const a = b;\n",
+        'a.mjs': [
+          'const url = "https://example.com/x";',
+          "import { b } from './b.mjs';",
+          'export const a = b;',
+          '',
+        ].join('\n'),
         'b.mjs': 'export const b = 1;\n',
       },
     });
     const problems = [];
     const c = scriptClosure(dir, ['scripts/a.mjs'], problems);
-    assert.ok(c.includes('scripts/b.mjs'), '真导入必须跟到');
-    assert.deepEqual(problems, [], `不该误报：${JSON.stringify(problems)}`);
+    assert.ok(c.includes('scripts/b.mjs'), `URL 里的 // 被当成注释起点：${JSON.stringify(c)}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('DF-066：注释里提到一个**不存在的**路径，不算被吞的导入', () => {
+test('DF-074：注释里的导入**不算**导入 —— 不许把说明文字跟成依赖', () => {
   const dir = tmp();
   try {
     mkSrcWithScripts(dir, {
       scripts: {
-        'a.mjs': '// 旧版本曾经 import ./gone.mjs，已经删了\nexport const a = 1;\n',
+        // question-form.mjs / classify-stop.mjs 的真实形态：
+        // 注释里写 `import './x.mjs'` 讲为什么拆文件，那不是导入。
+        'a.mjs': [
+          '/**',
+          " * 为什么不 import './b.mjs'：那会形成环。",
+          ' */',
+          'export const a = 1;',
+          '',
+        ].join('\n'),
+        'b.mjs': 'export const b = 1;\n',
       },
     });
     const problems = [];
-    scriptClosure(dir, ['scripts/a.mjs'], problems);
-    assert.deepEqual(problems, [], `注释里提到已删除的路径不该报：${JSON.stringify(problems)}`);
+    const c = scriptClosure(dir, ['scripts/a.mjs'], problems);
+    assert.deepEqual(c, ['scripts/a.mjs'], `注释里的 import 被当成真依赖：${JSON.stringify(c)}`);
+    assert.deepEqual(problems, [], `不该报错：${JSON.stringify(problems)}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-074：注释块跨多行、中间夹真导入时，真导入必须跟到（原 bug 的形态）', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, {
+      scripts: {
+        // 这是 old stripComments 会整段吞掉的形态：块注释里出现 /* 字面量
+        'a.mjs': [
+          '/**',
+          ' * 说明文字，里面有 ' + '`scripts/data/*.txt`' + ' 这种通配路径',
+          ' */',
+          "import { b } from './b.mjs';",
+          'export const a = b;',
+          '',
+        ].join('\n'),
+        'b.mjs': 'export const b = 1;\n',
+      },
+    });
+    const problems = [];
+    const c = scriptClosure(dir, ['scripts/a.mjs'], problems);
+    assert.ok(c.includes('scripts/b.mjs'), `块注释里的通配路径吞掉了后面的导入：${JSON.stringify(c)}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-074：全仓 58 个生产脚本逐个算闭包，problems 必须为空（误报回归）', () => {
+  const base = join(import.meta.dirname, '..');
+  const scriptsDir = join(base, 'scripts');
+  const files = readdirSync(scriptsDir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs'));
+  const offenders = [];
+  for (const f of files) {
+    const problems = [];
+    scriptClosure(base, [`scripts/${f}`], problems);
+    if (problems.length) offenders.push(`${f}: ${problems[0]}`);
+  }
+  assert.deepEqual(offenders, [],
+    `这些脚本算闭包时报了错，而它们都是正常源码 —— 说明判据又误报了：\n${offenders.join('\n')}`);
+});
+
+test('DF-066 负向：词法器必须保留行注释之后的导入（旧实现会整段吞掉）', () => {
+  // **这条测试直接钉词法器的行为，不经过任何「护栏」。**
+  //
+  // 我原本想做「把实现换回旧版，测试必须红」的变异验证，但在 Windows 上反复
+  // 被引号转义卡住，折腾多次没做干净。改成直接断言：**旧实现做不到的事**。
+  //
+  // 旧实现是两条正则（先删块注释、再按行删行注释）。下面这段源码里，
+  // `//` 行注释中有 `scripts/data/*.txt`，它的 `/*` 会认领**后面块注释的** `*/`，
+  // 把中间的真导入整块当注释删掉。新词法器按状态机走，知道「`//` 之后到行尾都是注释」，
+  // 也知道「引号里的不是注释」，所以两行 `//` 处理完就回到代码态。
+  const dir = tmp();
+  try {
+    const src = [
+      '// 通配路径写在行注释里：`scripts/data/*.txt`',
+      "import { b } from './b.mjs';",
+      'export const a = b;',
+      '/**',
+      ' * 这个块的结束符会被上面那个 /* 认领（旧实现）',
+      ' */',
+      'export const z = 1;',
+      '',
+    ].join('\n');
+    mkSrcWithScripts(dir, { scripts: { 'a.mjs': src, 'b.mjs': 'export const b = 1;\n' } });
+    const c = scriptClosure(dir, ['scripts/a.mjs'], []);
+    assert.ok(c.includes('scripts/b.mjs'),
+      `闭包丢了 b.mjs —— 说明行注释里的 /* 被当成了块注释起点：${JSON.stringify(c)}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -3089,7 +3089,7 @@ const LIVING_DOCS = [
 
 `healthCheck()` 的 log 层原来只判 `logHealth.healthy === true`，`at` 只被塞进 `layers`
 却从不与 `nowMs` 比较。现在加 `LOG_LIMIT = PROBE_INTERVAL * 3`（15 分钟）——
-`log-health.json` 由 `HEALTH_EVERY_MS = 60_000`（60 秒）重写一次，45 倍余量。
+`log-health.json` 由 `HEALTH_EVERY_MS = 60_000`（60 秒）重写一次，15 倍余量。
 
 修后实测（同一状态）：
 ```
@@ -3240,3 +3240,76 @@ JS 兜底也接不住 —— 所以真正的防线是**让那次分配不要发�
   对照组：把那行正则退回 [a-z]+ → 同一个 [bogus-state] 零命中（漏掉）
   ```
 - 建议归属：独立任务（已完成）
+
+### DF-074 [fixed] 我上一轮给 DF-066 加的护栏会误报：12/58 个脚本，且误报导致载荷生成不出来
+
+- 发现于：2026-11-21 锐评 Agent「最该重做的一条」；主线程复现
+- 位置：`scripts/build-payload.mjs` 里 DF-066 那次加的对账块（已删除）
+- 证据（主线程实测）：
+  ```
+  $ # 对 58 个生产脚本逐个算闭包，统计会报「被剥注释吞掉」的
+  会误报的文件: 12 / 58
+    build-payload.mjs / launch.mjs / overwatch.mjs / pre-write-gate.mjs /
+    question-form.mjs / question-audit.mjs / tui-theme.mjs / watch.mjs …
+
+  $ # 只往 SKILL.md 加一行 README 自己推荐的命令
+  $ echo "node scripts/pre-write-gate.mjs" >> .claude/skills/oversight/SKILL.md
+  $ node scripts/build-payload.mjs --out /tmp/x
+  ✘ 没有生成载荷（1 条问题）：
+    ❯ scripts/question-form.mjs 的导入 ./question-audit.mjs 被剥注释吞掉了 …
+  ```
+  `question-form.mjs` 里**根本没有**「斜杠加星号」——那只是它注释里的一句
+  `` `import './question-audit.mjs'` ``（讲为什么不直接 import，避免环）。
+- 根因（判据错）：第一版护栏假设「注释里提到的路径通常不存在」。
+  本仓恰恰相反 —— 注释里引用真实存在的兄弟文件是常态。
+  `classify-stop.mjs:32` 的 JSDoc 里就有 `import { classifyStop } from './classify-stop.mjs'`。
+- **性质**：修「静默少带文件」的护栏，变成了「按错误理由拒绝生成」——
+  把问题挪了个位置，而且新位置更坏（原来的 bug 至今没触发过，新护栏却能立刻炸）。
+- 修法（**换掉根因，删掉护栏**）：
+  1. `stripComments()` 从两条正则改成**状态机词法器**：遇到引号就整体跳过其中内容，
+     只在「代码态」才认注释起点。这样引号里的 `/*` 与 `//` 都只是内容。
+  2. **删掉那道护栏**。根因修好之后它不需要存在。
+- 负向验证（**这次做对了**）：
+  ```
+  把 stripComments 换回旧正则实现（在 /tmp 副本里手工替换那 38 行）
+  → ✖ DF-066：行注释里的「斜杠加星号」不许吞掉后面的真导入      (54/56)
+  → ✖ DF-066 负向：词法器必须保留行注释之后的导入
+  ```
+- **过程教训**：这个负向验证我做了 **8 次才成功**。前几次都在跟 shell 的引号转义较劲
+  （`sed -i`、`python3 -c`、`node -e` 里嵌正则），每次"看起来替换了"其实没生效，
+  测试照样全绿，差点误判成「测试抓不住回归」。最后用
+  **「把旧实现写进一个文件、再 splice 进副本」** 才干净。
+  这本身就是 DF-066 记的那条铁律的又一次：**改了没跑就是没改**，
+  而这里是「以为改了」。
+
+### 顺带修掉的两处锐评指出的
+
+1. **台账里「15 倍余量」算错了**：`HEALTH_EVERY_MS = 60_000`（60 秒），
+   上限 15 分钟 = 900 秒，是 **15 倍**不是 45 倍。已改。
+2. **`overwatch.mjs` 的注释自相矛盾**：`:713` 写「watcher 不健康必须进退出码」、
+   `:720` 写「退出码保持原样」—— 后者是最终决定，前者是中途记录。已合并成一段。
+
+### 未修（锐评指出，我认可，但超出本轮）
+
+- `watcherUnhealthy` 靠**中文字符串** `includes('没有在工作')` 判健康 ——
+  文案一改就静默失效。锐评实测把「没有在工作」改成「不在工作」后，
+  总结行又回到「前提齐了」。**判据挂在人话上是这一轮最该记住的教训。**
+- `install-watcher status` 的退出码 `2` 与既有的「模板缺失」`2` 撞车。
+- `DF-070` 的退出码改动与 `DF-068` 的总结行**都没有测试**。
+
+### DF-075 [fixed] `doctor` 的 watcher 判据挂在**中文字符串**上，改一次文案就静默失效
+
+- 发现于：2026-11-21 锐评 Agent 第 1 节末；主线程复核
+- 位置：`scripts/overwatch.mjs` 里 `watcherUnhealthy` 的计算
+- 证据（锐评实测，我复现过）：把 `scripts/watch.mjs` 里的「没有在工作」全改成「不在工作」，
+  原来的 `verdict.includes('没有在工作')` 静默变 false，总结行**又回到「前提齐了，可以跑 scan」**。
+- 影响：`docs/CHANGELOG.md` 里 DF-068 那一节的价值主张全部建立在这句话上，
+  而它随时会被一次措辞改动静默关掉，**没有任何测试会红**。
+- 修法：改读 `--health` **已经输出的结构化字段** `layers`
+  （形态 `{jobs:'45.2', probe:'45.3', log:'故障'}`，健康时是 `'正常'`），
+  判「有没有一层的值不是已知的健康词」。与 verdict 的措辞解耦。
+- 验证：把「没有在工作」全改成「不在工作」→ 总结行**仍然**说
+  「但后台监视装着却没在工作」。
+- **没做的**：`layers` 的「健康词」集合（`正常/ok/healthy`）仍是白名单，
+  将来 `--health` 输出新词时要同步。更彻底的做法是让 `--health --json` 直接给
+  `healthy: false` 布尔值，让 `doctor` 读那个。已记在这里。

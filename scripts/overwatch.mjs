@@ -710,16 +710,13 @@ async function runDoctor(opts) {
   const elapsedMs = Date.now() - started;
   const wallMs = bootMs + elapsedMs;
 
-  // **watcher 不健康必须进退出码（DF-068 / DF-070）。**
+  // ## 退出码：**保持原样，只由 `transcripts.kind` 决定**
   //
-  // 修前 `code` 只由 `transcripts.kind` 决定，watcher 那一项拿到了 `r.code`
-  // （`runNode` 在 `:228` 如实带回了）却**没有用**。于是同一屏里
-  // 「watcher … health 说 没有在工作」与「前提齐了，可以跑 scan」并排出现，
-  // 退出码 0 —— 读那屏的人最后一眼看到的是后者。
+  // 修前的第一个问题是：同一屏里「watcher … health 说 没有在工作」与
+  // 「前提齐了，可以跑 scan」并排出现 —— 读那屏的人最后一眼看到的是后者。
+  // 那一条**靠改总结行解决**（见下面的 `watcherUnhealthy` 分支）。
   //
-  // **退出码保持原样：只由 `transcripts.kind` 决定（DF-068 的取舍）。**
-  //
-  // 我一开始把 watcher 不健康也接进了退出码（返回 3）。查文档后撤回：
+  // 我一开始也想把 watcher 不健康接进退出码（返回 3），**然后撤回**。理由：
   // `docs/CAPABILITIES.md:17` 给 `doctor` 的契约是「**8 项前提事实，每行只说
   // 读到什么，不出红绿灯**；空（exit 2）与坏（exit 3）分开」——退出码的语义是
   // 「哪一类前提读不出」，不是「整体健康分」。
@@ -733,12 +730,30 @@ async function runDoctor(opts) {
   //
   // 真正该修的是**总结行**：它逐项如实报过「health 说 没有在工作」，
   // 却在同一屏说「前提齐了」。那句话是**陈述**，不是红绿灯，改它不违背契约。
+  //
+  // ## 判据不能挂在人话上（DF-075）
+  //
+  // 第一版用 `watcherFacts.verdict.includes('没有在工作')` —— 挂在**中文字符串**上。
+  // 锐评实测：把 `watch.mjs` 里那七个字改成「不在工作」，`verdict` 变了、
+  // 而这个 includes 静默变 false，总结行又回到「前提齐了」。
+  // 文案会被人改，判据不该跟着断。
+  //
+  // 现在读 `--health` **已经输出过的结构化字段**：`layers.jobs` / `layers.probe`
+  // 是 `checkWatcherLive` 从 `jobs 上次 43 小时前` 这类行里抽出来的纯数据。
+  // 判「不健康」= 装了 且 至少一层报了非「正常」的东西 —— 与 verdict 的措辞解耦。
+  //
+  // `layers` 的取值形态：健康时是 `'正常'` 或类似短词；不健康时是 `'43.2 小时前'` 这类。
+  // 所以判据是「有没有一层的值不是已知的健康词」，而不是「含某个中文短语」。
+  const HEALTHY_LAYER_WORDS = new Set(['正常', 'ok', 'healthy']);
   const watcherStep = steps.find((s) => s && s.id === 'watcher');
   const watcherFacts = (watcherStep && watcherStep.facts) || {};
   const watcherInstalled = watcherFacts.launcherPresent === true;
-  const watcherVerdict = typeof watcherFacts.verdict === 'string' ? watcherFacts.verdict : null;
-  const watcherUnhealthy = watcherInstalled
-    && typeof watcherVerdict === 'string' && watcherVerdict.includes('没有在工作');
+  const layersObj = (watcherFacts.layers && typeof watcherFacts.layers === 'object') ? watcherFacts.layers : {};
+  const layerValues = Object.values(layersObj).filter((v) => typeof v === 'string' && v.trim());
+  const anyLayerUnhealthy = layerValues.some((v) => !HEALTHY_LAYER_WORDS.has(v.trim()));
+  // 装了、且至少有一层不是健康词 → 说「没在工作」。
+  // 没装 → 那是合法状态，不在此断言（doctor 上面那行会如实报「启动器不在」）。
+  const watcherUnhealthy = watcherInstalled && anyLayerUnhealthy;
 
   const code = transcripts.kind === 'absent'
     ? EXIT.ABSENT
