@@ -780,3 +780,71 @@ test('DF-060：传递 import 闭包会跟着带走（不能只拷第一层）', 
     assert.ok(!r.written.includes('scripts/unused.mjs'), '没被引用到的脚本不该进载荷');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ── DF-066：剥注释不许吞掉真导入 ──────────────────────────────────────
+//
+// 这条守的是一个**会让交付物崩掉**的静默失效：`stripComments()` 的块注释正则
+// 遇到源码里的「斜杠加星号」字面量会提前收尾，把后面的真导入一起吞掉。
+// 实测 `tui-theme.mjs` 因此丢了 `./width-table.mjs`，闭包算出只有它自己、
+// `problems` 为空 —— 载荷会带上 `tui-theme.mjs` 却不带 `width-table.mjs`。
+
+test('DF-066：源码里有「斜杠加星号」字面量时，被吞掉的导入必须报出来', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, {
+      scripts: {
+        // 要复现真实的误剥形态（`tui-theme.mjs` 那样），必须**成对**：
+        // 一个假起点（自然语言里的「斜杠加星号」）+ 后面某个 `*/` 收尾，
+        // 于是中间那段（含真导入）整块被当成注释剥掉。
+        'a.mjs': [
+          '// 表由 x 从 scripts/data ' + '/*' + '.txt 生成',
+          '// 上面那个星号让下面的块注释被提前打开',
+          "import { b } from './b.mjs';",
+          'export const a = b;',
+          '/**',
+          ' * 文档块的结尾（就是它的结束符把上面整段吞掉）',
+          ' */',
+          'export const z = 1;',
+          '',
+        ].join('\n'),
+        'b.mjs': 'export const b = 1;\n',
+      },
+    });
+    const problems = [];
+    const c = scriptClosure(dir, ['scripts/a.mjs'], problems);
+    assert.ok(!c.includes('scripts/b.mjs'), '前提：这条导入确实被吞了（否则测试没验到东西）');
+    assert.ok(problems.some((p) => /b\.mjs/.test(p) && /被剥注释吞掉了/.test(p)),
+      `被吞的导入必须报出来，实际 problems：${JSON.stringify(problems)}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-066：注释里提到自己（自指路径）不算被吞的导入，不许误报', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, {
+      scripts: {
+        // 头部注释里提到自己 —— 剥掉它是正确行为
+        'a.mjs': '// 参见 ./a.mjs 的说明\n' + "import { b } from './b.mjs';\nexport const a = b;\n",
+        'b.mjs': 'export const b = 1;\n',
+      },
+    });
+    const problems = [];
+    const c = scriptClosure(dir, ['scripts/a.mjs'], problems);
+    assert.ok(c.includes('scripts/b.mjs'), '真导入必须跟到');
+    assert.deepEqual(problems, [], `不该误报：${JSON.stringify(problems)}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-066：注释里提到一个**不存在的**路径，不算被吞的导入', () => {
+  const dir = tmp();
+  try {
+    mkSrcWithScripts(dir, {
+      scripts: {
+        'a.mjs': '// 旧版本曾经 import ./gone.mjs，已经删了\nexport const a = 1;\n',
+      },
+    });
+    const problems = [];
+    scriptClosure(dir, ['scripts/a.mjs'], problems);
+    assert.deepEqual(problems, [], `注释里提到已删除的路径不该报：${JSON.stringify(problems)}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

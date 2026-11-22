@@ -226,7 +226,7 @@ export function badge(state, enabled = true) {
 // 1. **宽度表必须是 Unicode 官方的全量数据。** 旧实现手抄了 20 段 W/F，
 //    而 Unicode 18.0 里有 298 段。实测 10 个代表性字符错了 8 个：
 //      ⚓ ⚪ 🟡 🟢 🟣 ✅ ⚡ ⌚  →  全部量成 1 列（实际 2 列）
-//    现在表由 scripts/gen-width-table.mjs 从 scripts/data/*.txt（官方原文件）
+//    现在表由 scripts/gen-width-table.mjs 从 scripts/data/ 下的官方原文件
 //    生成；测试直接读原始数据逐码点比对，手改表会被揪出来。
 //
 // 2. **必须做 grapheme 聚类。** 旧实现按码点遍历，`👍🏻` 被量成 4 列

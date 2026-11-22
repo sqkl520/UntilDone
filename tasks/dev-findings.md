@@ -2810,6 +2810,12 @@ const LIVING_DOCS = [
 
 ### DF-063 [open] `render-plan.mjs` 不在载荷里：SKILL 从不调用它，闭包算不到
 
+> **2026-11-21 更正（主线程自纠）**：本条初版的「影响」段写着
+> 「**`docs/CAPABILITIES.md` 里它是一个能力**，在载荷形态下 README 承诺的这条**不存在**」——
+> **前半句是我编的**。实测 `awk '/^## 1\./,/^## 2\./' docs/CAPABILITIES.md | grep -c render-plan` = **0**；
+> 全文唯一出现是 `:214`，讲的是「会写进框架仓库」这个**副作用**，不是能力行。
+> 那句断言从未存在，我按印象写的。原文保留在下方，划掉的是不成立的部分。
+
 - 发现于：2026-11-21 验收 Agent 补充第 2 条；主线程复核
 - 证据：
   ```
@@ -2817,16 +2823,44 @@ const LIVING_DOCS = [
   $ ls <payload>/scripts/render-plan.mjs   → No such file or directory
   $ grep -rn "render-plan" .claude/ docs/CAPABILITIES.md
     docs/CAPABILITIES.md:214  ← 只有这一处，且是在讲「会写进框架仓库」的副作用
+  $ awk '/^## 1\./,/^## 2\./' docs/CAPABILITIES.md | grep -c render-plan   → 0
   ```
   `.claude/skills/oversight/SKILL.md` 与 12 份 agent 定义里**都没有** `render-plan`。
 - 性质：DF-060 的闭包机制**按引用取**，这个设计是对的（整目录 96 个文件只带 22 个）。
-  真正的问题是 **SKILL 压根没让主线程跑 render-plan** —— 它是「计划渲染」的入口，
-  而 SKILL 的流程从头到尾没提它。所以这不是闭包漏了，是**流程漏了**。
-- 影响：交付出去的载荷里，主线程没有任何「把拆解图渲染成人能读的计划」的手段。
-  `docs/CAPABILITIES.md` 里它是一个能力，在载荷形态下 README 承诺的这条**不存在**。
+  ~~真正的问题是 SKILL 压根没让主线程跑 render-plan —— 所以这不是闭包漏了，是流程漏了。~~
+  **这句话被批判 Agent 推翻，见下方「三方复核结论」。**
+- ~~影响：交付出去的载荷里，主线程没有任何「把拆解图渲染成人能读的计划」的手段。
+  `docs/CAPABILITIES.md` 里它是一个能力，在载荷形态下 README 承诺的这条不存在。~~
+  **更正后的影响**：没有任何文档对载荷形态承诺过计划渲染。载荷里缺它**不构成承诺失守**。
+  真正可观测的只有一件事：`docs/CAPABILITIES.md:214` 那句「会写进框架仓库」的副作用清单里
+  点了它的名，而在载荷形态下它根本跑不了——但这不误导任何人。
 - 与 DF-062 的关系：DF-062 正文说「三个消费者」，其中 `render-plan` 在载荷形态下仍是
   `MODULE_NOT_FOUND`。验收 Agent 指出这一点，**它是对的**，那句话在载荷形态下不成立。
-- 建议归属：独立任务（要么让 SKILL 调用它，要么明确「载荷形态不提供计划渲染」）
+- 建议归属：独立任务
+
+#### 三方复核结论（2026-11-21，测绘/批判/检索三 Agent + 主线程）
+
+**「该不该让 SKILL 调用它」这个问题，答案是「不该」，理由有四条，都是实证的：**
+
+1. **它是观察层，不是调度步骤。** `render-plan.mjs:80-83` 自述「用途是让用户安心知道流程」；
+   `:53` 「零依赖，只读」；`:13` 「不产生第二套状态、不写任何文件、不改任何台账」。
+   唯一的副作用是 stdout。
+2. **它连 SKILL §7 都满足不了。** SKILL.md:317 要的是**逐 Agent 状态行**
+   （`[阶段B · Agent#3 EXPLORING · reads=42/novelty=0.74 …]`），而 `render-plan` 输出的是
+   **任务级** `PLAN <run> · 进度 2/5 完成`。`docs/research/2026-11-14-docs-coverage.md:83`
+   早就点明「两者不是同一个东西」。把塞进去解不了 §7。
+3. **设计文档的接线点是应用，不是主线程。** `docs/design/2026-11-14-plan-rendering.md:157-164`
+   列的三个接点依次是 `watch.mjs` / `oversight-tui.mjs` / `stop-verify-hook.mjs`，
+   SKILL.md 没在其中；`scripts/overwatch.mjs:679-705` 已按此用 `await import()` 进程内调用。
+   让模型每轮 shell 出去跑一次，恰恰是设计文档**没选**的形态。
+4. **外部判据**：Azure WAF 原文「the monitoring stack **runs in parallel**」；
+   且检索 Agent 自己补了反向限定——「渲染是否属于流程」随「渲染之后那个动作可不可逆」变化。
+   `render-plan` 之后没有任何不可逆动作，所以它属于并行栈。同厂商内部对照：
+   Claude Code 把「计划批准」做成流程（plan mode），把「计划显示」做成可关的视图（TodoList `Ctrl+T`）。
+
+**但复核过程捞到了一条真 bug（DF-066）**：`stripComments()` 会把 `/*` 字面量当块注释起点，
+静默吞掉真导入。**即使决定永远不给载荷加 `render-plan`，那个也必须修。**
+
 
 ### DF-064 [open] 「角色在哪」有三套答案、两种配置来源，互相不认
 
@@ -2845,3 +2879,114 @@ const LIVING_DOCS = [
   但 DF-062 的修复新增了 `<pkgRoot>/agents` 这条约定，等于给「角色在哪」添了第三个答案。
 - 影响：任何用 `checks.json` 调过 `agentsDir` 的项目，硬门和派发器看的是两个不同目录。
 - 建议归属：独立任务（先定「谁是权威」，再决定要不要让 roles.mjs 读配置）
+
+### DF-065 [open] `displayPath` 在两个模块各导出一份，硬门探针表按名字命中，其中一份从未被验过
+
+- 发现于：2026-11-21 主线程核对 DF-063 时偶然发现
+- 位置：`scripts/render-plan.mjs:171`（`displayPath(abs, root = ROOT)`）、
+  `scripts/roles.mjs:201`（`displayPath(p, root = null)`）
+- 证据（同一组参数喂两个实现，**行为不同**）：
+  ```
+  $ node --input-type=module -e "
+    import { displayPath as rp } from './scripts/render-plan.mjs';
+    import { displayPath as ro } from './scripts/roles.mjs';
+    const args=['/nonexistent-ow-probe/.claude/agents','/nonexistent-ow-root'];
+    console.log('render-plan:', rp(...args));
+    console.log('roles      :', ro(...args));"
+  render-plan: ".claude/agents"
+  roles      : "<abs>/.claude/agents"
+  ```
+- 机制：`scripts/check-structure.mjs:809` 的 `PROBE_ARGS` 是**按名字扁平命中所有模块**的
+  （该表自己的注释就写着「函数名刻意不叫 parseArgs：探针表是按名字命中的扁平表，重名会被另一份参数调用」）。
+  一份参数只调一次，所以两份实现里**有一份从来没被 `checkImportable` 验过**。
+  更糟的是 `roles.mjs` 这份是 2026-11-21（DF-062 整改）新加的，它没遇到撞名检查。
+- 影响：这是「门报绿但检查没跑」的又一形态 —— 探针确实跑了，但只跑了两份中的一份，
+  另一份的返回值对不对无人过问。`render-plan.mjs:171` 的那份有 28 条独立测试兜着，
+  `roles.mjs:201` 那份有 DF-062 整改①的测试兜着，所以**目前没有实际缺陷**，
+  但机制本身是个洞：下一次谁再加一个同名导出，就没有这层兜底了。
+- 建议归属：两条路 —— ①把 `roles.mjs` 那份改名（它们是不同语义：一个按 `root` 相对化，
+  一个按 `<pkg>` / `<abs>` 三级回落）；②给 `PROBE_ARGS` 加「重名必须显式区分」的检查。
+
+### DF-066 [fixed] `stripComments()` 把 `/*` 字面量当块注释起点，静默吞掉真导入——载荷会交付一跑就崩的脚本，而 `--check` 全绿
+
+- 发现于：2026-11-21 批判 Agent 顺手捞到；主线程独立复现
+- 位置：`scripts/build-payload.mjs:139-145` 的 `stripComments()`
+- 根因：`scripts/tui-theme.mjs:229` 的自然语言里写着 `scripts/data/*.txt`，
+  其中的 `/*` 被 `.replace(/\/\*[\s\S]*?\*\//g,'')` 当成块注释起点，
+  配对的 `*/` 是 `:236` 那个 JSDoc 块的结尾。**`:229..236` 整段被剥掉**，
+  而 `:239` 的 `import { EAW_WIDE, EMOJI_PRESENTATION } from './width-table.mjs'` 夹在中间。
+- 证据（主线程实测，两行命令）：
+  ```
+  $ node -e '…对 tui-theme.mjs 跑原正则 vs stripComments…'
+  原始匹配: [ './tui-theme.mjs', './width-table.mjs' ]
+  剥注释后: []                       ← 一个都不剩，比批判 Agent 说的更彻底
+
+  $ node -e '…scriptClosure("D:/Projects/Overwatch",["scripts/tui-theme.mjs"],probs)…'
+  tui-theme 的闭包: [ 'scripts/tui-theme.mjs' ]
+  problems: []                       ← width-table.mjs 丢了，而且不报错
+  ```
+- 为什么现在没炸：载荷 22 个脚本里**零个** import `tui-theme.mjs`（实测）。
+  谁哪天给某个 agent 加一句依赖它的指令，闭包就会带上 `tui-theme.mjs` 而不带
+  `width-table.mjs`，交付出去 `ERR_MODULE_NOT_FOUND`，两份门都绿。
+- **两处防线为什么都没拦住**：
+  - `scriptClosure()` 的契约是「找不到的导入进 problems 让生成停住」，但它**根本没看见**那条导入。
+  - `checkPayload()` 第 5.5 条（DF-060 加的）只核「markdown 引用的脚本在不在」，
+    **不核「脚本引用的脚本在不在」**。它覆盖 md→脚本 一跳，不覆盖脚本→脚本。
+- 同类：批判 Agent 报「同一模式在别的文件里还有 11 处」（`check-structure.mjs:1445`、
+  `scan-sessions.mjs:990`、`watch.mjs:2072` …）—— **未验证**，本条只对 `tui-theme.mjs` 做了实证。
+- 修法方向（不在此条内定）：`stripComments` 要么换成真正的词法扫描，要么对
+  「剥完之后导入数变少」这个事件本身就报错——后者更便宜，且能兜住所有同类。
+- 建议归属：**优先级高于 DF-063**，因为它是一个会让交付物崩掉的真 bug。
+
+#### 修法（2026-11-21 已修）
+
+两条一起做，缺一不可：
+
+1. **`scriptClosure()` 加对账**：剥注释后若某个相对导入「原文有、剥完没了」，
+   且它指向的文件**真实存在、又不是自指**，就作为 problem 报出来并停止生成。
+   不写完整词法器 —— 那要处理字符串 / 模板串 / 正则字面量的嵌套，成本远超收益。
+   这条判据便宜，且能兜住所有同类误剥。
+2. **改掉源头**：`scripts/tui-theme.mjs:229` 的注释不再写通配文件名。
+
+两条判据的取舍（都写进了代码注释）：
+- **只报「指向盘上真的存在」的**——注释里提到一个不存在的旧路径是常态，剥掉它对。
+- **排除自指**——`tui-theme.mjs` 头部注释提到 `./tui-theme.mjs`，那是自指不是导入；
+  第一版没有这条排除，会误报。
+
+**负向证据（两次，第二次才做对）：**
+```
+改回通配文件名 →
+  scriptClosure → [ 'scripts/tui-theme.mjs' ]（width-table 丢了）
+  problems     → ['… 的导入 ./width-table.mjs 被剥注释吞掉了 …']    ← 报出来了
+
+把对账循环改成 for (const spec of []) → DF-066 测试红（52/53）
+```
+**第一次负向做失败了**：`python3` 的字符串替换没匹配上缩进，实测仍 53/53 全绿，
+差点当成「这条测试没用」。改成按行号 `sed` 才真正禁用 —— **改了没跑就是没改**，
+这次是「以为改了」。新增 3 条测试（吞掉必须报 / 自指不许误报 / 提到已删除路径不许误报）。
+
+### DF-067 [open] 硬门查「角色有没有被派发」，却不查「脚本有没有被调用」——10 个真孤儿因此隐形
+
+- 发现于：2026-11-21 测绘 Agent 结尾一句 + 主线程复算
+- 位置：`scripts/check-structure.mjs:2340` 的 `checkAgentReachability()` 只扫
+  `.claude/agents/*.md` 与 `SKILL.md`；**没有对应的脚本可达性检查**。
+- 证据（主线程实测，口径写明）：
+  ```
+  脚本总数（不含 .test.mjs）: 58
+  在任何入口文本（SKILL / 12 agents / overwatch.mjs / README / CAPABILITIES / GUIDE）里没出现: 19
+  其中扣掉「被别的脚本 import 的内部模块」后，真孤儿: 10
+    gen-width-table 8KB / measure-gate-ceiling 38KB / probe-evidence-sources 26KB /
+    probe-parser-divergence 15KB / probe-relay 10KB / redteam-gate-evidence 5KB /
+    resolution-gate-audit 25KB / verify-bugfix-negatives 14KB /
+    verify-claim-fix-negatives 7KB / verify-tui-negatives 18KB
+  ```
+- 口径说明：这是**文本包含**判据（入口文本里有没有出现脚本名），不是「运行时真的被调用」。
+  它比「函数被 import 过」弱，但足以说明「没有任何读者知道它们存在」。
+- `render-plan.mjs` **不在**这 10 个里——它在 `overwatch.mjs` 与 `CAPABILITIES.md` 里都出现了。
+  它的处境不同：**有消费者，但消费者本身不在载荷里**。
+- 影响：角色侧有「定义了却从不被派发」的红线（`checkAgentReachability`），
+  脚本侧没有对应的。于是「写完就没人用」这件事只能靠人读台账发现。
+  本仓已有 10 个实例，最早的来自 2026-10-31。
+- 为什么难自动判：脚本的合法无消费者形态有好几种（被 import 的内部模块、一次性度量、
+  只给测试用的负向验证器）。**做这条检查前必须先定义「什么算孤儿」**，否则会误杀。
+- 建议归属：独立任务（先定判据，再决定要不要做成检查）

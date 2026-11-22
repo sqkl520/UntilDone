@@ -132,9 +132,23 @@ const REL_IMPORT_RE = /(?:from\s*|import\s*\(\s*|import\s+)['"](\.[^'"]+)['"]/g;
  *  **为什么必须先剥**：`scripts/stop-signals.mjs:34` 的注释里写着
  *  「`export { x } from './m'` 只建立导出」，正则把它当成真导入，
  *  于是闭包计算报 `./m 不存在`，整份载荷都生成不出来。实测第一次跑就撞上。
- *  这里不追求完美的词法分析（字符串里的 `//` 会被误剥）—— 代价是可能漏掉一条
- *  真导入，而漏掉的后果由 `--check` 与运行期 `ERR_MODULE_NOT_FOUND` 兜底；
- *  反过来（把注释当导入）的后果是**载荷根本生成不出来**，两者不对称。
+ *
+ *  **但它会误剥，而且误剥的形态很隐蔽**（DF-066）：`scripts/tui-theme.mjs:229`
+ *  的自然语言里写着 `scripts/data/` 加一个星号再跟 `.txt`，其中的「斜杠加星号」
+ *  被当成块注释起点，一路吞到 `:236` 那个 JSDoc 的结束符，而 `:239` 的
+ *  `import { EAW_WIDE } from './width-table.mjs'` 恰好夹在中间。实测：
+ *
+ *      原始匹配: [ './tui-theme.mjs', './width-table.mjs' ]
+ *      剥注释后: []                       ← 一个都不剩
+ *
+ *  后果是 `scriptClosure('scripts/tui-theme.mjs')` 返回**只有它自己**、`problems` 为空，
+ *  于是载荷会带上 `tui-theme.mjs` 却不带 `width-table.mjs`，运行期 `ERR_MODULE_NOT_FOUND`
+ *  而两道门都绿。现在没炸只因为载荷里零个脚本 import 它。
+ *
+ *  **本函数不打算写成完整词法器**（那要处理字符串、模板串、正则字面量的嵌套，
+ *  成本远超收益）。改为在下面 `scriptClosure` 里加一道**对账**：
+ *  剥注释后若「导入数比原文少」，就把被吞掉的那些作为 problem 报出来并停止生成。
+ *  判据简单、能兜住所有同类误剥，且不会为了正确性把载荷卡死。
  */
 function stripComments(src) {
   return String(src)
@@ -173,8 +187,42 @@ export function scriptClosure(base, roots = [], problems = []) {
     const rel = queue.pop();
     if (seen.has(rel)) continue;
     seen.add(rel);
+    let raw = '';
     let text = '';
-    try { text = stripComments(readFileSync(join(base, rel), 'utf8')); } catch { continue; }
+    try {
+      raw = readFileSync(join(base, rel), 'utf8');
+      text = stripComments(raw);
+    } catch { continue; }
+
+    // **对账：剥注释不许吞掉真导入**（DF-066）。
+    //
+    // `stripComments()` 的块注释正则在遇到源码里的 `/*` 字面量时会提前收尾，
+    // 实测 `tui-theme.mjs` 因此丢掉了 `./width-table.mjs` 这条真导入，而
+    // `scriptClosure` 完全看不出来（它以为那个文件没有更多导入）。后果是载荷带上
+    // `tui-theme.mjs` 却不带 `width-table.mjs`，运行期 `ERR_MODULE_NOT_FOUND`，
+    // 而 `--check` 与硬门都绿。
+    //
+    // 判据：**原文能匹配到、剥完后匹配不到的相对导入，就是被吞掉的**。
+    // 这不需要写完整词法器，却能兜住所有同类误剥；而「剥多了」只会让载荷少文件、
+    // 「剥少了」才会让它多一个不存在的路径 —— 两个方向都在这里报出来，不猜。
+    {
+      const rawImports = new Set([...String(raw).matchAll(REL_IMPORT_RE)].map((m) => m[1]));
+      const keptImports = new Set([...text.matchAll(REL_IMPORT_RE)].map((m) => m[1]));
+      for (const spec of rawImports) {
+        if (keptImports.has(spec)) continue;
+        // **只报「指向盘上真的存在、且不是自己」的那些**。注释里提到一个路径是常态
+        // （`tui-theme.mjs` 的头部注释就有 `./tui-theme.mjs`，那是自指），剥掉它是
+        // **正确**行为，不该报。而真导入被吞掉时，它指向的**另一个**文件一定在盘上 ——
+        // 这条区分把「注释里的路径」和「被吞掉的真导入」分开，且不需要词法器。
+        const target = resolve(base, dirname(rel), spec);
+        if (!existsSync(target)) continue;
+        if (toPosix(relative(base, target)) === rel) continue;   // 自指，不是导入
+        problems.push(`${rel} 的导入 ${spec} 被剥注释吞掉了 —— `
+          + '源码里有「斜杠加星号」的字面量（例如文档里写 scripts/data 下的通配文件名），'
+          + '它被当成块注释起点。把它改写掉，否则这个文件会带着不完整的闭包进载荷');
+      }
+    }
+
     for (const m of text.matchAll(REL_IMPORT_RE)) {
       // **用 relative()，不用字符串切片**：`resolve(dirname(rel), './x')` 在 rel 是
       // 单段路径（如 `scripts/a.mjs`）时会解析成仓库根自身，`rel.slice(base.length + 1)`
