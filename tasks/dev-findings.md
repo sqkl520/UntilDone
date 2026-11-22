@@ -3182,3 +3182,31 @@ const LIVING_DOCS = [
 JS 兜底也接不住 —— 所以真正的防线是**让那次分配不要发生在主进程**。
 
 - 建议归属：独立任务（方向已改写，见上）
+
+### DF-072 [fixed] 硬门的「导出未登记」提示会误报：登记的导出正被探针真实调用，它却说没登记
+
+- 发现于：2026-11-21 验收 Agent 的「非阻断观察」第 3 条；主线程复核
+- 位置：`scripts/check-structure.mjs:1920` 的 warn 分支 vs `:1095-1096` 的 `PROBE_ARGS`
+- 证据：
+  ```
+  $ node scripts/check-structure.mjs 2>&1 | grep "未登记"
+    [scripts/build-payload.mjs] 导出 "referencedScriptRoots" 未登记 …
+    [scripts/build-payload.mjs] 导出 "scriptClosure" 未登记 …
+
+  $ grep -n "referencedScriptRoots:|scriptClosure:" scripts/check-structure.mjs
+    1095:  referencedScriptRoots: '[]',
+    1096:  scriptClosure: '["/nonexistent-ow-probe", []]',
+  ```
+  两个导出**正被探针真实调用**，却被告知「不会被 checkImportable 调用」。
+- 根因：`PROBE_ARGS` 的键**只被 JSON 序列化后传给子进程**（`:1199`），
+  **从不加进 `REGISTERED`**。`REGISTERED` 靠每个模块一张手写清单兜底
+  （这里的是 `BUILD_PAYLOAD_FNS`，`:1729`），而 DF-060 加这两个导出时只改了
+  `PROBE_ARGS`、没改那张表。
+- 影响：这是「手工维护的清单必然漂」的又一次复发（DF-031 / DF-044 / DF-047 同形态）。
+  提示本身不阻塞，但**它让人不再相信这类提示** —— 而本仓真正靠这类提示发现过缺陷。
+- 修法：两个名字补进 `BUILD_PAYLOAD_FNS`，并在那里留一行注释说明「加纯函数进
+  `PROBE_ARGS` 时同一处也要加进这张表」。修后 `grep -c "未登记"` = 0。
+- **没做的那半**：`REGISTERED` 靠手写清单这件事本身没改。真正的解法是
+  **`PROBE_ARGS` 的键自动进 `REGISTERED`**（它们本来就一定会被调用），
+  那样这张手写表就不需要存在。本轮没做，因为改动面比这一条大。
+- 建议归属：独立任务（自动登记那半）

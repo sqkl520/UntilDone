@@ -1726,11 +1726,18 @@ function checkUnregisteredExports() {
   // buildPayload 会**写盘**（rmSync + writeFileSync），main 是 CLI 入口 —— 两个都进
   // INTENTIONALLY_PROBED_FREE，由 build-payload.test.mjs 的 11 条生成/负向用例覆盖。
   // 常量是数据（目录名 / 文件名 / 版本号 / 帮助文本），不是函数。
+  //
+  // **这张表要跟 PROBE_ARGS 一起改。** 2026-11-21 加 `referencedScriptRoots` /
+  // `scriptClosure`（DF-060）时只登记进了 `PROBE_ARGS`、忘了这张表，
+  // 于是硬门每次都提示「这两个导出未登记」—— 而它们其实**正被探针真实调用**。
+  // 这类「手工清单漂了」已在本仓复发多次（DF-031/DF-044/DF-047）。
+  // 记在这里：加纯函数进 `PROBE_ARGS` 时，**同一处**也要加进这张表。
   const BUILD_PAYLOAD_FNS = [
     'PAYLOAD_VERSION', 'GENERATOR', 'MANIFEST_FILE', 'PLUGIN_NAME', 'DEFAULT_OUT',
     'AGENTS_REL', 'SKILLS_REL', 'HELP',
     'defaultOutDir', 'summarizeSources', 'payloadDigest', 'pluginManifest',
     'pluginManifestBytes', 'planPayload', 'checkPayload', 'parseArgv',
+    'referencedScriptRoots', 'scriptClosure',
   ];
   for (const k of BUILD_PAYLOAD_FNS) REGISTERED.add(k);
 
