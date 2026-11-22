@@ -526,19 +526,45 @@ async function checkWatcherLive(env, timeoutMs, nowMs) {
     return { ok: true, code: 0, out: '', err: '', timedOut: false, ms: Date.now() - started, facts };
   }
 
-  const r = await runNode('watch.mjs', ['--health'], timeoutMs);
+  // **用 `--json`：要的是那个 `healthy` 布尔，不是一行人话。**（DF-076）
+  //
+  // 之前是 `['--health']` 然后从文本里正则抽 `jobs 上次 45.2` 这类年龄。
+  // 抽出来的东西**不是健康判据**（`0` 表示健康、`45.2` 表示不健康，都是年龄），
+  // 而有人（我）一度拿它当判据，结果健康时也判成不健康。
+  // `--health --json` 直接给 `{healthy, reasons[]}`，不需要任何转译。
+  const r = await runNode('watch.mjs', ['--health', '--json'], timeoutMs);
   if (r.timedOut) {
     return { ...r, facts, timedOut: true, ms: Date.now() - started };
   }
   const body = r.out || r.err || '';
   facts.raw = body.trim();
-  const verdictLine = body.split('\n').find((l) => /判定[:：]/.test(l));
-  facts.verdict = verdictLine ? stripGlyphs(verdictLine.replace(/^.*判定[:：]/, '')).replace(/。$/, '') : null;
-  for (const line of body.split('\n')) {
-    const m = stripGlyphs(line).match(/^(jobs|probe)\s+上次\s+(\S+)/);
-    if (m) facts.layers[m[1]] = m[2];
-    const lg = stripGlyphs(line).match(/^log\s+(\S.*)$/);
-    if (lg) facts.layers.log = lg[1].trim();
+  // **结构化判定优先**：能不能解析出 `healthy` 布尔，决定这一项是「知道」还是「不知道」。
+  // 解析不出来（旧版 watch.mjs / 输出被截断）时 `facts.healthy` 保持 `null`，
+  // 调用方必须把它当「未判定」，不许当健康。
+  let parsed = null;
+  try { parsed = JSON.parse(body); } catch { /* 不是 JSON：下面按文本兜底 */ }
+  if (parsed && typeof parsed === 'object' && typeof parsed.healthy === 'boolean') {
+    facts.healthy = parsed.healthy;
+    facts.reasons = Array.isArray(parsed.reasons) ? parsed.reasons : [];
+    // 人类可读的一行，仍从结构化字段生成 —— 不再从文本正则抽。
+    facts.verdict = parsed.healthy ? '运行中。所有层都在周期内' : '没有在工作';
+    for (const layer of (Array.isArray(parsed.layers) ? parsed.layers : [])) {
+      if (layer && typeof layer.name === 'string' && layer.stale != null) {
+        // 只用于显示；判据一律走 `facts.healthy`
+        facts.layers[layer.name] = layer.stale ? (layer.lastAt ? '过期' : '从未运行') : '正常';
+      }
+    }
+  } else {
+    // 兜底：旧版输出是文本。此时 `healthy` 是 `null`（未判定），不是 true。
+    facts.healthy = null;
+    const verdictLine = body.split('\n').find((l) => /判定[:：]/.test(l));
+    facts.verdict = verdictLine ? stripGlyphs(verdictLine.replace(/^.*判定[:：]/, '')).replace(/。$/, '') : null;
+    for (const line of body.split('\n')) {
+      const m = stripGlyphs(line).match(/^(jobs|probe)\s+上次\s+(\S+)/);
+      if (m) facts.layers[m[1]] = m[2];
+      const lg = stripGlyphs(line).match(/^log\s+(\S.*)$/);
+      if (lg) facts.layers.log = lg[1].trim();
+    }
   }
   void nowMs; // --health 自己取时钟；这里保留参数是为了与 checkGateInProcess 同形
   return { ...r, facts, ms: Date.now() - started };
@@ -554,6 +580,12 @@ function checkWatcher(result, env) {
     stateDir: f.stateDir || stateDirFor(env),
     launcherPresent: f.launcherPresent ?? null,
     shortcutPresent: f.shortcutPresent ?? null,
+    // **`healthy` 必须透传**（DF-076）。这里是 `facts` 的**重建**，漏一个字段
+    // 就等于把上面那段的解析结果扔掉 —— 实测症状：`checkWatcherLive` 里
+    // `facts.healthy === true` 明明拿到了，`--json` 输出却是 `undefined`，
+    // 于是总结行走进「没查」分支。
+    healthy: typeof f.healthy === 'boolean' ? f.healthy : null,
+    reasons: Array.isArray(f.reasons) ? f.reasons : [],
     verdict: f.verdict ?? null,
     layers: f.layers || {},
     stateNote: f.stateNote || null,
@@ -731,29 +763,27 @@ async function runDoctor(opts) {
   // 真正该修的是**总结行**：它逐项如实报过「health 说 没有在工作」，
   // 却在同一屏说「前提齐了」。那句话是**陈述**，不是红绿灯，改它不违背契约。
   //
-  // ## 判据不能挂在人话上（DF-075）
+  // ## 判据必须来自结构化字段（DF-075 → DF-076）
   //
-  // 第一版用 `watcherFacts.verdict.includes('没有在工作')` —— 挂在**中文字符串**上。
-  // 锐评实测：把 `watch.mjs` 里那七个字改成「不在工作」，`verdict` 变了、
-  // 而这个 includes 静默变 false，总结行又回到「前提齐了」。
-  // 文案会被人改，判据不该跟着断。
+  // 第一版挂在中文串 `verdict.includes('没有在工作')` 上 —— 文案一改就静默失效。
+  // 第二版改成读 `layers` 里的年龄值 —— **更糟**：`layers.jobs = '0'`（健康时的年龄）
+  // 不在健康词里，于是**健康时也判成不健康**，`doctor` 100% 说反话。
+  // 红队实测复现：「health 说 运行中。所有层都在周期内」+ 总结「但后台监视装着却没在工作」。
   //
-  // 现在读 `--health` **已经输出过的结构化字段**：`layers.jobs` / `layers.probe`
-  // 是 `checkWatcherLive` 从 `jobs 上次 43 小时前` 这类行里抽出来的纯数据。
-  // 判「不健康」= 装了 且 至少一层报了非「正常」的东西 —— 与 verdict 的措辞解耦。
-  //
-  // `layers` 的取值形态：健康时是 `'正常'` 或类似短词；不健康时是 `'43.2 小时前'` 这类。
-  // 所以判据是「有没有一层的值不是已知的健康词」，而不是「含某个中文短语」。
-  const HEALTHY_LAYER_WORDS = new Set(['正常', 'ok', 'healthy']);
+  // 现在只认一个东西：`--health --json` 给的 `healthy` 布尔。
+  //   `false` → 不健康（说真话）
+  //   `true`  → 健康（说「前提齐了」）
+  //   `null`  → **未判定**（watcher 那项被预算跳过、或输出解析不出来）
+  //             → 不许说「前提齐了」，也不许说「没在工作」，要明说「没查」。
   const watcherStep = steps.find((s) => s && s.id === 'watcher');
   const watcherFacts = (watcherStep && watcherStep.facts) || {};
   const watcherInstalled = watcherFacts.launcherPresent === true;
-  const layersObj = (watcherFacts.layers && typeof watcherFacts.layers === 'object') ? watcherFacts.layers : {};
-  const layerValues = Object.values(layersObj).filter((v) => typeof v === 'string' && v.trim());
-  const anyLayerUnhealthy = layerValues.some((v) => !HEALTHY_LAYER_WORDS.has(v.trim()));
-  // 装了、且至少有一层不是健康词 → 说「没在工作」。
-  // 没装 → 那是合法状态，不在此断言（doctor 上面那行会如实报「启动器不在」）。
-  const watcherUnhealthy = watcherInstalled && anyLayerUnhealthy;
+  const watcherHealthy = typeof watcherFacts.healthy === 'boolean' ? watcherFacts.healthy : null;
+  const watcherChecked = !watcherStep || watcherFacts.skipped == null;
+  // 只在「装了 且 真的判定过」时才有资格说坏话。没装 = 合法状态；
+  // 没判定 = 不许下结论（DF-068 修的正是「没查却说齐了」）。
+  const watcherUnhealthy = watcherInstalled && watcherChecked && watcherHealthy === false;
+  const watcherUnknown = watcherChecked && watcherHealthy === null && !watcherFacts.skipped;
 
   const code = transcripts.kind === 'absent'
     ? EXIT.ABSENT
@@ -763,14 +793,20 @@ async function runDoctor(opts) {
     code,
     kind: transcripts.kind,
     watcherUnhealthy,
+    watcherChecked,
+    watcherHealthy,
     line: transcripts.kind === 'absent'
       ? `transcript 根不存在：${transcripts.facts.root} —— 先在这台机器上用一次 Claude Code，doctor 才有东西可查`
       : transcripts.kind === 'unreadable'
         ? `transcript 根读不出：${transcripts.facts.root}（${transcripts.facts.errno || '原因未知'}）—— 这是环境问题，不是「没有会话」`
-        // watcher 装了但死着时说「前提齐了」是假话：它自己上一行刚判过「没有在工作」。
+        // watcher 装了但判定为不健康 → 说真话（DF-068）。
         : watcherUnhealthy
           ? `${transcripts.facts.projects} 个项目 / ${transcripts.facts.transcripts} 份 transcript —— **但后台监视装着却没在工作**（见上面 watcher 那行），「没有在等你」这类结论现在不可信`
-          : `${transcripts.facts.projects} 个项目 / ${transcripts.facts.transcripts} 份 transcript —— 前提齐了，可以跑 scan`,
+          // watcher 那一项没跑（预算不够），或跑了但拿不到判据 → **不许说「齐了」**（DF-076）。
+          // 一台慢机器上默认预算就会跳，实测 10 次里有 2 次。
+          : watcherUnknown || (watcherStep && watcherFacts.skipped != null)
+            ? `${transcripts.facts.projects} 个项目 / ${transcripts.facts.transcripts} 份 transcript —— **后台监视这一项没查**（预算不够或输出解析不出），所以「前提齐了」这句话现在不成立`
+            : `${transcripts.facts.projects} 个项目 / ${transcripts.facts.transcripts} 份 transcript —— 前提齐了，可以跑 scan`,
   };
 
   return {

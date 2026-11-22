@@ -593,3 +593,84 @@ function mutateEntry(out, replacements) {
   writeFileSync(out, text);
   return text;
 }
+
+// ── DF-076：doctor 的 watcher 判据必须来自结构化字段，且三态可分 ──────
+//
+// 这一组补的是一条**没有测试就必然退化**的判据。历史：
+//   第一版 `verdict.includes('没有在工作')` —— 挂在中文串上，改文案就失效；
+//   第二版读 `layers` 的年龄值 —— **健康时也判成不健康**（`layers.jobs='0'`
+//           不在健康词表里），红队实测 doctor 100% 说反话。
+// 所以这里钉三条：健康 → 齐了 / 不健康 → 没在工作 / 没查 → 明说没查。
+
+test('DF-076：watcher 健康时，总结行必须是「前提齐了」', () => {
+  const now = Date.now();
+  const dir = mkdtempSync(join(tmpdir(), 'ow-doc-'));
+  try {
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({
+      version: 1,
+      lastJobsScanAt: new Date(now - 2000).toISOString(),
+      lastProbeAt: new Date(now - 2000).toISOString(),
+    }));
+    writeFileSync(join(dir, 'log-health.json'), JSON.stringify({
+      healthy: true, at: new Date(now - 2000).toISOString(), logFile: 'x', sizeBytes: 1,
+    }));
+    // 同样必须给足预算：`--health` 要约 420ms，默认 1000ms 下会被前面几项挤掉，
+    // 那时 watcher 被跳过、总结走「没查」分支，测不到「健康」这个分支。
+    const r = run(['doctor', '--budget', '4000'], { env: { OVERWATCH_STATE_DIR: dir } });
+    assert.match(r.out, /——\s*前提齐了，可以跑 scan/,
+      `watcher 健康时总结必须是「前提齐了」。实测总结行：\n${(r.out.split('\n').find((l) => l.startsWith('合计')) || r.out.slice(-300))}`);
+    assert.doesNotMatch(r.out, /没在工作/,
+      'watcher 健康时不许说「没在工作」—— 这正是第二版判据的 bug');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-076：watcher 不健康时，总结行必须是「没在工作」而不是「前提齐了」', () => {
+  const now = Date.now();
+  const dir = mkdtempSync(join(tmpdir(), 'ow-doc-'));
+  try {
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({
+      version: 1,
+      lastJobsScanAt: new Date(now - 50 * 3600 * 1000).toISOString(),
+      lastProbeAt: new Date(now - 50 * 3600 * 1000).toISOString(),
+    }));
+    writeFileSync(join(dir, 'log-health.json'), JSON.stringify({
+      healthy: true, at: new Date(now - 50 * 3600 * 1000).toISOString(), logFile: 'x', sizeBytes: 1,
+    }));
+    // **必须给足预算。** `--health` 自己要约 420ms（实测），而默认 1000ms 预算里
+    // 前面几项会把它挤掉 —— 那时 watcher 被跳过、总结走「没查」分支，
+    // 这条用例就测不到「不健康」这个分支了。实测默认预算下约 1/3 的运行会跳。
+    const r = run(['doctor', '--budget', '4000'], { env: { OVERWATCH_STATE_DIR: dir } });
+    const sumLine = r.out.split('\n').find((l) => l.startsWith('合计')) || '';
+    assert.match(sumLine, /没在工作/,
+      `watcher 50 小时没动，总结必须说「没在工作」。实际总结行：\n${sumLine}`);
+    // 再确认一次：不许同一行里既说「没在工作」又说「前提齐了」。
+    assert.doesNotMatch(sumLine, /前提齐了/, `不健康时最后一行不许是「前提齐了」：\n${sumLine}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-076：watcher 那项被预算跳过时，总结行不许说「前提齐了」', () => {
+  const r = run(['doctor', '--budget', '30'], {});
+  // summary 是「合计 …ms … —— <结论>」那一行，**不是输出的最后一行**
+  // （后面还有「接着可以跑」的建议，取最后一行会取到建议里的一行命令）。
+  const sumLine = r.out.split('\n').find((l) => l.startsWith('合计')) || '';
+  assert.ok(sumLine, `找不到「合计」那一行：\n${r.out.slice(-400)}`);
+  assert.doesNotMatch(sumLine, /——\s*前提齐了，可以跑 scan/,
+    `watcher 没查却断言「齐了」—— 正是 DF-068 要修的那句矛盾：\n${sumLine}`);
+  // 注意：不许写成 `doesNotMatch(/前提齐了/)` —— 正确的那句话里也含这四个字
+  //（「所以『前提齐了』这句话现在不成立」），那样会误报。
+  assert.match(sumLine, /没查|不成立/, `要说清「没查」，实际：${sumLine}`);
+});
+
+test('DF-076：watch.mjs 的措辞变了，doctor 的判定不许跟着变', () => {
+  // 第一版判据挂在这七个中文字上。这条测试钉死「解耦」：
+  // 直接构造一个 healthy 布尔，绕开任何文案。
+  const raw = readFileSync(join(HERE, '..', 'scripts', 'overwatch.mjs'), 'utf8');
+  // **只查代码，不查注释** —— 注释里会提到那个旧写法（解释为什么改掉它）。
+  const code = raw.split('\n')
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n');
+  assert.doesNotMatch(code, /includes\(['"]没有在工作['"]\)/,
+    'doctor 的判据不许挂在中文串上 —— 改一次文案就静默失效');
+  assert.match(code, /watcherHealthy === false/,
+    '必须读 `--health --json` 的 healthy 布尔');
+});
