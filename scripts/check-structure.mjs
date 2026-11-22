@@ -2100,7 +2100,22 @@ function checkStopHookKillSwitch() {
  *  这里不检查「应该有多少 open」（那是判断，不是事实），只检查**格式合法性**：
  *  状态必须在枚举内、每个条目必须有发现位置、ledger 不能全是 fixed 而文件里还有 open 字样。 */
 function checkLedger() {
-  const ENUM = new Set(['open', 'triaged', 'scheduled', 'fixed', 'wontfix']);
+  // **状态枚举。`partially fixed` 是合法的两个词状态**（DF-043、DF-070 在用）。
+  //
+  // 2026-11-21 之前这里的三个正则都是 `\[([a-z]+)\]` —— 只认连续小写字母。
+  // 于是 `[partially fixed]`（带空格）、`[bogus-state]`（带连字符）**一条都匹配不上**，
+  // 既不在枚举校验里、也不进 open 计数。实测：台账 72 条，正则只看到 **70** 条，
+  // DF-043 与 DF-070 完全隐形。
+  //
+  // 而这个函数的注释写着「台账是『还有多少债』的唯一来源」（下面 :2106 附近）——
+  // 唯一来源漏了 2 条债。这正是本仓最稳定的缺陷形态：**判据在跑，但它看不见一部分输入，
+  // 而屏幕上是绿的**（DF-059 记的就是这个洞，当时只测了 `[bogus]` 这种纯小写的，
+  // 所以没发现带空格/连字符的也会漏）。
+  //
+  // 修法：**先用宽正则把所有 `[xxx]` 抓出来，再判它在不在枚举里**。
+  // 顺序反过来的话，「非法状态」会先被窄正则筛掉，于是「非法」变成「不存在」——
+  // 这正是修前的行为。
+  const ENUM = new Set(['open', 'triaged', 'scheduled', 'fixed', 'wontfix', 'partially fixed']);
 
   const df = join(ROOT, 'tasks', 'dev-findings.md');
   if (existsSync(df)) {
@@ -2110,16 +2125,16 @@ function checkLedger() {
     // 2026-10-31 实测：DF-020 标题写 [open]、正文写 fixed，两个地方对不上，
     // 而台账是「还有多少债」的唯一来源。不一致的台账比没有台账更坏。
     for (const b of text.split(/^### /m).slice(1)) {
-      const head = b.match(/^(DF-\d{3}) \[([a-z]+)\]/);
+      const head = b.match(/^(DF-\d{3}) \[([^\]]+)\]/);
       if (!head) continue;
-      const body = b.match(/\*\*状态\*\*[：:]\s*([a-z]+)/);
+      const body = b.match(/\*\*状态\*\*[：:]\s*([a-z ]+)/);
       if (!body) continue;
-      if (body[1] !== head[2]) {
-        fail('tasks/dev-findings.md', `${head[1]} 标题写 [${head[2]}]，正文写 ${body[1]} —— 状态不一致`);
+      if (body[1].trim() !== head[2]) {
+        fail('tasks/dev-findings.md', `${head[1]} 标题写 [${head[2]}]，正文写 ${body[1].trim()} —— 状态不一致`);
       }
     }
 
-    const entries = [...text.matchAll(/^### (DF-\d{3}) \[([a-z]+)\]/gm)];
+    const entries = [...text.matchAll(/^### (DF-\d{3}) \[([^\]]+)\]/gm)];
     const real = entries.filter(([, , st]) => ENUM.has(st));
     const bad = entries.filter(([, , st]) => !ENUM.has(st));
     for (const [, id, st] of bad) {
@@ -2128,7 +2143,7 @@ function checkLedger() {
     if (!real.length) {
       warn('tasks/dev-findings.md', '没有识别到任何 DF-xxx 条目 —— 台账可能是空的，或格式变了');
     } else {
-      const open = real.filter(([, , st]) => st === 'open' || st === 'triaged' || st === 'scheduled').length;
+      const open = real.filter(([, , st]) => st === 'open' || st === 'triaged' || st === 'scheduled' || st === 'partially fixed').length;
       // 只提示，不阻塞：全 fixed 可能是真的都修完了。但值得每次看见，因为更常见的是没人往里加。
       if (open === 0) {
         warn('tasks/dev-findings.md', `${real.length} 条全部已收口，0 个开放项 —— 确认这是事实，而不是没人登记`);
