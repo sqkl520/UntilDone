@@ -73,6 +73,7 @@ export const DEFAULTS = Object.freeze({
     'docs/spec/evidence-discipline.md',
     'docs/spec/relay-protocol.md',
     'docs/spec/output-format.md',
+    'docs/spec/success-metrics.md',
     'docs/spec/tui-visual.md',
     'docs/adr/0001-config-only.md',
     'docs/adr/0002-honest-degradation.md',
@@ -110,7 +111,8 @@ export const CHECK_NAMES = Object.freeze([
   'absolutePaths', 'privatePaths', 'gitignoreSanity', 'agents', 'emptyDirs',
   'capabilityDisclosure', 'testCount', 'syntax', 'importable', 'unregisteredExports',
   'links', 'changelog', 'stopHookKillSwitch', 'ledger', 'launcherPlacement',
-  'inboxWiring', 'promptWiring', 'designIndex', 'agentReachability', 'dispatchDepth',
+  'inboxWiring', 'promptWiring', 'evidenceTaxonomy', 'designIndex', 'agentReachability', 'dispatchDepth',
+  'dispatchQuartet',
   'docReferences', 'docCommands', 'docConstants', 'researchIndex', 'capabilities',
   'livingDocsCoverage',
 ]);

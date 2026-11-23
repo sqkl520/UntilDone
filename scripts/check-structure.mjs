@@ -20,6 +20,7 @@ import {
   loadChecks, livingDocsGap, CONFIG_REL, CHECK_NAMES, DEFAULTS as CHECKS_DEFAULTS,
 } from './check-config.mjs';
 import { countRegisteredTests } from './regression-count.mjs';
+import { quartetGaps, QUARTET_FIELDS } from './dispatch-quartet.mjs';
 
 const ROOT = process.cwd();
 const violations = [];
@@ -811,6 +812,10 @@ const PROBE_ARGS = {
   resolveRole: '[[]]', roleIndex: '[[]]', labelOf: '[[]]', nameOf: '[[]]',
   extractCommands: '""', classifyRequirement: '""', requiredTools: '[[]]',
   stopConditionProblem: '""',
+  // 契约 §8.2 的失败通知判据（2026-11-23）：渲染函数喂合法类别、判据函数喂空串。
+  // 两个都是纯函数，空输入必须安全返回（`failureNoticeProblem("")` 返回 null =
+  // 「首轮没有通知」，那是正常分支）。
+  failureNoticeText: '"acceptance"', failureNoticeProblem: '""',
   checkPromptSpec: '[{}]',
   fillDispatchTemplate: '["", {}]', composePrompt: '[{}]',
   deriveInjected: '[{ root: "/nonexistent-ow-probe" }]',
@@ -1051,6 +1056,25 @@ const PROBE_ARGS = {
   // / isContinuation / CONTINUATION_RE / ATTRIBUTION_CLASSES / attribute）不重复登记 ——
   // PROBE_ARGS 按名字命中所有模块，上面那份探针会同样调用它们。
   gateReadsFixedOf: '["Bash", { command: "head -n 20 a.mjs" }]',
+  // delivery-verdict.mjs（2026-11-22，证据分层与交付裁决）：判定层**全是纯函数**，
+  // 逐个进 PROBE_ARGS 实际调用。参数取最小可构造输入 —— 空对象 / 空串 / 空数组，
+  // 它们都必须安全返回、不抛。正确性由 delivery-verdict.test.mjs 的 39 条逐支钉
+  // （含「验收 PASS 但红队 BLOCK → BLOCKED」这条两件事都成立的主用例）。
+  // 五个枚举是数据，不是函数。
+  deliverVerdict: '[{}]',
+  parseAcceptorVerdict: '""',
+  classifyEvidence: '[{}]',
+  redteamItemProblems: '[{}]',
+  coverageProblems: '""',
+  isAnchored: '""',
+
+  // dispatch-quartet.mjs（2026-11-23，P0-1 第二项）：返回格式的解析判据，全是纯函数。
+  // 参数取最小可构造输入 —— 空串 / 空数组 —— 都必须安全返回、不抛。
+  // 正确性由 dispatch-quartet.test.mjs 的边界用例逐条钉（跳过围栏内伪标题 /
+  // 三种坏输入各报各的错 / CRLF 与 LF 同结果）。`QUARTET_FIELDS` 是数据，登记在下面。
+  outputFenceLines: '""',
+  quartetGaps: '["", []]',
+
   // question-audit.mjs（2026-11-14 提问形态审计）：判定层全是纯函数，逐个实际调用。
   // 参数取最小可构造输入：空对象 / 空数组 / 空串 —— 都要安全返回，不抛。
   questionsOfAsk: '[{}]', normalizeText: '""', judgeReadFirst: '[{}]',
@@ -1780,6 +1804,21 @@ function checkUnregisteredExports() {
   ];
   for (const k of LINK_CHECK_FNS) REGISTERED.add(k);
 
+  // delivery-verdict.mjs（2026-11-22）：六条判定层函数已进 PROBE_ARGS 实际调用，
+  // 这里显式登记免得被「未登记导出」刷屏。五个枚举与两张冻结表是**数据**，不是函数。
+  const DELIVERY_FNS = [
+    'RT_DISPATCH', 'RT_SEVERITY', 'VERDICTS', 'EVIDENCE_KINDS', 'COVERAGE_SECTIONS',
+    'redteamItemProblems', 'isAnchored', 'coverageProblems', 'classifyEvidence',
+    'parseAcceptorVerdict', 'deliverVerdict',
+  ];
+  for (const k of DELIVERY_FNS) REGISTERED.add(k);
+
+  // dispatch-quartet.mjs（2026-11-23）：`outputFenceLines` / `quartetGaps` 已进 PROBE_ARGS
+  // 实际调用（在 `dispatch-quartet.test.mjs` 里还有一组边界用例）。
+  // `QUARTET_FIELDS` 是**字段名清单**（数据），不是函数，checkArgs 调不动它。
+  const QUARTET_EXPORTS = ['QUARTET_FIELDS', 'outputFenceLines', 'quartetGaps'];
+  for (const k of QUARTET_EXPORTS) REGISTERED.add(k);
+
   // roles.mjs（2026-11-21，DF-044）：角色注册表 —— 「有哪些角色」的唯一实现。
   // 纯函数与读盘函数都进了 PROBE_ARGS 实际调用；这里显式登记以免被「未登记导出」刷屏。
   // `defaultRoles` 不参加探针：它按模块顶层标志缓存，探一次之后结构门再 import
@@ -1816,6 +1855,9 @@ function checkUnregisteredExports() {
     'composePrompt', 'normalizeForHash', 'promptHash', 'makePromptRow', 'readPromptLedger',
     'firstUserText', 'readHeadRecords', 'subagentFiles', 'verifyPrompts', 'main',
     'LAYERS', 'OBLIGATION_KINDS', 'REQUIRED_ELEMENTS', 'REQUIRED_PLACEHOLDERS', 'FORBIDDEN_CONTEXT',
+    // 契约 §8.2 的失败通知判据（2026-11-23）：判定层两条纯函数已进 PROBE_ARGS 实际调用；
+    // 渲染函数已进 PROBE_ARGS（传一个合法类别）；枚举是数据。
+    'FAILURE_CATEGORIES', 'failureNoticeText', 'failureNoticeProblem',
   ];
   for (const k of COMPOSE_PROMPT_FNS) REGISTERED.add(k);
 
@@ -2308,6 +2350,86 @@ function checkPromptWiring() {
   }
 }
 
+/** 证据分层与红队三档：**规范里的枚举必须与代码逐字一致**（2026-11-22）。
+ *
+ *  ## 为什么需要这条
+ *
+ *  这是 `checkPromptWiring()` 的同一个模式。`docs/spec/evidence-discipline.md` §9
+ *  写下了红队三档 `block` / `accept` / `advisory` 与两个强 `kind` 集合，
+ *  而那是**散文** —— 散文里的枚举与 `delivery-verdict.mjs` 里的数组没有任何机制
+ *  保证一致。改代码不改文档（或反过来）时，屏幕上是绿的，
+ *  而读到规范的人会按一个不存在的档位去判 —— 正是 DF-042 的形态。
+ *
+ *  ## 判据（三条，都可机械判定）
+ *
+ *    1. `RT_DISPATCH` 的值必须**逐个**出现在规范 §9 的表格里
+ *    2. 强证据的 `kind` 必须全部出现在规范 §1.5 里（弱证据同理）
+ *    3. 规范里必须出现「缺省不是 `advisory`」这一条 —— 它是三档设计里唯一
+ *       不看代码就看不出来的约定（少了它，读者会把缺省当成 advisory）
+ *
+ *  **不检查措辞**：规范怎么说这些档位是给人读的，门只管「枚举值一个不缺」。
+ *  「写得够不够清楚」不可机械判定，硬要检查会退化成「请务必包含」。 */
+function checkEvidenceTaxonomy() {
+  const doc = join(ROOT, 'docs', 'spec', 'evidence-discipline.md');
+  if (!requirePath(doc, 'docs/spec/evidence-discipline.md')) return;
+  let text = '';
+  try { text = readFileSync(doc, 'utf8'); } catch { return; }
+  const mod = join(SCRIPTS_DIR, 'delivery-verdict.mjs');
+  if (!requirePath(mod, `${SCRIPTS_REL}/delivery-verdict.mjs`)) return;
+  let src = '';
+  try { src = readFileSync(mod, 'utf8'); } catch { return; }
+
+  // 从源码里读枚举的**值**（不是从 import 读：门要能在模块坏掉时报出原因，
+  // 而 import 失败会让这条检查变成「没跑」，与「通过」同形）。
+  const arrayOf = (name) => {
+    const m = new RegExp(`${name}\\s*=\\s*Object\\.freeze\\(\\[([^\\]]*)\\]`).exec(src);
+    return m ? [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]) : null;
+  };
+  const dispatch = arrayOf('RT_DISPATCH');
+  if (!dispatch) {
+    fail(`${SCRIPTS_REL}/delivery-verdict.mjs`, '读不出 RT_DISPATCH 的三档枚举 —— '
+      + '这条规范与代码的一致性检查因此没有对象（门不许静默放行）');
+    return;
+  }
+  for (const d of dispatch) {
+    // 判据必须锚在**表格行**上，不能只判「全文里出现过这个词」。
+    // 实测踩过：`block` 在正文别处也会出现（`redteam_block`、`dispatch=block` 的说明文字），
+    // 于是「把三档表格里那一行删掉」不会红 —— 一条永远绿的检查比没有更坏。
+    //
+    // 现在要求：存在一行以 `| \`<档位>\` |` 开头的表格行。这是三档表格的固定形状。
+    const rowRe = new RegExp(`^\\|\\s*\`${d}\`\\s*\\|`, 'm');
+    if (!rowRe.test(text)) {
+      fail('docs/spec/evidence-discipline.md', `三档表格里没有 \`${d}\` 这一行 —— `
+        + '代码里有这一档，规范里没有：读到规范的人会按一个不存在的档位判');
+    }
+  }
+  // 强 / 弱 evidence kind：从 EVIDENCE_KINDS 的对象字面量里取键名。
+  const kinds = [...src.matchAll(/^\s{2}(\w+):\s*\{\s*strong:\s*(true|false)/gm)]
+    .map((m) => ({ kind: m[1], strong: m[2] === 'true' }));
+  if (!kinds.length) {
+    fail(`${SCRIPTS_REL}/delivery-verdict.mjs`, '读不出 EVIDENCE_KINDS —— 证据分层的一致性检查没有对象');
+    return;
+  }
+  for (const { kind, strong } of kinds) {
+    if (!new RegExp(`\\b${kind}\\b`).test(text)) {
+      fail('docs/spec/evidence-discipline.md',
+        `代码里的证据类型 "${kind}"（${strong ? '强' : '弱'}）在规范里没有出现`);
+    }
+  }
+  // 三档设计里唯一「不看代码看不出来」的那条约定。
+  //
+  // 判据刻意宽松到「缺省」与「advisory」在同一行出现即可：这一条的意思可以用
+  // 好几种写法表达（「缺省不是 advisory」/「不许缺省成它」/「为什么缺省不能是」），
+  // 而收紧到某一种具体句式，会让规范作者换一个更准确的措辞时**门反而红** ——
+  // 那会逼人为了过门去写一句更差的话。
+  const defaultClause = text.split('\n').some((l) => /缺省/.test(l) && /advisory/.test(l));
+  if (!defaultClause) {
+    fail('docs/spec/evidence-discipline.md',
+      '没有写明「dispatch 缺省不是 advisory」—— 少了这一句，读者会把「没写」当成「不阻断」，'
+      + '而那正是静默放行');
+  }
+}
+
 /** DF-016：设计文档必须标明「未实现」，且索引必须覆盖每一份。
  *
  *  970 行设计文档描述的能力一行代码都没有，而在此之前**没有任何入口指向它们**——
@@ -2477,6 +2599,89 @@ function checkDispatchDepth() {
       if (CLAIM_1.test(text)) {
         fail(rel, '角色里已经有派生工具（深度 ≥2），但这里仍写着「深度是 1 层」—— 文档过期了');
       }
+    }
+  }
+}
+
+/** 检查：**四元组字段缺失 → 失败**（P0-1 的第二项，`dispatchDepth` 之后）。
+ *
+ *  ## 它守的是什么
+ *
+ *  子 Agent 的最终返回是一个**固定字段的结构**，主线程按字段名读它。字段名少一个，
+ *  下游不是「少读到一条信息」，而是**读到一个不存在的东西**：
+ *
+ *    · 少 `## 我产出的文件` → 产出对账拿不到自述，`UNREPORTED` 变成常态；
+ *    · 少 `## 我认为的薄弱点` → 红队与锐评的「被禁输入」不存在（它们本靠**不看**保证独立，
+ *      现在是**没得看**），独立性约束从设计退化成碰巧；
+ *    · 少 `## 执行日志` → 主线程失去「它在哪停下的」的唯一可读线索。
+ *
+ *  在此之前，四元组只活在 prompt 里：`templates/dispatch.md` 写着，角色定义里抄一遍，
+ *  **没有任何检查核它**。这与 DF-047 / DF-077 是同一种病：约定靠人抄，抄漏了没人发现。
+ *
+ *  ## 解析判据不在本文件里
+ *
+ *  「输出节里第一个代码围栏」的取法在 `scripts/dispatch-quartet.mjs`（`outputFenceLines()` /
+ *  `quartetGaps()`）。搬走的原因：本文件是 `CLI_SCRIPTS` 的第一项，**import 它就执行
+ *  全部门禁并 exit**，所以这里的判据没法被单测。而它有**两种错法不会在当前文档上暴露**
+ *  （切片过早 / 围栏未闭合误判），只在有人改动文档结构时才炸 —— 那时离根因已经很远。
+ *  `dispatch-quartet.test.mjs` 直接钉住那份判据的边界逻辑，本文件只负责接线。
+ *
+ *  ## 为什么按文件列表而不是「所有角色都要四元组」
+ *
+ *  四元组是 `executor` / `repair` 的返回格式，不是全部 12 个角色的：`acceptor` 交判定表、
+ *  `redteam` 交反例表、`probe` 交三选一判定 —— 输出格式各自不同，而且都**不该**
+ *  有「我认为的薄弱点」（那会污染独立性）。
+ *
+ *  **`repair` 的标题与 `executor` 不同，这是既有的、有意的差异，不是本条检查的疏忽**：
+ *  它的输出是「修复后的交付物 / 修复说明 / 我认为仍然存在但本次不修的问题 / 我无法修复的部分 /
+ *  我产出的文件」五节，而文件头写着「输出（四元组）」。本检查按**各文件实际声明的节**核，
+ *  不强行把 `executor` 的字段名套到 `repair` 上 —— 强行统一会让「修复说明」这类字段
+ *  失去它唯一的读者（验收 Agent 要看「改了什么、为什么」）。
+ *  这一处「标注写四元组、内容五节」的不一致，记在 `tasks/dev-findings.md`（DF-081）。
+ *
+ *  ## 四个载体
+ *
+ *  | 文件 | 为什么它必须带回收格式 |
+ *  |---|---|
+ *  | `docs/spec/dispatch-contract.md` §6 | 规格本体。它说「返回是四元组」，就是给全仓下的定义 |
+ *  | `templates/dispatch.md` | 每个子 Agent 都逐字收到它，它是**唯一**每轮都到场的载体 |
+ *  | `.claude/agents/oversight-executor.md` | 执行 Agent 的角色定义（返回格式的权威副本） |
+ *  | `.claude/agents/oversight-repair.md` | 修复 Agent（另有自己的节名，但同样必须有「我产出的文件」） |
+ */
+const QUARTET_CARRIERS = [
+  { rel: 'docs/spec/dispatch-contract.md', sections: QUARTET_FIELDS },
+  { rel: 'templates/dispatch.md', sections: QUARTET_FIELDS },
+  { rel: '.claude/agents/oversight-executor.md', sections: QUARTET_FIELDS },
+  {
+    rel: '.claude/agents/oversight-repair.md',
+    sections: [
+      '## 修复后的交付物', '## 修复说明',
+      '## 我认为仍然存在但本次不修的问题', '## 我无法修复的部分',
+      '## 我产出的文件',
+    ],
+  },
+];
+
+function checkDispatchQuartet() {
+  for (const { rel, sections } of QUARTET_CARRIERS) {
+    const abs = join(ROOT, rel);
+    // 四个载体全是本仓库的规定产物（规格 / 派发模板 / 两份角色定义）。缺文件 = 仓库坏了，
+    // 与「字段缺失」是同一类：这条检查因此没有对象，必须红而不是静默跳过。
+    if (!requirePath(abs, rel)) continue;
+    let text = '';
+    try { text = readFileSync(abs, 'utf8'); } catch (e) {
+      fail(rel, `读不了文件（${e.message}）—— 四元组检查因此没有对象`);
+      continue;
+    }
+    const got = quartetGaps(text, sections);
+    if (!got.ok) {
+      fail(rel, `${got.error}。四元组字段因此无法被核`);
+      continue;
+    }
+    if (got.missing.length) {
+      fail(rel, `输出格式的代码围栏里缺少 ${got.missing.length} 个字段：${got.missing.join(' / ')} —— `
+        + '字段名是主线程读返回时的键，少一个就读到一个不存在的东西。'
+        + '完整清单见 docs/spec/dispatch-contract.md §6');
     }
   }
 }
@@ -2884,9 +3089,11 @@ const CHECKS = [
   ['launcherPlacement', checkLauncherPlacement],
   ['inboxWiring', checkInboxWiring],
   ['promptWiring', checkPromptWiring],
+  ['evidenceTaxonomy', checkEvidenceTaxonomy],
   ['designIndex', checkDesignIndex],
   ['agentReachability', checkAgentReachability],
   ['dispatchDepth', checkDispatchDepth],
+  ['dispatchQuartet', checkDispatchQuartet],
   ['docReferences', checkDocReferences],
   ['docCommands', checkDocCommands],
   ['docConstants', checkDocConstants],

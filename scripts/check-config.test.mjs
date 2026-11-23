@@ -59,10 +59,24 @@ function makeProject() {
   for (const rel of ['scripts', 'docs', 'templates', 'tasks/runs', '.claude/agents']) {
     mkdirSync(join(d, rel), { recursive: true });
   }
-  for (const f of ['check-structure.mjs', 'check-config.mjs', 'roles.mjs',
-    'published-paths.mjs', 'link-check.mjs', 'regression-count.mjs']) {
+  // **这份清单必须跟着 `check-structure.mjs` 的本地 import 走。**
+  //
+  // 2026-11-22 实测：`check-structure.mjs` 新 import 了 `dispatch-quartet.mjs`，
+  // 而这里没跟着拷 —— 于是硬门在临时项目里**在打印任何东西之前**就
+  // `ERR_MODULE_NOT_FOUND` 崩掉。表现是「配置在生效」那行没有输出，
+  // 测试报「改了形状却没打印配置在生效」，而真正的原因是夹具缺文件。
+  //
+  // 这条陷阱的形状值得记住：**夹具的失败看起来像被测代码的失败**。
+  // 所以下面用「列出来 + 断言每个都存在」而不是静默跳过。
+  const NEEDED = [
+    'check-structure.mjs', 'check-config.mjs', 'roles.mjs',
+    'published-paths.mjs', 'link-check.mjs', 'regression-count.mjs',
+    'dispatch-quartet.mjs',
+  ];
+  for (const f of NEEDED) {
     const src = join(REPO, 'scripts', f);
-    if (existsSync(src)) cpSync(src, join(d, 'scripts', f));
+    if (!existsSync(src)) throw new Error(`夹具缺 ${f} —— 它被 check-structure.mjs import，必须一起拷`);
+    cpSync(src, join(d, 'scripts', f));
   }
   writeFileSync(join(d, '.gitignore'), 'tasks/runs/\n');
   writeFileSync(join(d, 'README.md'), '# demo\n\n不能自动接力。\n');

@@ -23,7 +23,7 @@
  * | L0 身份 | 角色定义正文（职责边界、禁止事项、输出形状） | 人，冻结 | 同一角色跨任务**必须一致** |
  * | L1 协议 | `templates/dispatch.md` 的四输入/纪律/返回四元组/对账 | 仓库，冻结 | 极少变 |
  * | L2 现写 | 任务、验收标准、约束、停机条件 | **主线程，每个任务现写** | 每次不同 |
- * | L3 注入 | 构建/测试命令、硬门输出、baseline、上次失败模式、nonce、outputs | **机器从仓库状态派生** | 自动 |
+ * | L3 注入 | 构建/测试命令、硬门输出、baseline、无内容失败通知、nonce、outputs | **机器从仓库状态派生** | 自动 |
  *
  * 两条分界规则（本文件的全部设计都从它们推出来）：
  *
@@ -194,10 +194,56 @@ export const REQUIRED_ELEMENTS = Object.freeze([
   { id: 'nonce', label: 'nonce', why: 'observe 靠它把 transcript 归属到任务，缺失是静默失败' },
   { id: 'tool_compat', label: '验收需求 × 工具白名单相容', why: '不相容时子 agent 只会判「不通过」——今晚那条矛盾的根' },
   { id: 'independence', label: '未注入被禁止的上下文', why: '锚定无法用 prompt 撤销，只能靠不提供（契约 §3）' },
+  // 契约 §8.1：失败处理的默认路径是盲重采样。新实例只允许收到一条**无内容**通知，
+  // 因为把失败输出喂回去会让它复现近似相同的解（外部实证 33–68%，盲重采样 2–14%）。
+  // 这一项在「首次派发」时通过（没有通知就是对的），在重派时必须逐字是那个句式。
+  { id: 'failure_notice', label: '上次失败通知（无内容形态）', why: '失败输出是锚定源；给了具体内容就退化成「修复」，而那必须是可定位时才走（契约 §8.2）' },
 ]);
 
 /** 不可判定的停机条件措辞。命中且**没有**任何量化界限时判不通过。 */
 const VAGUE_STOP = /尽可能|尽量|全面|彻底|充分|深入|酌情|视情况|合理|适当|等等/;
+
+// ── 失败通知：只允许「无内容」形态（契约 §8.2）──────────────────────────
+
+/** 失败原因类别。**只有这三个合法值**，其余一律拒绝。
+ *
+ *  为什么把类别做成枚举而不是自由文本：类别之外的内容就是失败现场的细节
+ *  （哪条 AC 没过、红队看到什么反例），而细节正是锚定源。枚举是最小的、
+ *  又能保住「确实失败了」这一条信息的形态。 */
+export const FAILURE_CATEGORIES = Object.freeze(['acceptance', 'redteam', 'execution']);
+
+/** 「无内容失败通知」的唯一合法文本。**这是渲染与校验共用的同一份来源** ——
+ *  两边各写一遍的话，校验认的句式与实际渲染的句式会漂，而漂法是静默的：
+ *  渲染出来的东西不再被自己的校验认可（或者更糟，校验放行了另一种）。 */
+export function failureNoticeText(category) {
+  const c = FAILURE_CATEGORIES.includes(category) ? category : 'execution';
+  return `上一次派发失败（原因类别：${c}）。本次从原始任务契约重新开始。`;
+}
+
+/** 判一段 `--prior-failure` 文本能不能进新实例的提示词。返回 null = 可以。
+ *
+ *  ## 判据是**整段全等**，不是「包含某句式」
+ *
+ *  用「包含」判的话，`上一次派发失败（原因类别：acceptance）。本次从原始任务契约重新开始。
+ *  另外你上次在 AC2 那里漏了 fail_if` 会被放行 —— 前半句合规，后半句就是失败输出。
+ *  锚定不需要很多字，一句具体位置就够了。所以只认**逐字全等**。
+ *
+ *  ## 为什么首轮允许为空
+ *
+ *  「没有通知」是首轮的正常形态。空串返回 null（通过），非空才判形态。 */
+export function failureNoticeProblem(text) {
+  const s = String(text == null ? '' : text).trim();
+  if (!s) return null;
+  if (/[\r\n]/.test(s)) return '失败通知不得多行——多出来的每一行都只能来自失败现场，那是锚定源';
+  const ok = FAILURE_CATEGORIES.map((c) => failureNoticeText(c));
+  if (!ok.includes(s)) {
+    return '失败通知必须是「上一次派发失败（原因类别：acceptance / redteam / execution 之一）。'
+      + '本次从原始任务契约重新开始。」这一句的逐字形态；'
+      + '带具体内容（验收逐项表、红队反例、file:line、上次漏了什么）等于把默认路径从'
+      + '盲重采样退化成修复，而修复只在可定位时才允许（契约 §8.2 / §8.3）';
+  }
+  return null;
+}
 
 // ── frontmatter / 角色工具集 ──────────────────────────────────────────
 
@@ -321,6 +367,7 @@ export function checkPromptSpec({
   nonce,
   injected = [],
   context = {},
+  priorFailure = null,
 } = {}) {
   const errors = [];
   const warnings = [];
@@ -443,6 +490,18 @@ export function checkPromptSpec({
     `注入了不该给 ${role} 的内容：${present.join(', ')}——锚定无法用 prompt 撤销（契约 §3）`,
     forbidden.length ? `未注入 ${forbidden.join('/')}` : '该角色无额外禁止项');
 
+  // 10) 上次失败通知的形态（契约 §8.2）
+  //
+  //  首轮没有 `priorFailure` → 通过（没有通知就是对的）。
+  //  重派时必须**逐字**是那一句；带具体内容的失败信息一律拒绝派发 —— 因为
+  //  「带内容的失败信息」= 把默认路径从盲重采样换成修复，而修复要求可定位（§8.3）。
+  //
+  //  为什么这条必须在这里而不是只写在文档里：`--prior-failure` 是 CLI 上真实存在的参数，
+  //  文档说「不许传具体内容」，而没有任何东西拦得住它 —— 那就只是一句愿望（契约 §8.6）。
+  const fnProblem = failureNoticeProblem(priorFailure);
+  mark('failure_notice', !fnProblem, fnProblem || '',
+    priorFailure ? `无内容通知（逐字合规）：${String(priorFailure).trim().slice(0, 40)}` : '首轮派发，无重派通知');
+
   // 附带的提示项（不阻塞）
   if (Array.isArray(acs) && acs.length && acs.length < 2) {
     warnings.push('acceptance: 只有 1 条判定项——单条标准无法区分「部分完成」与「完整完成」');
@@ -519,9 +578,9 @@ export function deriveInjected({
   }
   if (priorFailure) {
     facts.push({
-      label: '上次失败模式（负面约束，不是缩小范围）',
+      label: '上次派发失败（无内容通知，重派用）',
       value: String(priorFailure).trim(),
-      source: 'claims.jsonl / 上一轮验收结论',
+      source: '契约 §8.2：只允许「原因类别」这一句，不得含失败输出',
     });
   }
   facts.push({
@@ -556,7 +615,7 @@ export function fillDispatchTemplate(templateText, { run, task, nonce, paths = [
 
 /** 生成提示词正文。**顺序 = L0 指针 → L1 协议 → L2 现写 → L3 注入。**
  *
- *  为什么把 L3 放最后：它是唯一「可能被误当结论」的一层（硬门输出、上次失败模式）。
+ *  为什么把 L3 放最后：它是唯一「可能被误当结论」的一层（硬门输出、无内容失败通知）。
  *  放在 L2 之后，读者先看到「要判什么」，再看「已有什么事实」，不容易把事实当判定。 */
 export function composePrompt({
   role,
@@ -868,7 +927,7 @@ const HELP = `compose-agent-prompt — 分层拼装子 agent 提示词
   node scripts/compose-agent-prompt.mjs compose --run <id> --task ST1 \\
     --graph tasks/runs/<id>/task-graph.json --role <角色 id 或全名> \\
     [--stop "<停机条件>"] [--constraint "<约束>" ...] \\
-    [--gate "<命令>=<输出文件>" ...] [--gate-exit N] [--prior-failure "<上次失败模式>"] \\
+    [--gate "<命令>=<输出文件>" ...] [--gate-exit N] [--prior-failure "<无内容失败通知>"] \\
     [--context-from <context.json>] \\
     [--nonce <8位hex>] [--out <文件>] [--dry-run] [--json]
 
@@ -889,6 +948,12 @@ const HELP = `compose-agent-prompt — 分层拼装子 agent 提示词
            解析走 .claude/agents/ 的注册表（scripts/roles.mjs），先全名、再 id、
            再加 agentPrefix 试一次 —— 三个名字空间的写法不必由人来记住（DF-044）。
            找不到时报错并列出**现有角色**，不发明岗位。
+
+           --prior-failure 只收**无内容失败通知**，且必须逐字是
+             「上一次派发失败（原因类别：acceptance|redteam|execution）。本次从原始任务契约重新开始。」
+           带具体内容的（验收逐项表、红队反例、file:line、「上次漏了什么」）一律
+           exit 1 —— 那会把默认路径从盲重采样退化成修复（契约 §8.2）。
+           首轮不传这个参数就是对的。
   verify   收活时核对：子 agent 实际收到的首条消息，是否就是 compose 记下的那一份。
 
 分四层：L0 身份（冻结，只放指针）/ L1 协议（templates/dispatch.md 逐字）/
@@ -1080,6 +1145,9 @@ function main(argv) {
     const spec = {
       role, roleText, task: st.goal, acceptance, shape: st.shape, outputs,
       stopCondition, nonce, injected, context,
+      // 契约 §8.2：这一项要是没传进 spec，「失败通知必须无内容」这条检查在真实调用中
+      // 恒真 —— 那正是缺陷 B（`context` 恒传 `{}`）的同一形态，不能重演。
+      priorFailure: args['prior-failure'] ? String(args['prior-failure']) : null,
     };
     const check = checkPromptSpec(spec);
 

@@ -52,6 +52,7 @@
 | `checkCapabilities()` | 能力清单里的每条命令必须可执行；README 必须指向它 | 改命令或补入口 |
 | `checkLinks()` | 文档相对链接不能悬空 | 修链接 |
 | `checkDesignIndex()` | 设计文档必须在索引里、且索引写明「未实现」 | 登记状态 |
+| `checkEvidenceTaxonomy()` | 红队三档（`block`/`accept`/`advisory`）与证据强/弱 `kind` 的**表格行**必须与 `delivery-verdict.mjs` 的枚举逐档一致；「缺省不是 `advisory`」那一句必须存在 | 补规范表格行，或改代码枚举 |
 | `checkChangelog()` | 改了源码/规格却没有 CHANGELOG 条目 | 补条目 |
 
 这些检查的共同思路：**把「记得同步」换成「不同步就红」**。它们在每次提交前跑，

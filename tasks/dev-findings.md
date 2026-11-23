@@ -2556,7 +2556,7 @@ const LIVING_DOCS = [
   若把 DF-003/014/030 划进 A，则变成 7/49。
 - 建议归属：记录，供决策；不作为施工项
 
-### DF-053 [open] 文档里的「检查条数」写 23，实际 25，且没有任何检查在对账这个数
+### DF-053 [fixed] 文档里的「检查条数」写 23，实际 25，且没有任何检查在对账这个数
 
 - 发现于：2026-11-21 批判 Agent 点名 + 主线程复核
 - 位置：`README.md:68`（`- **结构硬门** —— 23 项检查…`）、`README.md:365`（`# 结构硬门：23 项检查，0 违规才绿`）；
@@ -2647,7 +2647,7 @@ const LIVING_DOCS = [
 - 影响：`docs/research/` 里已由红队点过同一个洞（「写个 exit 0 的空脚本就永远通过」），**至今未堵**。
 - 建议归属：独立任务
 
-### DF-059 [open] 台账状态的正则只认 `[a-z]+`：写 `[bogus-state]` 能整条逃过枚举检查
+### DF-059 [fixed] 台账状态的正则只认 `[a-z]+`：写 `[bogus-state]` 能整条逃过枚举检查
 
 - 发现于：2026-11-21 主线程对 `checkLedger` 做负向测试时发现
 - 位置：`scripts/check-structure.mjs:2082`（`text.split(/^### /m)` 后的 `head` 匹配）
@@ -3411,3 +3411,98 @@ $ OVERWATCH_STATE_DIR=/tmp/fx node scripts/overwatch.mjs
 - 修法：在 `checkDispatchCoverage()` 里加一段——活文档（README / CLAUDE / GUIDE /
   CAPABILITIES）里凡写「N 项检查」，N 必须等于 `CHECK_NAMES.length`。
 - 负向：改回 23 → 两处同时红。
+
+### DF-079 [open] `roles.mjs` 声称 frontmatter 可覆盖 `forbiddenContext`，但没有任何调用方消费它
+
+- 发现于：2026-11-22 用户要求「核实上下文隔离是真在生效还是只是写着」，主线程实测
+- 位置：`scripts/roles.mjs:242`（注释承诺）、`scripts/roles.mjs:374`（读入注册表）、
+  `scripts/compose-agent-prompt.mjs:439`（`FORBIDDEN_BY_ID[roleId]`，读的是冻结表）
+- 证据（主线程实测，临时项目 + 一份 `oversight-executor.md` 副本，往 frontmatter 加
+  `forbiddenContext: self_assessment`）：
+  ```
+  注册表 executor.forbiddenContext = ["self_assessment"]
+  compose independence = true | 该角色无额外禁止项      ← 覆盖没生效
+  ```
+  对照：冻结表里的角色（`acceptor` / `review` / `redteam`）确实生效 ——
+  给 `acceptor` 注入 `review_score` 会被拒（exit 1，且不落文件）。
+- 影响：**任何依赖 frontmatter 覆盖来收紧独立性的项目会以为自己加了一道闸，而那闸没接线。**
+  与本仓台账最高频的缺陷形态同形：配置坏了但看起来一切正常（DF-031/033/039/040/041/047）。
+- 为什么本轮不修：本轮范围是「证据分层规范 + 交付裁决函数」。修它是
+  `checkPromptSpec` 的三行改动 + 一条测试，但它会改变 `acceptor`/`review` 之外
+  所有角色的独立性行为，需要单独的负向验证（改了冻结表语义就要重新证一遍
+  「注入被拒」这条路），混进本轮会让两件事的负向证据互相稀释。
+- 建议修法：
+  1. `checkPromptSpec` 先用注册表的 `role.forbiddenContext`，冻结表只作缺省
+     （`resolveRole(...)?.forbiddenContext ?? FORBIDDEN_CONTEXT[roleId] ?? []`）；
+  2. 补一条测试：「frontmatter 覆盖能改变独立性判定」——正向（加一项 → 被拒）与
+     反向（删一项 → 放行）各一条，否则只测了「不炸」，没测「真的读了」。
+- 建议归属：独立任务（改的是所有角色的独立性判据，与本轮的裁决函数无耦合）
+
+### DF-080 [open] 交付裁决函数已实现且有 39 条测试，但**还没有任何调用点**
+
+- 发现于：2026-11-22 本轮自评（写了 `scripts/delivery-verdict.mjs` 之后回头找调用方）
+- 位置：`scripts/delivery-verdict.mjs` 的 `deliverVerdict()`；应接进
+  `scripts/validate-run.mjs`（派发前声明 `keyPaths`）与一个收活时读 `redteam.md` 的读取器
+- 证据：`grep -rn "delivery-verdict" scripts/ docs/ .claude/ templates/` 只命中它自己、
+  它的测试、以及 `check-structure.mjs` 的两处登记（PROBE_ARGS / REGISTERED）。
+  没有任何生产路径 import 它。
+- 性质：**这就是 DF-042 的同一种形态**——「定义里写得再对，没人调用等于不存在」。
+  本轮把规范与函数写出来了，但如果不登记这条，下一个读者会以为裁决已经自动化了。
+- 影响：目前 `evidence-discipline.md` §10 的「调用位置」表描述的是**应当**在哪里调用，
+  不是**已经在**哪里调用。两者在屏幕上同形，所以必须显式记一笔。
+- 建议修法：
+  1. `validate-run.mjs` 的子树校验加 `keyPaths` / `requiredStrong`（可选字段，
+     但一旦写了就必须合法），并把它们注入 compose 的 L2；
+  2. 加一个收活命令（或 `claim-ledger` 的子命令）读
+     `tasks/runs/<run-id>/{acceptor,redteam}.md`，调 `deliverVerdict()` 打印裁决；
+  3. **必须有负向测试**：「验收 PASS + 红队 BLOCK → 打印 BLOCKED」这条要在
+     CLI 层跑一遍，不能只在纯函数层跑。
+- 建议归属：独立任务（需要先定 `redteam.md` 的落盘约定）
+
+### DF-081 [fixed] 失败处理的默认路径是「把失败上下文交给 repair」，而那正是锚定源
+
+- 发现于：2026-11-23 用户给了一条外部实证后，主线程核对 Phase E
+- 位置：`.claude/skills/oversight/SKILL.md` 原 Phase E 第 2 条
+  （`2. 不通过 → oversight-repair → 完整重新验收`）、
+  `.claude/agents/oversight-repair.md:4` 的 description
+  （「仅在验收不通过或锐评低于阈值时触发。接收验收理由 + 原始交付物 + 锐评意见进行修复」）
+- 证据（外部实证，1.5B / 3B / 7B 匹配预算）：
+  | 观察 | 数字 |
+  |---|---|
+  | 盲重采样在 7B 以下是最强条件 | 7B 才与最佳「修复」持平 |
+  | 盲重采样相对「修复」的 token | 少 **2.5–5.5 倍** |
+  | 失败程序喂回去后复现近似相同的程序 | **33–68%** |
+  | 盲重采样的重复率 | **2–14%** |
+  | 「执行反馈」在无内容失败通知之外的额外贡献 | 无可测量的额外贡献 |
+- **证据等级：外部研究，不是本仓实测。** 本仓的失败样本量任何时候都做不了这个对照。
+  它支撑的是「默认值」这个选择，**不支撑**「本仓失败率会降几个点」这类断言。
+- 影响：每一次验收不通过 / 红队阻断 / 执行失败，都把失败输出当输入再喂一遍，
+  而且 recipient 是一个被明确要求「对着这些问题修」的角色 —— 这正是 33–68% 那个形态。
+- 修法：
+  1. `dispatch-contract.md` 新增 §8：A 盲重采样（默认，无条件）/ B 局部修复（例外，
+     C1 定位 + C2 局部 + C3 不复用三条同时成立），两条路径的输入差**只有**「有没有
+     `file:line`」，失败输出在两条路径上都**不给**。
+  2. §8.4 把「可定位性」的判定权归 Hub，明确禁止失败实例自报「我能修」。
+  3. §8.6 **如实列出两条判不了的**（「是否真可定位到局部」依赖 Hub 对代码的判断；
+     「7B 以上自修复更优」要求一份不存在的实验）。后者因此**当前不可开启**。
+  4. `compose-agent-prompt.mjs` 新增 `FAILURE_CATEGORIES` / `failureNoticeText()` /
+     `failureNoticeProblem()`，并把 `failure_notice` 做成 `checkPromptSpec` 的第 10 项。
+     **这才是关键**：`--prior-failure` 是 CLI 上真实存在的参数，只在文档里写「不许传
+     具体内容」等于没有约束（契约 §8.6 自己就是这么要求的）。
+  5. `SKILL.md` Phase E、`oversight-repair.md`、`oversight-executor.md`、
+     `templates/dispatch.md`、`docs/GUIDE.md` 同步。
+- 负向（都真跑过）：
+  - CLI 里删掉传 `priorFailure` 的那一行 → 带内容的失败通知重新通过（exit ≠ 1）；
+  - 把 `failureNoticeProblem` 放宽成「包含句式即可」→
+    `上一次派发失败（…）。本次从原始任务契约重新开始。另外你上次在 AC2 漏了 fail_if`
+    被放行；严格版拦住它；
+  - `FAILURE_*` 三个导出不登记功能表 → `checkStructure` 的「导出未登记」提示多三条。
+- **这一轮里我自己写错的一条测试**（记下来，因为它就是本仓反复批评的形态）：
+  `failure-path-wiring.test.mjs` 第一版用 `/盲重采样/` 判 Phase E 有没有接上新的默认路径。
+  那个词在那一段里出现 **5 次**（决定句、次数上限、理由段），所以把决定句改回
+  「交给 oversight-repair」时判据照样通过 —— **假绿**。改成锚在
+  `任一条不满足 → 盲重采样` 这一句上之后，回退才真的能打红。
+- 建议归属：已完成。**未做的事**留在这里，不要当成已做：
+  - 轮次与熔断（每子树 3 次 / 盲重采样 2 次）目前只有**文档判据**，没有脚本在数派发次数。
+    要机械判定得让 `claim-ledger` 或 `compose` 记「这是第几次派这个子树」；
+  - §8.5 的「7B 以上自修复」没有对照实验，也没有 ADR —— 它是**关闭**的，不是「待做」。

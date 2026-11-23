@@ -30,6 +30,7 @@ import {
   stopConditionProblem, checkPromptSpec, deriveInjected, fillDispatchTemplate,
   composePrompt, normalizeForHash, promptHash, makePromptRow, readPromptLedger,
   firstUserText, readHeadRecords, verifyPrompts, makeNonce,
+  failureNoticeText, failureNoticeProblem, FAILURE_CATEGORIES,
   FORBIDDEN_CONTEXT, REQUIRED_ELEMENTS, REQUIRED_PLACEHOLDERS, OBLIGATION_KINDS, LAYERS,
 } from './compose-agent-prompt.mjs';
 
@@ -272,6 +273,53 @@ test('独立性：没有禁止项的角色不受影响（对照组）', () => {
   assert.deepEqual(FORBIDDEN_CONTEXT.review.includes('self_assessment'), true);
 });
 
+// ── 失败通知：只允许「无内容」形态（契约 §8.2）──────────────────────────
+//
+// 这一组是失败的**默认路径**（盲重采样）在代码上的唯一落点：只要 `--prior-failure`
+// 能被塞进带内容的失败信息，默认路径就在事实上退化成修复，而这正是外部实证里
+// 复现率从 2–14% 涨到 33–68% 的那个动作。
+
+test('失败通知：首轮不传 → 通过（没有通知就是对的）', () => {
+  assert.equal(failureNoticeProblem(null), null);
+  assert.equal(failureNoticeProblem(''), null);
+  assert.equal(failureNoticeProblem('   '), null);
+  const r = checkPromptSpec({ ...OK, roleText: EXECUTOR_TEXT });
+  assert.equal(r.ok, true, r.errors.join('\n'));
+  assert.ok(r.checks.some((c) => c.id === 'failure_notice' && c.ok));
+});
+
+test('失败通知：三个类别逐字形态都通过', () => {
+  for (const c of FAILURE_CATEGORIES) {
+    assert.equal(failureNoticeProblem(failureNoticeText(c)), null, `类别 ${c} 的逐字形态被拒了`);
+  }
+});
+
+test('失败通知：带具体内容必须拒绝派发（这是「默认路径没退化」的唯一机械判据）', () => {
+  const bad = [
+    '上一轮漏了 fail_if',
+    failureNoticeText('acceptance') + '另外你上次在 AC2 漏了 fail_if',
+    '验收不通过：AC1 未找到证据；AC3 判定为否',
+    failureNoticeText('acceptance') + '\nAC2: scripts/x.mjs:40 没有判空',
+    '上一次派发失败（原因类别：验收）。本次从原始任务契约重新开始。', // 类别不在枚举里
+  ];
+  for (const b of bad) {
+    const p = failureNoticeProblem(b);
+    assert.ok(p, `这条被放行了：${JSON.stringify(b)}`);
+    const r = checkPromptSpec({ ...OK, roleText: EXECUTOR_TEXT, priorFailure: b });
+    assert.equal(r.ok, false, `带内容的失败通知不该通过：${b}`);
+    assert.match(r.errors.join('\n'), /failure_notice/);
+  }
+});
+
+test('回退断言：把 failureNoticeProblem 放宽成「包含句式即可」，上一条必须变假', () => {
+  // 真的放宽一次（在测试里实现一个放宽版），证明「整段全等」这条判据是必要的，
+  // 而不是我随手写的一个更严的实现。
+  const loose = (t) => (String(t || '').includes('本次从原始任务契约重新开始') ? null : 'not');
+  const attack = failureNoticeText('redteam') + '你上次把 A.mjs 的返回值改成 null，别再那样';
+  assert.equal(loose(attack), null, '放宽版本该放行（说明攻击向量确实能穿过宽松判据）');
+  assert.ok(failureNoticeProblem(attack), '严格版必须拦住它');
+});
+
 // ── L1 模板填充 ───────────────────────────────────────────────────────
 
 test('L1：真实 dispatch.md 的具名占位符全部被填掉', () => {
@@ -434,7 +482,9 @@ test('L3 注入派生：项目命令、outputs、nonce 都在，且每条都有�
   const { facts } = deriveInjected({
     root: ROOT, outputs: ['docs/a.md'], nonce: 'a1b2c3d4',
     injected: [{ command: 'node scripts/x.mjs', path: 'g.txt', exitCode: 0 }],
-    priorFailure: '上一轮漏了 fail_if',
+    // 契约 §8.2：注入的失败信息只能是**无内容**通知，不能是「上一轮漏了 fail_if」
+    // 那种带具体内容的形态 —— 后者是锚定源（外部实证 33–68% 复现近似相同的解）。
+    priorFailure: failureNoticeText('acceptance'),
   });
   for (const f of facts) {
     assert.ok(f.label && f.value && f.source, `事实缺字段：${JSON.stringify(f)}`);
@@ -442,7 +492,7 @@ test('L3 注入派生：项目命令、outputs、nonce 都在，且每条都有�
   const labels = facts.map((f) => f.label);
   assert.ok(labels.some((l) => l.includes('构建/测试命令')));
   assert.ok(labels.some((l) => l.includes('nonce')));
-  assert.ok(labels.some((l) => l.includes('上次失败模式')));
+  assert.ok(labels.some((l) => l.includes('上次派发失败')));
 });
 
 test('L3 注入：认不出项目类型时如实说「我没认出来」，不编一条命令', () => {
@@ -817,6 +867,71 @@ test('负向：把 CLI 的 context 改回硬编码 {}，拒绝用例必须失效
       // 匹配的是**报错句式**而不是键名：通过时也有一行「independence — 未注入 self_assessment」，
       // 按键名断言会把「未注入」当成「注入了」。
       assert.doesNotMatch(r.stdout, /注入了不该给/, r.stdout);
+    } finally { rmSync(target, { force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 失败通知的 CLI 接线（契约 §8.2）────────────────────────────────────
+//
+// 单测只证明 `failureNoticeProblem` 判得对。这一条证明**它真的接在 CLI 上**：
+// 只是把判据写对、而 CLI 不传 `priorFailure` 的话，那条判据在真实派发里恒真 ——
+// 这正是「缺陷 B」（`context` 恒传 `{}`）的同一形态。
+
+test('CLI：--prior-failure 带具体内容 → exit 1，且不落文件（默认路径没退化）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-prior-'));
+  try {
+    const graph = makeGraph(dir);
+    const gate = join(dir, 'gate.txt');
+    writeFileSync(gate, 'ok\n');
+    const out = join(dir, 'p.md');
+    const r = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', '每项 AC 必带 file:line，25 分钟内返回',
+      '--gate', `node scripts/check-structure.mjs=${gate}`, '--gate-exit', '0',
+      '--prior-failure', '上一次验收不通过：AC1 未找到证据，AC2 在 scripts/x.mjs:40 漏了判空',
+      '--out', out]);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout + r.stderr, /failure_notice|无内容/);
+    assert.equal(existsSync(out), false, '带内容的失败通知不该落文件——它就是「发出去但主线程不知道」的反面');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI 对照组：--prior-failure 用逐字无内容形态 → 通过，且那句话真的进了提示词', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-prior-'));
+  try {
+    const graph = makeGraph(dir);
+    const gate = join(dir, 'gate.txt');
+    writeFileSync(gate, 'ok\n');
+    const out = join(dir, 'p.md');
+    const notice = failureNoticeText('acceptance');
+    const r = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', '每项 AC 必带 file:line，25 分钟内返回',
+      '--gate', `node scripts/check-structure.mjs=${gate}`, '--gate-exit', '0',
+      '--prior-failure', notice, '--out', out]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    // 「通过检查」还不够 —— 它必须真的被渲染进去。只检查不发送的话，
+    // 子 agent 拿不到「不要在同一个坑里再来一次」这个唯一被允许的信息。
+    assert.ok(readFileSync(out, 'utf8').includes(notice), '无内容通知没有进提示词');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('负向：把 CLI 传 priorFailure 的那一行删掉，上面那条拒绝必须失效', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-prior-neg-'));
+  try {
+    const src = readFileSync(join(ROOT, 'scripts', 'compose-agent-prompt.mjs'), 'utf8');
+    const find = "      priorFailure: args['prior-failure'] ? String(args['prior-failure']) : null,\n    };";
+    assert.equal(src.split(find).length - 1, 1, '源码片段应当唯一');
+    const mutated = src.replace(find, '    };');
+    const target = join(ROOT, 'scripts', `.neg-prior-${process.pid}.mjs`);
+    writeFileSync(target, mutated, 'utf8');
+    try {
+      const graph = makeGraph(dir);
+      const r = spawnSync(process.execPath, [target, 'compose', '--run', 'r1', '--task', 'ST1',
+        '--graph', graph, '--role', 'acceptor', '--stop', '每项 AC 必带 file:line，25 分钟内返回',
+        '--prior-failure', '上一次验收不通过：AC1 未找到证据',
+        '--gate', `node scripts/check-structure.mjs=${writeGate(dir)}`, '--gate-exit', '0',
+        '--dry-run', '--root', ROOT], { encoding: 'utf8' });
+      assert.notEqual(r.status, 1,
+        `回退后不该再被判为「带内容」——说明拒绝是那一行给的：${r.stdout}${r.stderr}`);
     } finally { rmSync(target, { force: true }); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
