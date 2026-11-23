@@ -3365,3 +3365,49 @@ $ OVERWATCH_STATE_DIR=/tmp/fx node scripts/overwatch.mjs
 **这是正确的**（总比说「齐了」好），但意味着默认配置下 `doctor` 经常给不出结论。
 测试里必须 `--budget 4000` 才测得到健康/不健康两个分支。
 建议：要么提高默认预算，要么把 watcher 项挪到前面。
+
+### DF-077 [fixed] 规范声称「递归深度 3 层」，而 12 份角色一个派生工具都没有 —— 实际深度恒为 1
+
+- 发现于：2026-11-22 用户问「我们是哪种多 Agent 架构」时，主线程核对角色 tools 发现
+- 位置：`docs/spec/dispatch-contract.md §7`（原文「默认深度上限 3 层」）、
+  `CLAUDE.md` 硬约束 6、`.claude/agents/oversight-planner.md:35`
+- 证据（主线程实测）：
+  ```
+  $ cat .claude/agents/*.md | grep "^tools:" | sed 's/tools: //' | tr ',' '\n' | sort -u
+  Bash / Edit / Glob / Grep / Read / WebFetch / WebSearch / Write
+  → 8 种，没有 Task，也没有 Agent
+  ```
+  Claude Code 的 `tools` 是**精确白名单**，所以这 12 个角色**物理上派不出下一层**。
+- **这个问题在 2026-11-10 就被发现并判定过了**
+  （`docs/design/2026-11-10-agent-framework-skeleton.md:159`）：
+  > 规范声称的能力在实际配置里不存在，**这比没有规范更坏**（一个读者会据此设计三层方案）。
+  > v0 的动作是**修规范**，不是加能力。
+  设计稿连替换文本都写好了（`:230-256`），但**12 天没执行**。
+- 影响：任何读 §7 的人都会以为可以设计三层方案。而本仓的「深度」**没有任何检查守着** ——
+  `checkAgents()` 只校验「只读角色不得含 Edit/Bash」，对派生工具无感。
+- 修法（**文档追代码，不是代码追文档**）：
+  1. `dispatch-contract.md §7` 重写：深度 **1 层**，三条实测证据，
+     并单列一节说清「**平台能力 ≠ 本仓架构**」——宿主支持 3 层是平台能力，不是架构承诺。
+  2. `CLAUDE.md` 硬约束 6 同步。
+  3. `oversight-planner.md` 第 7 条改为「本版深度是 1 层，不要写出『由子树再派下级』的方案」。
+  4. **`original-design.md` 不改** —— 它是保留原文的历史存档，文件头已声明「冲突时以 spec/ 为准」。
+- **验收和修复都不加派发能力**（用户明确要求）：不加能力的理由不是「做不到」，
+  而是「**没被需要**」。契约漂移的正确解法是让文档追上代码，而不是让代码去追一个
+  没被需要的文档。
+
+### DF-078 [fixed] 「N 项检查」这个数字没有任何检查守着，漂了两轮没人发现
+
+- 发现于：DF-053（2026-11-21 批判 Agent 点名），本次修 DF-077 时顺带做掉
+- 证据：
+  ```
+  $ sed -i 's/26 项检查/23 项检查/' README.md   # 修前的真实值就是 23
+  $ node scripts/check-structure.mjs
+  ✗ [README.md] 第 68 行写「23 项检查」，实际 26 条（CHECK_NAMES）
+  ✗ [README.md] 第 365 行 …（同样）
+  ```
+  修前 `CHECK_NAMES` 是 25 条，README 写 23；本次加了 `dispatchDepth` 变 26。
+- 性质：**本仓有 `checkTestCount()` 专门防「文档里的测试数漂了」，却没有对应的东西
+  防「文档里的检查数漂了」**，而后者是这个仓库最常被引用的自证。
+- 修法：在 `checkDispatchCoverage()` 里加一段——活文档（README / CLAUDE / GUIDE /
+  CAPABILITIES）里凡写「N 项检查」，N 必须等于 `CHECK_NAMES.length`。
+- 负向：改回 23 → 两处同时红。

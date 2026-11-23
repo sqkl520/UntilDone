@@ -2387,8 +2387,101 @@ function checkAgentReachability() {
   }
 }
 
-// ── 检查 11：文档引用的路径必须存在 ────────────────────────────────────
+/** 检查：**文档声明的派生深度，必须与角色定义的实际能力一致**（DF-077）。
+ *
+ *  ## 这条检查要防的是什么
+ *
+ *  `docs/spec/dispatch-contract.md §7` 曾经写着「默认深度上限 3 层（宿主默认值即为 3）」，
+ *  而 12 份角色的 `tools:` 白名单里**一个派生工具都没有** —— 那份规范描述了一个
+ *  这一版根本执行不了的架构。2026-11-10 的设计稿当时就判定过：
+ *  「规范声称的能力在实际配置里不存在，**这比没有规范更坏**（一个读者会据此设计三层方案）」，
+ *  但直到 2026-11-22 才真正改掉，中间 12 天里所有读它的人都被误导了。
+ *
+ *  ## 判据
+ *
+ *  1. 扫描 12 份角色定义的 `tools:`，收集全部工具名的并集。
+ *  2. 若**没有任何**角色含派生工具（`Task` / `Agent`）→ 实际深度是 1。
+ *  3. 此时，活文档里**不许**出现「深度上限 3」「递归深度 3 层」这类断言。
+ *  4. 反过来：若**有**角色含派生工具，那实际深度 ≥2，也不许文档还写「深度是 1」。
+ *
+ *  ## 为什么用「工具名并集」而不是逐个角色判
+ *
+ *  深度由**最外层被派发的角色的能力**决定，而不是全部角色。但本仓的 12 个角色
+ *  都可能被主线程直接派发，且它们之间没有「谁一定在上层」的约定 —— 所以
+ *  「任何一个能派生」就足以让深度 ≥2。取并集是最保守（最不容易漏报）的判据。
+ *
+ *  ## 扫描范围
+ *
+ *  只查**活文档**：`CLAUDE.md` + `docs/spec/*.md`（排除 `original-design.md`，
+ *  那是保留原文的历史存档，文件头已声明「冲突时以 spec/ 为准」）。
+ *  不查 `docs/design/`（全是未实现的设计推演）与 `docs/research/`（会过期的过程记录）。
+ */
+function checkDispatchDepth() {
+  const agentDir = AGENTS_DIR;
+  if (!requirePath(agentDir, AGENTS_REL)) return;
 
+  const DERIVE_TOOLS = ['Task', 'Agent'];
+  const toolsUnion = new Set();
+  let files = [];
+  try { files = readdirSync(agentDir).filter((f) => f.endsWith('.md')); } catch { return; }
+  for (const f of files) {
+    let body = '';
+    try { body = readFileSync(join(agentDir, f), 'utf8'); } catch { continue; }
+    const m = body.match(/^tools:\s*(.+)$/m);
+    if (!m) continue;
+    for (const t of m[1].split(',')) toolsUnion.add(t.trim());
+  }
+  const canDerive = DERIVE_TOOLS.some((t) => toolsUnion.has(t));
+  const actualDepth = canDerive ? 2 : 1;
+
+  // 活文档：CLAUDE.md + docs/spec/*.md（排除历史存档）
+  const liveDocs = ['CLAUDE.md'];
+  try {
+    for (const f of readdirSync(join(ROOT, 'docs', 'spec'))) {
+      if (!f.endsWith('.md') || f === 'original-design.md') continue;
+      liveDocs.push(join('docs', 'spec', f));
+    }
+  } catch { /* spec 目录不在就算了，别的检查会报 */ }
+
+  // 「声称 3 层」的形态。刻意写得窄：只认明确断言，不认「宿主支持 3 层」这种
+  // 说明平台能力的句子（后者含「宿主」二字，是本节要保留的正当用法）。
+  const CLAIM_3 = /(?:默认)?深度上限\s*3\s*层|递归深度\s*(?:上限\s*)?3\s*层/;
+  const PLATFORM_CONTEXT = /宿主|平台能力|平台默认/;
+
+  for (const rel of liveDocs) {
+    const abs = join(ROOT, rel);
+    if (!existsSync(abs)) continue;
+    let text = '';
+    try { text = readFileSync(abs, 'utf8'); } catch { continue; }
+    text.split('\n').forEach((line, i) => {
+      if (!CLAIM_3.test(line)) return;
+      if (PLATFORM_CONTEXT.test(line)) return;   // 说明平台能力，正当
+      if (actualDepth === 1) {
+        fail(rel,
+          `第 ${i + 1} 行声称派生深度是 3 层，但 12 份角色的 tools 里没有任何派生工具`
+          + `（实测工具全集：${[...toolsUnion].sort().join(', ')}）—— 实际深度是 1。`
+          + ' 规范不许描述不存在的能力：一个读者会据此设计三层方案。'
+          + ' 见 docs/spec/dispatch-contract.md §7');
+      }
+    });
+  }
+
+  // 反方向：真的能派生了，文档却还说「深度是 1」
+  if (canDerive) {
+    const CLAIM_1 = /深度是\s*1\s*层|深度恒为\s*1|实际深度是\s*1/;
+    for (const rel of liveDocs) {
+      const abs = join(ROOT, rel);
+      if (!existsSync(abs)) continue;
+      let text = '';
+      try { text = readFileSync(abs, 'utf8'); } catch { continue; }
+      if (CLAIM_1.test(text)) {
+        fail(rel, '角色里已经有派生工具（深度 ≥2），但这里仍写着「深度是 1 层」—— 文档过期了');
+      }
+    }
+  }
+}
+
+// ── 检查 11：文档引用的路径必须存在 ────────────────────────────────────
 /** 「被文档引用的文件不存在」是同一类缺陷的反复复发：`dispatch-contract.md` 让所有
  *  Agent 去读 `templates/baseline.md`，而那个文件从来没被创建过；设计稿里更是列了
  *  一堆 `scripts/org.mjs` 这样的文件名，读者无法分辨「计划中的」和「已有的」。
@@ -2741,6 +2834,32 @@ function checkDispatchCoverage(ran) {
     fail('scripts/check-structure.mjs',
       `运行了但不在 CHECKS 表里：${unregistered.join(', ')} —— 它无法被配置关闭，也不计入总数`);
   }
+
+  // ## 「N 项检查」这个数字必须自己核（DF-053 / DF-078）
+  //
+  // `README.md` 里写了两次「N 项检查」。实测它长期写的是 `23`，而 `CHECK_NAMES`
+  // 当时是 25 —— **没有任何检查在核这个数**，所以它漂了两轮没人发现。
+  // 这个仓库有 `checkTestCount()` 专门防「文档里的测试数漂了」，
+  // 却没有对应的东西防「文档里的检查数漂了」，而后者是本仓最常被引用的自证。
+  //
+  // 判据：活文档里凡写「N 项检查」，N 必须等于 `CHECK_NAMES.length`。
+  const LIVE = ['README.md', 'CLAUDE.md', 'docs/GUIDE.md', 'docs/CAPABILITIES.md'];
+  const CLAIM = /(\d+)\s*(?:项|条)检查/g;
+  for (const rel of LIVE) {
+    const abs = join(ROOT, rel);
+    if (!existsSync(abs)) continue;
+    let text = '';
+    try { text = readFileSync(abs, 'utf8'); } catch { continue; }
+    text.split('\n').forEach((line, i) => {
+      for (const m of line.matchAll(CLAIM)) {
+        const n = Number(m[1]);
+        if (n !== contract.length) {
+          fail(rel, `第 ${i + 1} 行写「${m[1]} 项检查」，实际 ${contract.length} 条（CHECK_NAMES）—— `
+            + '这个数字没有任何别的机制核它，漂了就一直是错的');
+        }
+      }
+    });
+  }
 }
 
 // ── 运行 ──────────────────────────────────────────────────────────────
@@ -2767,6 +2886,7 @@ const CHECKS = [
   ['promptWiring', checkPromptWiring],
   ['designIndex', checkDesignIndex],
   ['agentReachability', checkAgentReachability],
+  ['dispatchDepth', checkDispatchDepth],
   ['docReferences', checkDocReferences],
   ['docCommands', checkDocCommands],
   ['docConstants', checkDocConstants],

@@ -65,7 +65,7 @@
 
 - **唯一入口** —— `overwatch.mjs` 报 8 项前提事实，**1000ms 预算且会把超支说出来**（本机实测 1133ms，输出末尾直接写「1133ms / 预算 1000ms」），不扫语料
 - **起一个挂了载荷的会话** —— `launch`，先 `--dry-run` 逐字看清会执行什么；`--verify` 只验载荷，不需要登录
-- **结构硬门** —— 23 项检查（测试数对账、文档路径与命令、能力清单、内外链、台账格式……）
+- **结构硬门** —— 26 项检查（测试数对账、文档路径与命令、能力清单、内外链、台账格式……）
 - **两本台账** —— `tasks/dev-findings.md`（范围外发现）、`tasks/accepted-deviations.md`（已知偏差）
 
 > 每条能力对应的**确切命令**见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) ——
@@ -362,7 +362,7 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
 **环境要求**：Node ≥ 18.20.4（跑工具）/ ≥ 20.16.0（跑测试）。
 
 ```bash
-node scripts/check-structure.mjs     # 结构硬门：23 项检查，0 违规才绿
+node scripts/check-structure.mjs     # 结构硬门：26 项检查，0 违规才绿
 node scripts/check-links.mjs         # 文档相对链接不悬空（170 份 .md，0 断链）
 node --test scripts/                 # 全量回归：48 个文件、1933 条
 ```

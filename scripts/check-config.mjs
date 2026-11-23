@@ -110,7 +110,7 @@ export const CHECK_NAMES = Object.freeze([
   'absolutePaths', 'privatePaths', 'gitignoreSanity', 'agents', 'emptyDirs',
   'capabilityDisclosure', 'testCount', 'syntax', 'importable', 'unregisteredExports',
   'links', 'changelog', 'stopHookKillSwitch', 'ledger', 'launcherPlacement',
-  'inboxWiring', 'promptWiring', 'designIndex', 'agentReachability',
+  'inboxWiring', 'promptWiring', 'designIndex', 'agentReachability', 'dispatchDepth',
   'docReferences', 'docCommands', 'docConstants', 'researchIndex', 'capabilities',
   'livingDocsCoverage',
 ]);
