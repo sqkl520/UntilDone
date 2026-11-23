@@ -52,8 +52,20 @@ prompt = templates/dispatch.md（公共段，长期稳定）
 | `relay` | Read, Grep, Glob, Write | inherit | 产出接力草稿 | — |
 | `safety` | Read, Grep, Glob | haiku | 检查草稿是否触碰红线 | 输入是草稿，与 relay 的输入不同 |
 | `resolution` | Read, Grep, Glob, Write | inherit | 裁决分歧 | 输入是双方原话，与 safety 不同 |
+| `verifier` | Read, Grep, Glob, Bash, Write | inherit | 核**主线程自己**说过的可机械验证的事实（数字 / 路径 / 命令输出 / grep 与行号） | 输入是主线程的原文，与其他角色的输入**不重叠**；且它只核事实不核判断，与锐评（好不好）、验收（过不过）是三件事 |
 
 **`critic` / `redteam` / `review` / `acceptor` / `safety` / `probe` 全部没有 `Edit`**。这不是 prompt 里的「请勿修改」，是工具集物理限制。`scripts/check-structure.mjs` 会验证这一点。
+
+**`verifier` 是唯一的例外形态：`readonly: true` 且带 `Bash`。** 它必须跑只读命令才能核事实
+（`grep` / `wc` / `node --test`），没有 `Bash` 它只能退化成「读一遍源码觉得它对」——那是判断，
+不是核验。硬门的规则**没有放松**：带 `Bash` 的只读角色必须
+① 在 frontmatter 写 `bashScope: read-only`，**且** ② 在正文给出 `## 允许的命令` 清单。
+两条缺一条照样红。它同时必须是**叶子**（`tools` 无 `Task` / `Agent`），否则 §7 的
+「深度恒 1」当场失效 —— `checkHubVerifier()` 专门核这一条。
+
+**`verifier` 为什么不能与 `acceptor` 合并**：验收核的是**交付物**（预声明的 AC 逐条），
+verifier 核的是**主线程的输出**（它这一轮说过的数字与路径）。两者的对象不同，
+而「主线程说的话有没有证据」这件事，此前没有任何角色被派去做。
 
 **为什么 `relay` 和 `safety` 不合并**：合并后就是「自己写草稿、自己审红线」，重演参考项目「锐评自己写自己」的失效模式。
 
@@ -106,15 +118,18 @@ timeout_min: 8
 
 ### 为什么是 1 层：三条实测证据
 
-1. **12 份角色定义的 `tools:` 白名单里，没有一个含派生子 Agent 的工具。**
-   实测全集只有 8 种：`Bash / Edit / Glob / Grep / Read / WebFetch / WebSearch / Write`。
-   Claude Code 的 `tools` 语义是**精确白名单**（列出即只给这些），所以这 12 个角色
+1. **13 份角色定义的 `tools:` 白名单里，没有一个含派生子 Agent 的工具。**
+   实测全集只有 8 种：`Bash / Edit / Glob / Grep / Read / WebFetch / WebSearch / Write`
+   （`verifier` 用的是其中已有的 `Bash`，没有引入新工具名）。
+   Claude Code 的 `tools` 语义是**精确白名单**（列出即只给这些），所以这 13 个角色
    **物理上派生不出下一层**。
 2. **宿主对 subagent 本来就不开放这条能力**（只对 fork 形态例外）。
    即便给某个角色加上工具名，深度 2 的下一层仍然拿不到派生能力。
-3. **结构硬门对它无感。** `checkAgents()` 只校验「只读角色不得含 `Edit`/`Bash`」，
-   不校验派生工具的有无 —— 也就是说「我们以为自己有几层」这件事**没有任何检查守着**，
-   只能靠人读角色定义。
+3. **结构硬门核这条了**（2026-11-23 起）。修前 `checkAgents()` 只校验「只读角色不得含
+   `Edit`/`Bash`」，不校验派生工具的有无 —— 也就是说「我们以为自己有几层」这件事
+   **没有任何检查守着**，只能靠人读角色定义。`checkDispatchDepth()` 现在取全部角色
+   `tools` 的并集，有派生工具就要求文档改成「深度 ≥2」；`checkHubVerifier()` 另外
+   指名核 `verifier` 必须是叶子。两条都不许靠人眼。
 
 ### 平台能力 ≠ 本仓架构（这条要单独说清）
 

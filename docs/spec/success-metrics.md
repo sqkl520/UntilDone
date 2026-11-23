@@ -292,17 +292,42 @@ terminal    = count(存在 PASS 且 无 block)         / count(进入分母的�
 
 ## 6. 汇总：五个指标各自的状态
 
-| # | 指标 | 现在能算吗 | 缺的那一条记录 | 备注 |
-|---|---|---|---|---|
-| 1 | 每任务总 token | **部分可算** | `kind:"usage"`（只为留痕；不加也能算，需重扫 transcript） | 必须按 `message.id` 去重，实测 4.72× 膨胀；`cache_read` 单列 |
-| 1 | 每任务总调用次数 | **部分可算** | 同上 | `scan-sessions` 的 `calls` 有截断且不去重，**不可用** |
-| 2 | 盲重采样命中率 | **不可算**（一半可算） | `kind:"verdict"` + `attempt` + `nonce` | 尝试次数已可从 `expect` 行数算出，且有两个独立来源可交叉校验 |
-| 3 | 局部定位准确率 | **不可算** | `kind:"locator"` + `kind:"localization"`（含 `repro` 命令） | 分母天然很小；「真位置」只能用「复现命令转绿」代理 |
-| 4 | 误放行率 | **不可算** | `kind:"verdict"` + 下游 DF 条目的回指 | 现有 DF 条目没有 `run`/`task` 字段 |
-| 4 | 误拦截率 | **不可算**（差结局） | `kind:"verdict"` + `outputs_sha256` | 「产出未变仍判过」这件事本身可算，缺的是结局 |
-| 5 | 一次成功 vs 终态成功 | **不可算** | `kind:"verdict"` | 与 §2 / §4 共用同一条记录 |
+> **2026-11-23 更新**：本节原来全是**读源码得出的判断**。现在有了
+> `scripts/compute-metrics.mjs`（DF-083），下列每一格都是**真跑出来的**。
+> 判决没变（四个指标仍卡在同一条记录上），但多了三处**只有跑过才会知道的**事实：
+> ① `expect.nonce` 归属在本仓 **0/3**（`observe` 自己跑也是 0/256）；
+> ② transcript 里真的有 **7 条**可解析的验收结论（不是零），但**没有 `task` / `nonce`**，
+>   只能拼出 2 条链（n=2）；
+> ③ 7 条里有 **1 条链出现「通过后又判不通过」**，但它是**候选**不是证明（见 §4.2）。
 
-一句话：**五个指标里，四个卡在同一条 `verdict` 记录上。**
+| # | 指标 | 现在能算吗 | 缺的那一条记录 | 实测（2026-11-23） |
+|---|---|---|---|---|
+| 1 | 每任务总 token | **部分可算** | `kind:"usage"`（也为留痕） | 语料级可算：231,056,476 计费 token（去重后，454 份 transcript）；**任务级 0/3 归属** |
+| 1 | 每任务总调用次数 | **部分可算** | 同上 | 语料级 55,656 次（按 `tool_use.id` 去重）；任务级同上 |
+| 2 | 盲重采样命中率 | **不可算**（一半可算） | `kind:"verdict"` + `attempt` + `nonce` | 分母 3 expect / 1 prompt；transcript 口径 2 条链、平均重采样 2 次（**n=2，不可引用**） |
+| 3 | 局部定位准确率 | **不可算** | `kind:"locator"` + `kind:"localization"`（含 `repro` 命令） | 只算出 C2 = 4/5、C1 机械部分 = 5/5 |
+| 4 | 误放行率 | **不可算** | `kind:"verdict"` + 下游 DF 条目的回指 | 可解析 PASS 总数 = 7；85 条 DF 条目**零个**带 `run`/`task` |
+| 4 | 误拦截率 | **不可算**（差结局） | `kind:"verdict"` + `outputs_sha256` | 「产出未变仍判过」的 sha 侧可算，但结局那一句没有落盘 |
+| 5 | 一次成功 vs 终态成功 | **不可算** | `kind:"verdict"` | transcript 口径 first_pass 0/2 · terminal 2/2（**n=2**） |
+
+一句话：**五个指标里，四个卡在同一条 `verdict` 记录上。** 这一条在 2026-11-23 之前是判断，
+之后是实测 —— 而实测同时发现了另一条：**指标 1 的归属缺的可能不是 `usage` 记录，
+而是 nonce 的落盘位置**（见下）。
+
+### 6.1 一个必须先修的比 `verdict` 更早的洞：归属键在数据上读不到
+
+`§1.2` 把「任务 → transcript」的归属挂在 `expect.nonce` + 首条 user 消息上。**实测 0/3**：
+`claim-ledger observe` 自己跑也是 `0/256`。真因不是判据错，是**nonce 的位置**：
+
+```
+一个子 agent transcript 里，nonce 首次出现的字节偏移 = 288,185 / 文件 423,275 字节
+（`findNonce(readHeadText(f))` 只读前 64 KiB，永远读不到）
+```
+
+它是子 agent 自己 `Read` 了 `claims.jsonl` 之后才被读进上下文的。所以要让归属成立，
+**nonce 必须出现在派发 prompt 的正文里**（`compose --nonce` 已经支持，但实测本仓那个 run
+的 3 个 nonce 没有一个进入了首条 user 消息）。这比 `kind:"verdict"` 更靠前：
+没有归属，即使有了 `verdict` 也拼不成「这个任务的第 i 次尝试」。
 
 ## 7. 交叉校验：每条指标至少两个独立来源
 
@@ -321,7 +346,31 @@ terminal    = count(存在 PASS 且 无 block)         / count(进入分母的�
 
 ## 8. 本轮明确没做的
 
-1. 没有实现任何读取器（`scan-sessions` / `claim-ledger` / `compose` 一行未改）。
-2. 没有加任何记录点。上面所有的 `kind:"..."` 都是**提案**，不是现状。
+1. ~~没有实现任何读取器~~ **2026-11-23 已实现一个**：`scripts/compute-metrics.mjs`
+   （+ `compute-metrics.test.mjs` 27 条）。它只读，不改 `scan-sessions` / `claim-ledger` / `compose` 一行。
+   它实现了 §1（语料级）、§3 的 C1/C2 机械部分、§2/§4/§5 的**分母**与可解析结局的检测。
+2. ~~没有加任何记录点~~ **仍未加**。上面所有的 `kind:"..."` 现在还是**提案** ——
+   脚本会在输出的 `gap` 里逐个点名它们该加在哪，但**不打那一行**。
+   理由记在 DF-083：加记录点要改 Phase E 的真实链路，而 Phase E 刚接上 `deliverVerdict()`
+   （DF-080），两个改动叠在一起会分不清是谁的回归。
 3. 没有用 54.8% / 95.4% 造任何「目标值」。本文件里它们只是参考坐标。
-4. 没有测出任何真实比率 —— 因为结局记录不存在，样本量也只有 1 个 run。
+4. ~~没有测出任何真实比率~~ **测出了三个，全部标了样本量**：
+   - 任务级 nonce 归属率 **0/3**；
+   - C2（AC anchor ∈ outputs）**4/5**；
+   - C1 机械部分（文件存在且行号可达）**5/5**。
+   另有两组 `n=2` 的数（平均重采样 2 次、first_pass 0/2）—— **样本量不足以支撑结论**，
+   报告里也这么标了。它们不是「比率」，是「这条链长这样」。
+
+## 9. 怎么复算
+
+```bash
+node scripts/compute-metrics.mjs              # 全量（本机 454 份 transcript / 730 MB）
+node scripts/compute-metrics.mjs --days 30    # 时间窗
+node scripts/compute-metrics.mjs --json       # 机器可读
+node scripts/compute-metrics.mjs --session <会话目录或 .jsonl>
+```
+
+三条读数的约定（脚本会打印，这里也写一遍，因为报告会被单独传阅）：
+- **每个比率与它的 `n` 同表出现**，`n < 30` 一律标「样本量不足以支撑结论」；
+- **算不出来返回 `null`，不返回 0** —— 0 会被下游当「比率 0%」引用；
+- **去重键**：token = `message.id`，调用 = `tool_use.id`；`cache_read` 单列。

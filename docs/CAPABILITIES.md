@@ -17,7 +17,7 @@
 | **自检：这台机器能干什么、缺什么**（唯一入口，不加参数即此） | `node scripts/overwatch.mjs` | 8 项前提事实，每行只说读到什么，不出红绿灯；空（exit 2）与坏（exit 3）分开 |
 | **起一个挂了载荷的会话** | `node scripts/overwatch.mjs launch` | 交互式会话，载荷是本仓库的 `.claude/`，工作目录是你的项目。**挂几个取决于 `agent.roster`**，随附配置只启用 3 个 |
 | 先看会挂上什么，不执行 | `node scripts/overwatch.mjs launch --dry-run` | 载荷 / roster / 两条 hook / 逐字命令行 |
-| **只验载荷挂对没有**（不需登录、不需推理） | `node scripts/overwatch.mjs launch --verify` | 宿主列出的角色与 `git` 跟踪的**源定义**（12 份）逐个对；缺一个即非零退出。**验的是源目录完整，不是实际挂载数** |
+| **只验载荷挂对没有**（不需登录、不需推理） | `node scripts/overwatch.mjs launch --verify` | 宿主列出的角色与 `git` 跟踪的**源定义**（13 份）逐个对；缺一个即非零退出。**验的是源目录完整，不是实际挂载数** |
 | 在你自己的项目里用（载荷不变，工作目录变） | `node scripts/overwatch.mjs launch --cwd <你的项目>` | 上面同一条，只是 `--cwd` 指过去 |
 | **会话里那些脚本命令从哪跑** | `node -e "console.log(process.env.UNTILDONE_PAYLOAD)"` | `launch` 注入的载荷根绝对路径。SKILL 与角色正文里的命令写成 `node "$UNTILDONE_PAYLOAD/scripts/<名字>.mjs"`。**打空值 = 这个会话不是经 `launch` 起的**，那些命令只在框架仓库里能跑。不用 `CLAUDE_PLUGIN_ROOT`：它在 SKILL 正文里不展开（实测） |
 | 扫全部会话，压成一张表（顺序固定：先按状态，同状态按闲置时长降序） | `node scripts/scan-sessions.mjs --days 3` | 每个会话一行：状态 / calls / novelty / idle / reason。**没有 `--sort` 参数** |
@@ -35,7 +35,7 @@
 | 「问了没答」的会话（不依赖宿主） | `node scripts/asked.mjs --hours 1` | 问了具体问题、人还没回的会话 |
 | 人工介入基线：把「介入变少」变成可证伪的数字 | `node scripts/measure-interventions.mjs --days 7` | 介入总数、按类型/按可避免性分级、每会话分布 |
 | 人工介入基线的机器可读版 | `node scripts/measure-interventions.mjs --json` | `totals` / `distribution` / `rates` |
-| Stop hook 验证闸：AI 想收工时替你把关 | `node scripts/stop-verify-hook.mjs`（由宿主调用，见 §3） | 判定写进 `<状态目录>/stop-hook/<日期>.jsonl`（`%LOCALAPPDATA%/UntilDone/`，不在你的项目里） |
+| Stop hook 验证闸：AI 想收工时替你把关 | `node scripts/stop-verify-hook.mjs`（由宿主调用，见 §3） | 判定写进 `<状态目录>/stop-hook/<日期>.jsonl`（`%LOCALAPPDATA%/UntilDone/`，不在你的项目里）。**它验的是「你说过的检查有没有做」，不是「活儿有没有做完」** —— 见 §3 开头 |
 | 看 Stop hook 放行样本的分布 | `node scripts/analyze-hook-samples.mjs` | 含完成语义但一次测试都没跑的候选 |
 | 后台守护进程的健康度 | `node scripts/watch.mjs --health` | 各轮询层「多久没扫过」，判断是活着还是在空转 |
 | 通知的可追溯率（生产指标） | `node scripts/watch.mjs --trace` | 每条通知能不能追到一次真实事件 |
@@ -48,6 +48,7 @@
 | 拼一个子 agent 的提示词（四层：身份/协议/现写/注入） | `node scripts/compose-agent-prompt.mjs compose --run <run-id> --task ST1 --role <角色> --stop "<可判定停机条件>"` | 逐项检查（含独立性），**不过就 exit 1 且不落文件**；打印配套的 `claim-ledger declare` 命令（nonce 与提示词里是同一个） |
 | 给某个角色补材料，同时拦住不该给它的东西 | `node scripts/compose-agent-prompt.mjs compose --run <run-id> --task ST1 --role review --context-from <context.json>` | 给锐评喂执行者自评、给验收喂锐评分数等一律拒绝派发；JSON 解析不了时 exit 2，不回落成「没给」 |
 | 收活时确认子 agent 收到的是不是台账里那一份 | `node scripts/compose-agent-prompt.mjs verify --run <run-id> --session <会话目录>` | 逐任务 `match: true/false/null`；`null` 是「看不到」，不是「通过」 |
+| **收活时给「这份交付能不能发」一个唯一裁决**（验收 × 红队 × 强证据） | `node scripts/delivery-verdict.mjs --acceptor tasks/runs/<run-id>/acceptor.md --redteam tasks/runs/<run-id>/redteam.md --key-paths tasks/runs/<run-id>/keypaths.json` | 退出码就是裁决：`0 PASS / 1 FAILED / 2 BLOCKED / 3 用法错误`。**「验收 PASS 但红队 BLOCK」判 `BLOCKED`** —— 两者都成立，不是矛盾。报告文件读不到时 exit 3，**不回落成「没有阻断项」** |
 | 全量回归测试 | `node --test scripts/` | 全绿；条数以命令输出为准 |
 | 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败。范围是 `git ls-files '*.md'`（实测 170 份，含根级与 `templates/`），判据在 `scripts/link-check.mjs`：文件在不在、锚点在不在、目标会不会被 gitignore 掉 |
 | 生成仓库社交预览图（1280×640） | `node scripts/make-social-preview.mjs --out docs/assets/social-preview.png` | 一张 PNG；GitHub 的 social preview 没有 API，要人工上传 |
@@ -61,7 +62,7 @@
 
 | 不能做 | 依据 | 哪份文档说清了为什么 |
 |---|---|---|
-| 实时干预运行中的会话 | 宿主的 `--resume` 对运行中会话是拒绝或分叉；跨会话通道强制标注来源 | `README.md`「为什么不能自动接力」、`docs/adr/0001-config-only.md` §代价·3 |
+| 实时干预运行中的会话 | 宿主的 `--resume` 对运行中会话是拒绝或分叉；跨会话通道强制标注来源 | `README.md`「边界一：不能自动接力」、`docs/adr/0001-config-only.md` §代价·3 |
 | 自动把回复发进目标会话 | 同上；`relay.deliver` 只有 `manual` 一个合法值 | `docs/spec/relay-protocol.md` §6 |
 | 判断「改得对不对」 | 那需要读语义与业务意图，超出「断言 vs 证据」的判据范围 | `README.md` 核心能力表「不能做」列 |
 | 从「停了很久」推断失败 | 该推断 2026-10-31 全语料实测后已删除：6308 次大间隔里 94.8% 之后仍有工具调用 | `docs/spec/state-model.md` §2.0.1 |
@@ -70,6 +71,19 @@
 | 在线判定「这次停止是问句还是结束」 | 要判得看下一句，而在线时下一句还没发生（实测 95.4%→100% `UNCLASSIFIABLE`） | `README.md`「已知局限」 |
 
 ## 3. Stop hook 验证闸：怎么开、默认是什么
+
+### 它验的是什么（2026-11-24 更正，先读这段）
+
+此前这一节只写「怎么开」，读起来像「开了它就替你把关做完了」。**它不是那个东西。**
+它验的是**「本轮最后那句话宣称的检查，transcript 里做没做」**，不是「需求有没有被做完」。
+它既不知道需求清单，也不认识「诚实地说还没做完」这类回合（那类回合没有完成性断言，
+走 `no-checkable-claim` 直接放行，对它零杠杆）。
+
+实测（2026-11-24 复算 412 条判定记录）：`action:"block"` 8 条里，
+`mode:"off"` 的观察记录 6 条、合成会话 1 条、真 UUID 但落在 e2e 沙箱 1 条 ——
+**真实项目、真实会话上的真实拦截 = 0**。完整表格与「怎么读这些数字」见
+[`README.md`「边界二」](../README.md#-边界二stop-hook-验的是说过的检查有没有做不是活儿有没有做完)；
+不修的部分与代价见 [`tasks/accepted-deviations.md`](../tasks/accepted-deviations.md) 的 AD-009 / AD-010 / AD-011。
 
 **默认关闭。** 不设环境变量时，`stop-verify-hook.mjs` 只**记账、永远放行**，不会拦住任何会话。
 

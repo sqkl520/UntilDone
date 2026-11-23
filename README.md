@@ -12,7 +12,7 @@
 ![CI](https://github.com/sqkl520/UntilDone/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4%20%C2%B7%20tests%2020.16%2B-blue?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
-![Tests](https://img.shields.io/badge/regression%20tests-1998-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/regression%20tests-2080-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 **零依赖** · **不用安装** · **不登录也能核对证据** —— `git clone` 之后 `node scripts/overwatch.mjs` 就行
@@ -42,7 +42,7 @@
 
 - **开工前问够再写** —— 第一次写文件之前，transcript 里必须已经有 N 个去重后的提问（`ask.minQuestionsBeforeWrite`，默认 `0` = 这条判据不存在）
 - **先证明读过项目** —— 首次写文件前要读过 ≥3 个不同文件（`minReads`）；Edit 侧另有一条：必须读过被改的那个文件本身
-- **收工前对上证据** —— 说完「做完了」，Stop hook 去 transcript 里找支持这句话的工具调用；`NO_EVIDENCE` / `STALE_ONLY` / `FAILED_ONLY` 拦，「判不了」的放行
+- **收工前对上证据** —— 说完「做完了」，Stop hook 去 transcript 里找支持这句话的工具调用；`NO_EVIDENCE` / `STALE_ONLY` / `FAILED_ONLY` 拦，「判不了」的放行。**它验的是「你说过的检查有没有做」，不是「活儿有没有做完」** —— 见下文「边界二」
 - **收活时机械对账** —— 子 agent 说它产出了哪些文件，`claim-ledger.mjs verify` 拿「期望 / 自述 / 磁盘 / transcript 痕迹」四方交叉
 
 **证据核对**
@@ -65,7 +65,7 @@
 
 - **唯一入口** —— `overwatch.mjs` 报 8 项前提事实，**1000ms 预算且会把超支说出来**（本机实测 1133ms，输出末尾直接写「1133ms / 预算 1000ms」），不扫语料
 - **起一个挂了载荷的会话** —— `launch`，先 `--dry-run` 逐字看清会执行什么；`--verify` 只验载荷，不需要登录
-- **结构硬门** —— 28 项检查（测试数对账、文档路径与命令、能力清单、内外链、台账格式、派发深度与返回格式……）
+- **结构硬门** —— 29 项检查（测试数对账、文档路径与命令、能力清单、内外链、台账格式、派发深度与返回格式……）
 - **两本台账** —— `tasks/dev-findings.md`（范围外发现）、`tasks/accepted-deviations.md`（已知偏差）
 
 > 每条能力对应的**确切命令**见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) ——
@@ -89,7 +89,7 @@
    [   0ms] node        v26.12.1 · 工具下限 18.20.4 满足 · 测试下限 20.16.0 满足
    [ 209ms] transcripts <home>/.claude/projects · 81 个（未完）项目 · 509 份 .jsonl（下限） · 最新一份 2 小时前
    [   8ms] sources     jobs 11 个 state.json · sessions 10 个 .json
-   [   2ms] claude/     agents 12 个 · skills 1 个 · settings.local.json 已建
+   [   2ms] claude/     agents 13 个 · skills 1 个 · settings.local.json 已建
    [  47ms] gate        mode=observe · brake=halt · marker=exists {...}
    [ 624ms] watcher     启动器 在 · 快捷方式 在 · health 说 未认出 · 数据目录 <state>
    [   1ms] platform    win32 · 桌面通知可用（Toast） · 开机自启有启动文件夹
@@ -148,7 +148,7 @@
 | 我的会话显示 `EXPLORING` 三天了，是卡住了吗？ | 大概率不是。`idle` 超过 1 小时判休眠（`reason: dormant`），`FAILED` **只认宿主上报**，不从「停了很久」推。最可靠的信号是打开那个会话看一眼 |
 | `claude agents --json` 已经能看会话了，为什么还要用这个？ | 两者回答不同问题：前者答「宿主注册了哪些、此刻 busy/idle/blocked」（没有 `failed`、没有 novelty / idle 时长 / 派生树 / token），后者答「这些会话在干什么、卡在哪儿」。`scan` 判断「该不该管」，`claude agents` 确认「这个会话是否真的注册着、能不能投递」 |
 | `UNCHECKABLE` 占八成的意思是「没问题」吗？ | 不是，是**判不了**。它只在少数有明确工具调用可对的断言上有效（构建成功、测试通过、推送完成、文件数）。把「判不了」说成「没问题」是本项目最不想犯的错 |
-| 能不能让 AI 自动把回复发进目标会话？ | 不能，而且不是没做完 —— 见 [为什么不能自动接力](#-为什么不能自动接力) |
+| 能不能让 AI 自动把回复发进目标会话？ | 不能，而且不是没做完 —— 见 [边界一：不能自动接力](#-边界一不能自动接力) |
 | 宿主明明给了 `needs`，为什么我这边大多是空的？ | `needs` / `suggestedReply` 只在**阻塞时**由宿主写入。本机实测 16 个 job 里只有 2 个带 `needs`、1 个带 `suggestedReply` |
 | 改了 `.claude/agents/` 里的角色，怎么生效？ | 新开的会话自动加载；已打开的不热更新（启动时读入）。改完先跑 `node scripts/check-structure.mjs`，它会查 frontmatter、`description` 长度、只读角色有没有混进 `Edit`/`Bash` |
 | 硬门红了 / 测试红了怎么办？ | 看 [`docs/GUIDE.md`](docs/GUIDE.md) §10「出问题了怎么办」，按报错逐类对照。硬门必须在**仓库根**跑，否则它会把你当前目录当仓库根 |
@@ -177,9 +177,9 @@
 | 层 | 用了什么 |
 |---|---|
 | 运行时 | Node（工具 ≥ 18.20.4，测试 ≥ 20.16.0），**无 `package.json`、无 `node_modules`** |
-| 代码量 | 59 个生产脚本 + 50 个测试文件（1998 条回归测试，硬门数**真实注册**对账） |
+| 代码量 | 61 个生产脚本 + 56 个测试文件（2080 条回归测试，硬门数**真实注册**对账） |
 | 接口面 | 宿主 hooks（`PreToolUse` / `Stop`）+ 命令行 + 纯文本 / JSON 输出 |
-| 角色 | `.claude/agents/` 12 份 markdown 定义 + 1 个调度 skill（宿主直接加载） |
+| 角色 | `.claude/agents/` 13 份 markdown 定义 + 1 个调度 skill（宿主直接加载） |
 | 存储 | 宿主 transcript 只读；自己的状态落在 `tasks/runs/`（gitignored）与用户状态目录 |
 | CI | GitHub Actions：[`validate.yml`](.github/workflows/validate.yml) —— 结构门 + 载荷布局 + 全量测试 |
 
@@ -316,7 +316,7 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
 **够用与否**：要「这几个会话里哪个在等我、哪个在报假完成」，够用；要「自动接力、自动决策」，
 **不够用**，而原因是平台的墙，不是缺一个 feature。
 
-## 🚧 为什么不能自动接力
+## 🚧 边界一：不能自动接力
 
 能力边界写在这里，是因为它最容易被误解成「还没做」：
 
@@ -324,6 +324,88 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
   而那是平台明确封的路径（实测过 UIA、IPC 管道、CDP 调试端口，全部不可用）。
 - 所以本库只能**生成草稿**（面板里按 `c` 复制），由你粘贴发送。
 - 这不叫「降级」，这叫「如实说平台的边界在哪」。
+
+## 🚧 边界二：Stop hook 验的是「说过的检查有没有做」，不是「活儿有没有做完」
+
+这一条是本仓库**最容易读错**的一处，所以单列一节。`Stop` hook（`scripts/stop-verify-hook.mjs`）
+此前被写成「收工前替你把关」，读起来像「它能判断你做没做完」。**它不能，而且不能的方式很具体。**
+
+### 它实际验的是什么
+
+它读本轮最后一条 assistant 文本，抽出**完成性断言**（「测试全过」「已推送」「三个 bug 都修好了」……），
+再去 transcript 里找**支持那句话的工具调用**。三档拦、三档放：
+
+| 判定 | 拦不拦 | 判的是什么 |
+|---|---|---|
+| `NO_EVIDENCE` | 拦 | 这句话在整个会话里找不到对应的调用 |
+| `STALE_ONLY` | 拦 | 有调用，但之后又改了源码 —— 那次成功已失效 |
+| `FAILED_ONLY` | 拦 | 只找到失败的调用 |
+| `SUPPORTED` | 放 | 调用成功，且在最后一次相关改动之后 |
+| `UNKNOWN` | 放 | 窗口截断 / 丢后台没拿到退出码 —— **没读到不等于没做** |
+| `UNCHECKABLE` | 放 | 这句话的类型没有确定性证据源 |
+
+所以它管的是**「你说过要验证的话，验证了没有」**。它**不管**的两件事：
+
+1. **活儿本身做完没有。** 它看不见你的需求清单，也不知道「三个 bug」具体是哪三个。
+   一个会话把需求做了一半、但每句「我做完了」都配了测试输出，它会一路放行。
+2. **诚实地停下来。** 说「还没做完，等你定方向」的回合没有完成性断言，
+   `detectClaims()` 认不出来，走 `no-checkable-claim` 直接放行。**对它零杠杆。**
+
+### 实测数字（2026-11-24 复算，不是估计）
+
+规模：`tasks/runs/stop-hook/` 与 `%LOCALAPPDATA%/Overwatch/stop-hook/` 合计 **412 条**判定记录，
+覆盖 2026-11-11 → 2026-11-23，来自 10 个台账文件。
+
+| 口径 | 数字 |
+|---|---|
+| 总判定记录 | **412** |
+| 其中 `unparsable-input`（输入没解析出来，全是 2026-11-18 之前的老格式） | **214（51.9%）** |
+| 剩下**能解析**的记录 | **198** |
+| ↳ 其中 `no-checkable-claim`（认不出可核对断言 → 放行） | **154 = 77.8%** |
+| ↳ `background-tasks-running`（后台任务在跑 → 放行） | 26 |
+| ↳ `all-claims-supported` | 8 |
+| ↳ `stop-hook-active`（防循环 → 放行） | 2 |
+| ↳ 真拦（`action:"block"`） | 8 |
+
+`action:"block"` 那 8 条再拆一层 —— **这里是上一版文档最容易骗人的地方**：
+
+| 细分 | 条数 | 是不是真拦截 |
+|---|---|---|
+| `mode:"off"` 的观察记录（只记账，宿主根本没收到 block） | **6** | ❌ 不是 |
+| `mode:"block"` + `outcome:"blocked"` + 合成会话 ID（`sim-` / `live-probe-` / `final-c` / `subperf`） | **1** | ❌ 不是 |
+| `mode:"block"` + `outcome:"blocked"` + **真 UUID 会话** | **1** | ⚠️ 但 transcript 落在 e2e 沙箱 |
+
+**真实项目、真实会话上的真实拦截 = 0 次。**
+
+最后那条「真 UUID」是 `106aa1ae-4070-4d81-97e0-ff057613dc0a`（2026-11-14，抓的是「三个 bug 都修好了」）。
+它的 transcript 在 `…/hook-e2e-sandboxes/PC3-proj/` 下，是**端到端测试的沙箱**，不是用户项目。
+而且它之后**没有后续记录** —— 没有「拦完之后补了验证再过」的闭环案例。
+
+**唯一一个真实主机会话**（`ea4ef562-…`，D 盘本仓库，87 条判定、跨 2026-11-18 → 11-23）
+全部是 `allow`：`no-checkable-claim` 54 / `background-tasks-running` 26 / `all-claims-supported` 7。
+其中 33 条有可核对断言，**0 条被拦**。
+
+### 怎么读这些数字
+
+`77.8%` 这个占比**不是**「AI 有 77.8% 的时候在撒谎」。它是「这 198 次收工里，有 154 次
+最后那句话根本没有可核对的完成性断言」。多半是正常收尾（回答问题、汇报进度、
+说「等你定方向」）。它说明的是**这道闸对绝大多数收工回合根本没有触发条件**，
+而不是「它判错了」。
+
+诚实的那部分反过来说：**它唯一真正抓过的一次真实项目撒谎，是 e2e 沙箱。**
+产品主张「一次做完」在「做没做完」这个维度上，实测拦截次数为 **0**。
+
+### 那它还有什么用
+
+两个用处，都不该被说成「保证做完了」：
+
+- **它拦得住「说了要验证、但没验证」**（前提是这句话带了可核对断言）。
+  这是真实发生过的事故类型，也确实是用户最常被骗的一类。
+- **它的台账是一份诚实的空白**。`77.8% no-checkable-claim` 说明这个方向**没有杠杆**，
+  而不是「已经很安全」。下一轮该做的是**认出「诚实地停下」并给它出路**，不是收紧这里。
+
+至于「它本质上验不了『做没做完』」这个大问题为什么不修、代价是什么，
+见 [`tasks/accepted-deviations.md`](tasks/accepted-deviations.md) 的 AD-009 / AD-010 / AD-011。
 
 ## 📌 当前进度
 
@@ -336,7 +418,7 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
 |---|---|---|
 | 开工前问清需求 | `scripts/pre-write-gate.mjs`（`PreToolUse`） | ✅ **已实现，默认关**。`ask.minQuestionsBeforeWrite` 默认 `0` = 判据不存在；开了也只数次数，判不了「问得准不准」 |
 | 过程中自拆清单供确认 | `scripts/claim-ledger.mjs` + `scripts/validate-run.mjs` | ⚠️ **工具在，没有闸**。清单率实测 1.4%（不含沙箱），覆盖不到真实使用，所以没加闸 |
-| 收工前逐项核对落盘 | `scripts/stop-verify-hook.mjs`（`Stop`） | ✅ **已实现，默认 `off`（只记账）**，本机已开 `block`。台账 355 条判定里拦住过 2 条 |
+| 收工前逐项核对落盘 | `scripts/stop-verify-hook.mjs`（`Stop`） | ✅ **已实现，默认 `off`（只记账）**，本机已开 `block`。**验的是「说过的检查做了没有」，不是「活儿做完了没有」**：412 条台账里 `action:"block"` 8 条，真实项目真实会话的真实拦截 **0** 次（拆解见下文「边界二」） |
 
 **各模块：**
 
@@ -362,9 +444,9 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
 **环境要求**：Node ≥ 18.20.4（跑工具）/ ≥ 20.16.0（跑测试）。
 
 ```bash
-node scripts/check-structure.mjs     # 结构硬门：28 项检查，0 违规才绿
+node scripts/check-structure.mjs     # 结构硬门：29 项检查，0 违规才绿
 node scripts/check-links.mjs         # 文档相对链接不悬空（170 份 .md，0 断链）
-node --test scripts/                 # 全量回归：51 个文件、1998 条
+node --test scripts/                 # 全量回归：56 个文件、2080 条
 ```
 
 `check-structure.mjs` 与全量测试**都必须绿才能提交**。两条命令都在一秒到半分钟量级，
@@ -389,7 +471,7 @@ CI 上跑的是同一套（[`validate.yml`](.github/workflows/validate.yml)）�
   它只说事实，正好是排查需要的那一份。
 - **想改代码请先开个 Issue 说一声**，避免白写。
 - **安全报告**：**不要开公开 issue**，见 [`SECURITY.md`](SECURITY.md)。
-- **跑测试**：`node --test scripts/`（1998 条回归测试；**这个数字由硬门对账**：它 import 每个测试文件
+- **跑测试**：`node --test scripts/`（2080 条回归测试；**这个数字由硬门对账**：它 import 每个测试文件
   数**真实注册**了几条，与 `ℹ tests` 逐条相等，写错即红。所以照抄即可、不必手工数）。
 
 > **贡献者名单和 Star 曲线这里目前都没有。** star 数是 0，star-history 会画出一张空图；

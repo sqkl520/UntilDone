@@ -52,13 +52,34 @@ const OK = {
   nonce: 'a1b2c3d4',
 };
 
-/** 真实角色定义：这些断言必须对着真人写的文件跑，不能对着测试自己造的样本跑。 */
-const ACCEPTOR_TEXT = read('.claude/agents/oversight-acceptor.md');
-const EXECUTOR_TEXT = read('.claude/agents/oversight-executor.md');
+/** 真实角色定义：这些断言必须对着真人写的文件跑，不能对着测试自己造的样本跑。
+ *
+ *  ## 为什么是惰性读取，不是模块级常量（DF-050）
+ *
+ *  模块级的 `readFileSync('.claude/agents/…')` 有一个与「这个测试要验什么」无关的
+ *  副作用：**没有角色目录的项目里，import 这个文件就抛**。而
+ *  `regression-count.mjs` 的探针会 import **每一个**测试文件（只登记用例，不跑用例体）
+ *  去数回归测试条数 —— 于是在一个只拷了 `scripts/` 的外部项目里，结构门报出一条
+ *  「`compose-agent-prompt.test.mjs` import 时就抛错」。
+ *
+ *  那条报错本身是对的（import 就炸的测试文件在全量跑里会整块消失，且不报错），
+ *  但它指向的是一份**只在本仓才有意义的夹具**，不是对方项目的缺陷。
+ *  惰性之后：import 永远不抛；缺少夹具时那几条用例自己会说清原因。
+ *
+ *  刻意**不用**「读不到就返回空串」：那会让断言对着空文本跑，失败信息变成
+ *  「tools 里没有 Bash」而不是「角色定义不在盘上」—— 一句指向错地方的诊断。 */
+function roleTextOrNull(rel) {
+  try { return readFileSync(join(ROOT, rel), 'utf8'); } catch { return null; }
+}
+const ACCEPTOR_TEXT = roleTextOrNull('.claude/agents/oversight-acceptor.md');
+const EXECUTOR_TEXT = roleTextOrNull('.claude/agents/oversight-executor.md');
+/** 缺夹具时先跳过并写明原因 —— 不假装通过（本仓一律如此）。 */
+const NEED_AGENTS = '需要本仓的 .claude/agents/ 角色定义（本用例对着真人写的文件跑）';
 
 // ── 角色工具集 ────────────────────────────────────────────────────────
 
-test('frontmatter 解析出 tools；acceptor 确实没有 Bash（这是那个矛盾的物理事实）', () => {
+test('frontmatter 解析出 tools；acceptor 确实没有 Bash（这是那个矛盾的物理事实）', (t) => {
+  if (!ACCEPTOR_TEXT) { t.skip(NEED_AGENTS); return; }
   const r = roleTools(ACCEPTOR_TEXT);
   assert.deepEqual(r.tools, ['Read', 'Grep', 'Glob', 'Write']);
   assert.equal(r.inheritAll, false);
@@ -66,7 +87,8 @@ test('frontmatter 解析出 tools；acceptor 确实没有 Bash（这是那个矛
   assert.ok(!r.tools.includes('Edit'));
 });
 
-test('executor 有 Bash（对照组：否则上面的断言可能只是因为谁都没有 Bash）', () => {
+test('executor 有 Bash（对照组：否则上面的断言可能只是因为谁都没有 Bash）', (t) => {
+  if (!EXECUTOR_TEXT) { t.skip(NEED_AGENTS); return; }
   const r = roleTools(EXECUTOR_TEXT);
   assert.ok(r.tools.includes('Bash'));
   assert.ok(r.tools.includes('Write'));

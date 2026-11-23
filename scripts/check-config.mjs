@@ -78,8 +78,40 @@ export const DEFAULTS = Object.freeze({
     'docs/adr/0001-config-only.md',
     'docs/adr/0002-honest-degradation.md',
   ],
-  /** 角色定义目录（`.md` 一份一个角色）。 */
-  agentsDir: '.claude/agents',
+  /** **本仓是不是本产品自身的仓库**（默认 `false`）。
+   *
+   *  ## 为什么需要这一位（DF-050 / DF-051）
+   *
+   *  修前硬门在任何一个陌生项目里跑都会报 **59 条违规，其中 54 条的原话是
+   *  「它是本仓库的规定产物」**（实测 `/tmp/owport`：只有 `README.md` + `git init`）。
+   *  那不是检查，那是要求对方复制我们整套文档。根因不是某几条判据写错了，
+   *  而是**判据里混着两种命题**：
+   *
+   *    · 「任何仓库都该成立」——脚本能被解析、能被 import、可发布区没有本机绝对路径、
+   *      相对链接不悬空、没有空目录；
+   *    · 「本产品自身的规矩」——README 必须声明「不能自动接力」、每个提交都要记 CHANGELOG、
+   *      设计稿必须标「未实现」、能力清单必须绑命令、派发必须带四元组…
+   *
+   *  后一类在别人的项目里**没有对象**：他们的 README 不是我们的 README，他们没有
+   *  `docs/design/`，也不欠我们一份 CHANGELOG。所以它不是「判据错」，是
+   *  **适用范围错**。这一位就是那个适用范围的声明：`true` = 按产品自身的规矩自检。
+   *
+   *  ## 为什么默认 `false`，而不是「默认等于本仓现状」
+   *
+   *  本文件头写着「默认值必须等于本仓现状」，那条规矩原本是为了让本仓库不写配置也
+   *  逐字节不变。但对**这一位**它是错的：默认 `true` 会让每个陌生项目一进来就拿到
+   *  54 条「规定产物」违规 —— 那正是本条要消灭的现象。所以这里的默认值取
+   *  「对任何项目都安全」的方向（`false`），由**本仓自己的那份配置**声明 `true`。
+   *  代价写在这里：删掉 `.untildone/checks.json` 会让产品规矩静默不再执行 ——
+   *  所以门会在 `false` 时**每次都打印一行**「哪一族规矩本轮不适用」，不静默；
+   *  而 `check-config.test.mjs` 钉住本仓那份配置写着 `true`。
+   *
+   *  ## 它**不是**「跳过所有检查」
+   *
+   *  `false` 只让上表第二类让位；第一类照跑，且**产物在盘上就照查**
+   *  （`docs/design/` 存在时索引照样要覆盖每一份、`tasks/dev-findings.md` 存在时
+   *  格式照样要合法）。失效方向是「不要求对方长成我们的样子」，不是「不检查对方」。 */
+  productRepo: false,
   /** 调度入口（SKILL.md）的落点。**不在派单列的 6 个常量里**，但同属一族：
    *  `checkInboxWiring` / `checkPromptWiring` / `checkAgentReachability` 三处都拿它
    *  判断「调度入口有没有提到某个脚本」。写死成 `.claude/skills/oversight/SKILL.md`
@@ -106,17 +138,69 @@ export const DEFAULTS = Object.freeze({
   disabledChecks: [],
 });
 
-/** 所有检查的名字。与 `check-structure.mjs` 的 RUNS 表一一对应；那边的未知名字会报错。 */
-export const CHECK_NAMES = Object.freeze([
-  'absolutePaths', 'privatePaths', 'gitignoreSanity', 'agents', 'emptyDirs',
-  'capabilityDisclosure', 'testCount', 'syntax', 'importable', 'unregisteredExports',
-  'links', 'changelog', 'stopHookKillSwitch', 'ledger', 'launcherPlacement',
-  'inboxWiring', 'promptWiring', 'evidenceTaxonomy', 'designIndex', 'agentReachability', 'dispatchDepth',
-  'dispatchQuartet',
-  'docReferences', 'docCommands', 'docConstants', 'researchIndex', 'capabilities',
-  'livingDocsCoverage',
-]);
+/** 所有检查的名字 → **适用域**。与 `check-structure.mjs` 的 CHECKS 表一一对应；
+ *  那边缺名字会报错。`CHECK_NAMES` 由它派生，**不再单独维护一份** —— 两份清单必然漂。
+ *
+ *  ## 两个域（DF-051 的修法本体）
+ *
+ *  `universal` —— 任何仓库都该成立的命题：脚本能被解析 / 能被 import、可发布区没有
+ *  本机绝对路径、相对链接不悬空、没有空目录、私有路径被 gitignore 排除、
+ *  文档引用的文件存在且命令能跑。
+ *
+ *  `product` —— **本产品自身的规矩**：README 必须声明「不能自动接力」、每个提交都要
+ *  记 CHANGELOG、设计稿必须标「未实现」、能力清单必须绑命令、派发必须带四元组、
+ *  角色 frontmatter 必须有 readonly……
+ *
+ *  这些在别人的项目里**没有对象**：他们的 README 不是我们的 README，他们没有
+ *  `docs/design/`，也不欠我们一份 CHANGELOG。修前它们全部报成
+ *  「它是本仓库的规定产物」—— 实测外部项目 59 条违规里 54 条是这个（DF-050/051）。
+ *
+ *  ## 为什么是「一个域位」而不是「十几条开关」
+ *
+ *  `disabledChecks` 也能关掉它们，但那要求使用者先知道 17 个内部名字、逐条关，
+ *  而且**下一次有人加一条新的产品规矩，它默认又是红的** —— 失效方式是结构性的。
+ *  域位让「新检查默认属于哪一族」成为一个必须回答的问题：加一条检查必须同时声明域，
+ *  否则元检查（`checkDomainCoverage()`）当场红。 */
+export const CHECK_DOMAINS = Object.freeze({
+  absolutePaths: 'universal',
+  privatePaths: 'universal',
+  gitignoreSanity: 'universal',
+  agents: 'universal',
+  emptyDirs: 'universal',
+  capabilityDisclosure: 'product',
+  testCount: 'universal',
+  syntax: 'universal',
+  importable: 'universal',
+  unregisteredExports: 'product',
+  links: 'universal',
+  changelog: 'product',
+  stopHookKillSwitch: 'product',
+  ledger: 'universal',
+  launcherPlacement: 'universal',
+  inboxWiring: 'product',
+  promptWiring: 'product',
+  evidenceTaxonomy: 'product',
+  designIndex: 'universal',
+  agentReachability: 'product',
+  hubVerifier: 'product',
+  dispatchDepth: 'product',
+  dispatchQuartet: 'product',
+  docReferences: 'universal',
+  docCommands: 'universal',
+  docConstants: 'universal',
+  researchIndex: 'universal',
+  capabilities: 'product',
+  livingDocsCoverage: 'universal',
+});
 
+/** 所有检查的名字。与 `check-structure.mjs` 的 RUNS 表一一对应；那边的未知名字会报错。 */
+export const CHECK_NAMES = Object.freeze(Object.keys(CHECK_DOMAINS));
+
+/** 一条检查属于哪一族。**未登记的名字返回 `null`** —— 调用方必须把它当成错误，
+ *  「不知道属于哪一族」不能静默当成 universal（那会让新检查在别人的项目里复活 DF-051）。 */
+export function domainOf(name) {
+  return Object.prototype.hasOwnProperty.call(CHECK_DOMAINS, name) ? CHECK_DOMAINS[name] : null;
+}
 /** 统一正斜杠、去掉 `./` 前缀与尾部斜杠。空串保持空串（由校验报错）。 */
 export function normRel(p) {
   return String(p == null ? '' : p)
@@ -185,11 +269,19 @@ export function validateChecks(raw) {
     if (key === 'disabledChecks') out[key] = [...v];
   }
 
-  for (const key of ['agentsDir', 'scriptsDir', 'runsDir', 'skillPath']) {
+  for (const key of ['scriptsDir', 'runsDir', 'skillPath']) {
     const v = raw[key] === undefined ? DEFAULTS[key] : raw[key];
     const e = pathError(v);
     if (e) { err(key, e); continue; }
     out[key] = normRel(v);
+  }
+
+  // `productRepo` 是**布尔，不是路径**：单独一支，且不做任何隐式转换。
+  // `"true"` / `1` 一律报错 —— 「我写了 true 却没生效」与「我没写」在屏幕上必须不同形。
+  {
+    const v = raw.productRepo === undefined ? DEFAULTS.productRepo : raw.productRepo;
+    if (typeof v !== 'boolean') err('productRepo', '必须是布尔值（true / false）');
+    else out.productRepo = v;
   }
 
   // 台账落点必须在私有区里：两张表指向不同目录时，「台账被 gitignore 排除」这条检查
@@ -234,8 +326,12 @@ export function validateChecks(raw) {
  * @param {string} root 项目根（`check-structure.mjs` 传 `process.cwd()`）
  * @param {{configPath?:string|null, env?:object}} [opts]
  * @returns {{config:object, path:string|null, errors:Array<{path:string,msg:string}>,
- *            source:'file'|'defaults'}}
- */
+ *            source:'file'|'defaults', declared:Set<string>}}
+ *   `declared` = **这份配置显式写了哪些键**（不含校验补上的默认值）。
+ *   存在的理由：有些判据要区分「用户声明了 X = 默认值」与「用户没写 X」——
+ *   两者解析后的 `config` 相同，但前者是声明、后者是缺省。`productRepo` 就是这种键
+ *   （默认 `false` 是「对任何项目安全」，而本仓必须**声明** `true`）；
+ *   少了这一位，硬门无法区分「这是本产品的仓库」与「用户恰好没关产品规矩」。 */
 export function loadChecks(root, { configPath = null, env = process.env } = {}) {
   const explicit = configPath || (env && env[CONFIG_ENV]) || null;
   const p = explicit ? resolve(String(explicit)) : join(String(root || '.'), CONFIG_REL);
@@ -247,9 +343,10 @@ export function loadChecks(root, { configPath = null, env = process.env } = {}) 
         path: p,
         errors: [{ path: 'config', msg: `指定的配置文件不存在：${explicit}` }],
         source: 'defaults',
+        declared: new Set(),
       };
     }
-    return { config: DEFAULTS, path: null, errors: [], source: 'defaults' };
+    return { config: DEFAULTS, path: null, errors: [], source: 'defaults', declared: new Set() };
   }
 
   let raw;
@@ -261,10 +358,17 @@ export function loadChecks(root, { configPath = null, env = process.env } = {}) 
       path: p,
       errors: [{ path: 'config', msg: `JSON 解析失败（${p}）：${e.message}` }],
       source: 'defaults',
+      declared: new Set(),
     };
   }
   const v = validateChecks(raw);
-  return { config: v.ok ? v.config : DEFAULTS, path: p, errors: v.errors, source: 'file' };
+  return {
+    config: v.ok ? v.config : DEFAULTS,
+    path: p,
+    errors: v.errors,
+    source: 'file',
+    declared: new Set(Object.keys(raw).filter((k) => k !== '$schema')),
+  };
 }
 
 // ── 活文档范围：手写清单的失效方式是结构性的，这里给它配一条覆盖检查 ──────

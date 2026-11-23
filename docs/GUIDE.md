@@ -52,7 +52,7 @@ node scripts/overwatch.mjs
 | 根在但读不出（权限 / 类型） | **3** |
 | 根在且 0 份 | 0 |
 
-### 命令 0b：在我自己的项目里用一个挂了 12 个角色的会话
+### 命令 0b：在我自己的项目里用一个挂了 13 个角色的会话
 
 ```bash
 cd ~/your-project
@@ -342,7 +342,7 @@ NO_COLOR=1 node scripts/oversight-tui.mjs   # 仍交互，但无色
 
 流程：Phase A 规划 → B 并行派发 → C 冲突登记 → E 验收与修复 → F 接力（手动）。主线程只做拆解、派发、汇总，不亲自检索、分析、编码、写作。首次运行问 5 件事（监控范围、接力触发、口吻、禁止操作、ADHD 输出），不答就按默认执行并声明「按默认执行」。
 
-### 12 个角色
+### 13 个角色
 
 | 角色 | 干什么 |
 |---|---|
@@ -353,6 +353,7 @@ NO_COLOR=1 node scripts/oversight-tui.mjs   # 仍交互，但无色
 | `redteam` | 攻击交付物：反例、边界、崩溃场景 |
 | `review` | 质量评分 1–10，指出最致命的 3 个问题 |
 | `acceptor` | 对照预声明标准逐项判定，一票否决 |
+| `verifier` | 核**主线程自己**说过的可机械验证的事实（数字 / 路径 / 命令输出 / grep 与行号）；不核判断 |
 | `repair` | 只在失败原因能落到具体 `file:line` 时接手局部修复；**默认的失败处理是盲重采样，不是它** |
 | `probe` | 只读日志判 `HEALTHY_EXPLORING` / `UNFOCUSED` / `LOOPING` |
 | `relay` | 写接力草稿 |
@@ -360,6 +361,8 @@ NO_COLOR=1 node scripts/oversight-tui.mjs   # 仍交互，但无色
 | `resolution` | 裁决分歧；判不了就说还需要什么证据 |
 
 **`critic` / `redteam` / `review` / `acceptor` / `safety` / `probe` 的 `tools` 里没有 `Edit`**，这是工具白名单的物理限制，不是 prompt 里写「请不要改」。`check-structure.mjs` 会验证。三个不可合并的角色各有原因：锐评管「好不好」、验收管「过不过」，混了就是一个人的左右手；relay 与 safety 合并就是「自己写草稿、自己审红线」；critic 与 redteam 的输入不同，一个看拆解图，一个看交付物。
+
+**`verifier` 是唯一「只读 + `Bash`」的角色**：它必须跑只读命令才能核事实。硬门的规则没有放松 —— 它得在 frontmatter 写 `bashScope: read-only` **且**正文给出 `## 允许的命令` 清单，两条缺一条就红。它同时必须是叶子（无 `Task` / `Agent`）。
 
 ### 什么时候该用编队，什么时候不值得
 
@@ -506,7 +509,7 @@ node --test scripts/state-model.test.mjs
 
 `+ actual` 是脚本现在算出的，`- expected` 是测试认为应该的。先判断哪边对——测试也可能过期。改判定逻辑时先想清楚这个测试保护的是什么行为；行为本身要变就改测试并在提交信息里写明为什么，不要为了让测试变绿而把断言改软。
 
-**51 个测试文件，1998 项全绿**（2026-11-21 实测，`ls scripts/*.test.mjs | wc -l` 可核；条数是 `node --test scripts/` 的 `ℹ tests` = 1998，其中 **1996 条 pass、2 条按平台 `skip`**——skip 只决定跑不跑，照样注册、照样进总数；硬门按同一口径对账）。分管范围：`state-model.test.mjs` 管六态判定、novelty、心跳阈值、Bash 归一化、权重重估；`tui-theme.test.mjs` / `tui-layout.test.mjs` / `tui-meta.test.mjs` / `app-router.test.mjs` / `tui-redesign.test.mjs` / `tui-bugfixes.test.mjs` 管 TUI 的字形、布局、元信息、键位路由与两轮重做；`oversight-tui.test.mjs` 管渲染、净化、草稿拼装、纯文本输出；`watch.test.mjs` 管通知去重与候选派发；`verify-claims.test.mjs` / `stop-signals.test.mjs` / `asked.test.mjs` / `classify-stop.test.mjs` / `measure-interventions.test.mjs` / `measure-execution-phase.test.mjs` / `measure-intervention-cost.test.mjs` 管各条确定性判据与两轮测量口径；`stop-verify-hook.test.mjs` / `analyze-hook-samples.test.mjs` 管 Stop hook 闸门与放行样本分析；`validate-run.test.mjs` / `install-watcher.test.mjs` / `replay-observe.test.mjs` 管运行图校验、自启动与回放；`claim-ledger.test.mjs` 管产出对账（期望 / 自述 / 磁盘 / transcript 四方交叉，含端到端 CLI 链）；`reconciliation-wiring.test.mjs` 管对账**有没有接进派发链路**（模板 / 角色定义 / SKILL.md 的 Phase E 前置门）；`observe-reality-check.test.mjs` 管写前闸在真实语料上的重放口径（窗口截断、沙箱分桶、fork 去重、计数与 decide 复算一致）。`compose-agent-prompt.test.mjs` 管提示词分层拼装（四层顺序、验收需求 × 工具白名单相容、停机条件可判定性、hash 台账与 transcript 对账）。
+**56 个测试文件，2080 项全绿**（2026-11-21 实测，`ls scripts/*.test.mjs | wc -l` 可核；条数是 `node --test scripts/` 的 `ℹ tests` = 2080，其中 **2078 条 pass、2 条按平台 `skip`**——skip 只决定跑不跑，照样注册、照样进总数；硬门按同一口径对账）。分管范围：`state-model.test.mjs` 管六态判定、novelty、心跳阈值、Bash 归一化、权重重估；`tui-theme.test.mjs` / `tui-layout.test.mjs` / `tui-meta.test.mjs` / `app-router.test.mjs` / `tui-redesign.test.mjs` / `tui-bugfixes.test.mjs` 管 TUI 的字形、布局、元信息、键位路由与两轮重做；`oversight-tui.test.mjs` 管渲染、净化、草稿拼装、纯文本输出；`watch.test.mjs` 管通知去重与候选派发；`verify-claims.test.mjs` / `stop-signals.test.mjs` / `asked.test.mjs` / `classify-stop.test.mjs` / `measure-interventions.test.mjs` / `measure-execution-phase.test.mjs` / `measure-intervention-cost.test.mjs` 管各条确定性判据与两轮测量口径；`stop-verify-hook.test.mjs` / `analyze-hook-samples.test.mjs` 管 Stop hook 闸门与放行样本分析；`validate-run.test.mjs` / `install-watcher.test.mjs` / `replay-observe.test.mjs` 管运行图校验、自启动与回放；`claim-ledger.test.mjs` 管产出对账（期望 / 自述 / 磁盘 / transcript 四方交叉，含端到端 CLI 链）；`reconciliation-wiring.test.mjs` 管对账**有没有接进派发链路**（模板 / 角色定义 / SKILL.md 的 Phase E 前置门）；`observe-reality-check.test.mjs` 管写前闸在真实语料上的重放口径（窗口截断、沙箱分桶、fork 去重、计数与 decide 复算一致）。`compose-agent-prompt.test.mjs` 管提示词分层拼装（四层顺序、验收需求 × 工具白名单相容、停机条件可判定性、hash 台账与 transcript 对账）。**本轮新增的四份接在真实链路上**：`delivery-verdict-wiring.test.mjs` 管交付裁决**有没有被调用**（SKILL 的 Phase E 段内 + CLI 六个端到端）；`forbidden-override.test.mjs` 管 `forbiddenContext` 的 frontmatter 覆盖**真的生效**（跑真 CLI 子进程，正反各一组）；`hub-verifier.test.mjs` 管 `oversight-verifier` 被派发且是叶子（跑真硬门 + 副本变异）；`bash-scope.test.mjs` 管只读角色的 `Bash` 出口（`bashScope` + 命令清单两条都要有）。
 
 全跑 `node --test scripts/`。**这个数字以该命令的输出为准**，`check-structure.mjs` 会把它与本文件、`README.md`、`CLAUDE.md` 里写的数字对账——写错了硬门会红。加测试后不需要手改这里，跑一次硬门就知道该改成多少。
 

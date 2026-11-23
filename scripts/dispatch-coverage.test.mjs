@@ -220,10 +220,22 @@ test('元检查 · 表行还在但调用被跳过 → 门必须红（真删 disp
     // 这是决定性实验的更隐蔽形态：`CHECKS` 表完整，只有运行循环里不再调它。
     // 只对 `CHECKS` ↔ `ran` 的元检查**抓不到**「表行被删」那一半，
     // 所以两个用例都要有 —— 它们守的是元检查的两条不同的腿。
+    //
+    // ## 锚点为什么是 `CURRENT_CHECK = name;` 而不是 `fn();`
+    //
+    // 2026-11-24（DF-051）：运行循环加了适用域过滤，`fn()` 前面多了
+    // `if (PRODUCT_REPO === false && domain === 'product') { … continue; }`。
+    // 原锚点 `if (disabled.has(name)) continue;\n  fn();` 因此匹配不到，本用例
+    // 以「前提失效」的形式红了 —— 那是**夹具的失败长得像被测代码的失败**（本文件
+    // 自己在别处记过这个坑）。
+    //
+    // 现在锚在**每一轮都必须执行的那一行**（`CURRENT_CHECK = name;`）：它与域过滤
+    // 无关，只要循环还在跑就一定在。注射点选 `continue` 之后、`fn()` 之前，
+    // 于是「表行还在、只是这一条不跑」这个形态被精确复现。
     const before = readGate(dir);
-    const anchor = 'for (const [name, fn] of CHECKS) {\n  if (disabled.has(name)) continue;\n  fn();';
+    const anchor = '  CURRENT_CHECK = name;\n  fn();';
     const after = before.replace(anchor,
-      'for (const [name, fn] of CHECKS) {\n  if (disabled.has(name)) continue;\n  if (name === \'ledger\') continue;\n  fn();');
+      '  if (name === \'ledger\') continue;\n  CURRENT_CHECK = name;\n  fn();');
     assert.notEqual(after, before, '没有匹配到运行循环 —— 本用例的前提失效了');
 
     writeGate(dir, after);

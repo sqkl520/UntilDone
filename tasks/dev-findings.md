@@ -2510,12 +2510,12 @@ const LIVING_DOCS = [
 
 ---
 
-### DF-050 [open] 硬门会在**被检查的项目**里创建 `tasks/runs/`，第二次跑再报它违规
+### DF-050 [fixed] 硬门会在**被检查的项目**里创建 `tasks/runs/`，第二次跑再报它违规
 
 - 发现于：2026-11-21 框架现状测绘（主线程复算）
 - 位置：`scripts/entry-symlink.test.mjs:38-46` 的 `makeTmp()` → `mkdirSync(join(ROOT,'tasks','runs'), {recursive:true})`；
   经 `scripts/check-structure.mjs` 的 `checkTestCount()`（`:498`）→ `regression-count.mjs` 的 `probeScript()`（`:116`）
-- 证据（在 `/tmp/owport` 复现，一个只有 `scripts/` + `README.md` + `.git` 的外来项目）：
+- 证据（在 `/tmp/owport` 复现，一个只有 `scripts/` + `README.md` + `*.git` 的外来项目）：
   ```
   跑门前：ls -d tasks        → No such file or directory
   node scripts/check-structure.mjs → EXIT=1，59 项违规
@@ -2523,13 +2523,21 @@ const LIVING_DOCS = [
   再跑一次 → [tasks/runs] 私有路径未在 .gitignore 中排除，可能被误提交
              [tasks/runs] 空目录不会被 git 跟踪，clone 后会消失
   ```
-- **注意因果链的边界**：探针只 `import()` 模块、不执行 `test()` 体，所以**不是** `makeTmp` 直接触发。
-  成立的是更弱但同样致命的一条：门在别人项目里跑完会留下 `tasks/runs/`，而这个残留恰好触发自己的
-  `emptyDirs` 与 `privatePaths` 两条检查。触发点未定位到具体一行，**标为已验证现象、未定位机制**。
+- **状态**：**fixed（2026-11-24）**。修前的记载写着「触发点未定位到具体一行，
+  标为已验证现象、未定位机制」—— 本轮把它定位到了，**就是模块级求值**：
+  `entry-symlink.test.mjs:91` 原为 `const LEDGER_DIR = join(makeTmp(), 'ledgers');`，
+  而 `regression-count.mjs:116` 的探针 **import 每一个测试文件**（只登记 `test()`、不跑用例体）。
+  于是**光是数一下测试条数**就执行了 `makeTmp()` 的 `mkdirSync`。
+- **两个修法缺一不可**：
+  1. `entry-symlink.test.mjs` 的 `makeTmp()` / 账本目录改为**惰性**（第一次真的 spawn 时才建）；
+  2. `regression-count.mjs` 的探针注入 `UNTILDONE_TEST_TMP_BASE`，让测试自己的临时目录
+     也进探针沙箱 —— 「数条数」在任何项目里零写盘。
+     只做 2 的话，「不该在 import 阶段建目录」这个原则仍不成立（换个测试文件就会再犯）。
+- **负向证据**：`check-config.test.mjs` 的「DF-050 跑门前后，陌生项目的 git status 必须干净」
+  用 `--untracked-files=all` 的差集判（不是「应该不会写」）。把 `makeTmp()` 改回模块级求值这一条会红。
 - 影响：一个只读性质的检查工具修改了被检查方。在别人的项目里跑一次门，等于给那个项目留了一个红。
-- 建议归属：独立任务（与 DF-051 同批）
 
-### DF-051 [open] 硬门把「本仓库的文档长相」当成「任何项目的合格线」：54 / 59 条违规是这个
+### DF-051 [fixed] 硬门把「本仓库的文档长相」当成「任何项目的合格线」：54 / 59 条违规是这个
 
 - 发现于：2026-11-21 框架现状测绘（主线程复算）
 - 位置：`scripts/check-structure.mjs` 全文；25 条 `CHECKS`（`:2706-2732`）里 17 条无任何「规则怎么算」的配置键
@@ -2543,7 +2551,31 @@ const LIVING_DOCS = [
   要么把 13 条整体 `disabledChecks` —— 那时真正还剩判据的只有 `syntax/importable/emptyDirs/links` 四条，
   而 `importable/unregisteredExports` 的探针表（`PROBE_ARGS` 646 条、`REGISTERED` 583 个名字）
   还写死本仓 48 个模块的导出名。
-- 建议归属：独立任务（本轮不做，见给用户的结论）
+- **状态**：**fixed（2026-11-24）**。**不是**加十几条开关 —— 那要求用户先知道 17 个内部名字，
+  而且下一次有人加一条新的产品规矩，默认又是红的（失效方式是结构性的）。
+  缺的概念是**适用域**：每条检查属于「任何仓库都该成立」（`universal`）还是
+  「本产品自身的规矩」（`product`）。
+  - `check-config.mjs` 新增 `CHECK_DOMAINS`（名 → 域），`CHECK_NAMES` **由它派生**
+    （不再单独维护，两份清单必然漂）；`domainOf()` 对未登记的名字返回 `null`。
+  - `.untildone/checks.json` 新增 `productRepo`（默认 `false` = 对任何项目安全），
+    **本仓显式写 `true`**。`loadChecks()` 新增 `declared`（显式写了哪些键），
+    让「本仓声明了 true」与「没写、恰好用默认」可区分。
+  - `requirePath()` 拆出 `requireProduct()`：本产品自身的产物，`productRepo=false` 时
+    记「本轮没跑」而不是报红（但**不静默** —— 输出末尾单列那一族 + 开关名字）。
+  - 元检查新增一条：`CHECKS` 里有检查没登记域 → 当场红（否则 DF-051 以「新加的一条规矩」复发）。
+- **实测（改前 / 改后，同一夹具：只有 `README.md` + `git init` + `scripts/` 副本）**：
+
+  | | 违规 | 其中「规定产物」 | exit |
+  |---|---|---|---|
+  | 改前 | **66** | **63** | 1 |
+  | 改后 | **0** | **0** | 0 |
+
+  判据本来是「违规 ≤ 5 且都是真问题」，实测 **0** —— 剩下的都是「未跑」（有登记、不阻塞）。
+- **负向证据**：`check-config.test.mjs` 的「DF-051 正向对照」用**同一份夹具**只翻
+  `productRepo` 一位，断言 `true` 时违规数必须比 `false` 时多 10 条以上且点名
+  `docs/CHANGELOG.md` —— 它证明「≤ 5」不是因为门什么都没查。
+  另一条直接断言违规行里**不许**出现「规定产物」这几个字。
+
 
 ### DF-052 [open] 台账 50 条 finding 里，只有 4 条真的属于「框架表达力不足」
 
@@ -2604,7 +2636,7 @@ const LIVING_DOCS = [
   `docs/research/2026-11-13-critique-stop-hook-product.md` 已由红队指出同类问题，**未修**。
 - 建议归属：独立任务（小修，可立刻做）
 
-### DF-056 [open] 台账里 `action:"block"` 有 8 条，真实项目真实拦截 0 次——`block` 字段会骗人
+### DF-056 [fixed] 台账里 `action:"block"` 有 8 条，真实项目真实拦截 0 次——`block` 字段会骗人
 
 - 发现于：2026-11-21 红队 Agent 声称；**主线程独立复算并修正了它的数字**
 - 证据（主线程复算 `tasks/runs/stop-hook` + `%LOCALAPPDATA%/Overwatch/stop-hook` 全部 376 条记录）：
@@ -2623,9 +2655,14 @@ const LIVING_DOCS = [
   对「全部测试通过，1626/1626」拦截。同一个会话、同一个门。
 - 影响：产品主张「一次做完」在「做没做完」这个维度上，实测拦截次数为 0。
   它验的是「你说过要验证的话有没有验证过」，不是「你说做完了到底做没做完」。
-- 建议归属：**产品方向决策**，不是施工项
+- **2026-11-24 处置（fixed）**：本轮按 `docs/roadmap.md` 目标 4 复算并**改写文档定位**。
+  复算仍是 0（412 条里 8 条 block：6 条 `mode:"off"` / 1 条合成会话 / 1 条 e2e 沙箱），
+  详见 `DF-087`。三处改写成「它验的是说过的检查，不是活儿」：`README.md`「边界二」整节、
+  `docs/CAPABILITIES.md` §3、新增 `docs/adr/0005-stop-hook-scope.md`。
+  **代码保持原定位**：没有为了让拦截数变好看而收紧判据 —— 那会造出第二个本条。
+  不修的根因（判据本身不存在）记在 `tasks/accepted-deviations.md` AD-005。
 
-### DF-057 [open] `Stop` hook 对「诚实地停下来」零杠杆：`no-checkable-claim` 占台账 40%
+### DF-057 [triaged] `Stop` hook 对「诚实地停下来」零杠杆：`no-checkable-claim` 占台账 40%
 
 - 发现于：2026-11-21 红队 Agent 实测
 - 证据：台账 376 条里 `no-checkable-claim` **131 条（34.8%）**、`unparsable-input` 214 条（56.9%）。
@@ -2635,9 +2672,15 @@ const LIVING_DOCS = [
   而用户经历的痛恰恰是后者（三轮问「还有哪些没做完」，代码零改动）。
 - **红队的自我限定**：它没能做反向抽样，「真失败率」没有基线，所以只能说「在这 3 个案例上没拦住」，
   不能说「拦不住 X% 的失败」。这一条按该限定收录。
-- 建议归属：产品方向决策
+- **2026-11-24 处置（triaged → AD-006）**：复算确认这个比例更高 —— 按**能解析的** 198 条记录算，
+  `no-checkable-claim` 是 **154 = 77.8%**（原 34.8% 是被 214 条 `unparsable-input` 老格式稀释过的）。
+  两个修法都被否掉并写进 `tasks/accepted-deviations.md` AD-006：
+  ① 把 `UNKNOWN`/`UNCHECKABLE` 改成拦 → 误拦诚实的人，闸会被关掉；
+  ② 让判据认出「诚实停下」→ **在线时判不了**（要看下一句，下一句还没发生；
+  本仓实测过同类问题：`classify-stop.mjs` 在线判定 95.4%→100% `UNCLASSIFIABLE`）。
+  这条**不修**，但 77.8% 这个数现在是 README「边界二」的正文 —— 它证明「本方向没有杠杆」。
 
-### DF-058 [open] 验证白名单靠**脚本名**判断，`exit 0` 的空脚本可骗过；空输出也算通过
+### DF-058 [fixed] 验证白名单靠**脚本名**判断，`exit 0` 的空脚本可骗过；空输出也算通过
 
 - 发现于：2026-11-21 红队 Agent 负向测试
 - 位置：`scripts/verify-claims.mjs` 的 `SCRIPT_VERIFY_NAME_WORDS`（含 lint/test/check/verify/validate 等词）与 `buildEvidenceIndex`
@@ -2645,7 +2688,15 @@ const LIVING_DOCS = [
   `cmd="node --test nonexistent-empty-dir/"` 输出为空 → `allow, all-claims-supported`。
   `ok` 由**退出码**而非输出内容决定。
 - 影响：`docs/research/` 里已由红队点过同一个洞（「写个 exit 0 的空脚本就永远通过」），**至今未堵**。
-- 建议归属：独立任务
+- **2026-11-24 处置（fixed）**：堵住了「输出为空 + exit 0」这一整类，外加顺带发现的
+  「只读命令被当成验证」（`DF-088`）与「空输出的真实形态是宿主占位符」（`DF-089`）。
+  修后四条攻击形态全部 `block`，且 reason 点名那条命令。
+  **另一半是防误伤**：`node --check` / `tsc --noEmit` / `eslint` 按设计静默，
+  专门有用例守着它们仍然放行 —— 没有这一半，修法本身就是错的。
+  仍然**没修**的那一层（断言里的数量不与实测比对）记在 `tasks/accepted-deviations.md` AD-007，
+  实测确认「跑 3 条测试、声称 1626 条」今天仍然放行。
+- 剩余风险：`isReadOnlyCommand` 是命令文本判据，一个**看起来像执行**的只读命令
+  （如 `node -e "读文件"`)仍可能被算成验证。判据不可能完备，代价已量化（0.41% 误伤）。
 
 ### DF-059 [fixed] 台账状态的正则只认 `[a-z]+`：写 `[bogus-state]` 能整条逃过枚举检查
 
@@ -2862,7 +2913,7 @@ const LIVING_DOCS = [
 静默吞掉真导入。**即使决定永远不给载荷加 `render-plan`，那个也必须修。**
 
 
-### DF-064 [open] 「角色在哪」有三套答案、两种配置来源，互相不认
+### DF-064 [fixed] 「角色在哪」有三套答案、两种配置来源，互相不认
 
 - 发现于：2026-11-21 红队第 6 条；主线程复核
 - 证据：
@@ -2878,7 +2929,34 @@ const LIVING_DOCS = [
 - 性质：这**不是 DF-062 引入的**（`roles.mjs` 从来没读过 `checks.json`），
   但 DF-062 的修复新增了 `<pkgRoot>/agents` 这条约定，等于给「角色在哪」添了第三个答案。
 - 影响：任何用 `checks.json` 调过 `agentsDir` 的项目，硬门和派发器看的是两个不同目录。
-- 建议归属：独立任务（先定「谁是权威」，再决定要不要让 roles.mjs 读配置）
+- **状态**：**fixed（2026-11-24）**。
+- **本轮先做了「三者会不会分叉」的实验**（`D:\tmp-ext\r32`：项目里只有 `team/agents/qa.md`，
+  `checks.json = {"agentsDir":"team/agents"}`，`scripts/` 是副本）：
+  ```
+  $ node scripts/check-structure.mjs
+    [team/agents/] 1 个角色定义里没有一个引用 --inbox    ← 硬门读了 team/agents（按配置）
+  $ node scripts/validate-run.mjs --help
+    [validate-run] 角色表 → 框架角色目录 ./.claude/agents（0 个；用户项目里没有 .claude/agents/）
+                                                        ← 运行期读了另一个地方
+  ```
+  **结论：会分叉**，而且分叉时两边都报绿/报红得「像那么回事」——没有一个机制发现它们不一致。
+- **修法是删掉一个真源，不是让 `roles.mjs` 也读配置**（那会添第二个真源，而两份必然漂，
+  本仓为这件事付过账：DF-013 / DF-044 / DF-062）：
+  1. **`checks.json` 不再有 `agentsDir` 键** —— 写进去就是「未知的键」错误
+     （`validateChecks()` 当场报，不静默回落）。
+  2. **硬门的 `AGENTS_DIR` 改为 `rolesDirFor(ROOT)`**（`check-structure.mjs:198`），
+     不再自己拼 `join(ROOT, CFG.agentsDir)`。
+  3. `rolesDirFor()` 恒等于 `<根>/.claude/agents` —— 与宿主加载项目角色的路径**同一个**。
+     唯一真源就是它：纯路径拼接，没有「探测」「候选」这些分支。
+- **修后实测**（本仓）：硬门 `AGENTS_DIR`、`rolesFor(root).dir`、`agentsDir()` 三者
+  逐字相同（`D:\Projects\Overwatch\.claude\agents`），`'agentsDir' in config === false`。
+- **负向证据**（`roles.test.mjs`，2 条）：
+  - `validateChecks({agentsDir:'team/agents'})` 必须 `ok:false` 且理由是「未知的键」；
+  - 硬门源码必须匹配 `const AGENTS_DIR = rolesDirFor(ROOT)` 且**不含** `CFG.agentsDir`
+    —— 判据从源码读但**不用** `src.includes('X(')` 那种能被注释骗过的形态（本仓吃过这个亏）。
+- 代价（如实记下）：**别人的项目不能再用 `checks.json` 把角色目录挪到 `team/agents`**。
+  这是有意的：宿主只认 `<项目根>/.claude/agents/`，允许配置挪走等于让「门看到的角色」
+  与「宿主实际加载的角色」永久不一致 —— 而那正是本条要消灭的东西。
 
 ### DF-065 [open] `displayPath` 在两个模块各导出一份，硬门探针表按名字命中，其中一份从未被验过
 
@@ -3412,7 +3490,7 @@ $ OVERWATCH_STATE_DIR=/tmp/fx node scripts/overwatch.mjs
   CAPABILITIES）里凡写「N 项检查」，N 必须等于 `CHECK_NAMES.length`。
 - 负向：改回 23 → 两处同时红。
 
-### DF-079 [open] `roles.mjs` 声称 frontmatter 可覆盖 `forbiddenContext`，但没有任何调用方消费它
+### DF-079 [fixed] `roles.mjs` 声称 frontmatter 可覆盖 `forbiddenContext`，但没有任何调用方消费它
 
 - 发现于：2026-11-22 用户要求「核实上下文隔离是真在生效还是只是写着」，主线程实测
 - 位置：`scripts/roles.mjs:242`（注释承诺）、`scripts/roles.mjs:374`（读入注册表）、
@@ -3427,18 +3505,28 @@ $ OVERWATCH_STATE_DIR=/tmp/fx node scripts/overwatch.mjs
   给 `acceptor` 注入 `review_score` 会被拒（exit 1，且不落文件）。
 - 影响：**任何依赖 frontmatter 覆盖来收紧独立性的项目会以为自己加了一道闸，而那闸没接线。**
   与本仓台账最高频的缺陷形态同形：配置坏了但看起来一切正常（DF-031/033/039/040/041/047）。
-- 为什么本轮不修：本轮范围是「证据分层规范 + 交付裁决函数」。修它是
-  `checkPromptSpec` 的三行改动 + 一条测试，但它会改变 `acceptor`/`review` 之外
-  所有角色的独立性行为，需要单独的负向验证（改了冻结表语义就要重新证一遍
-  「注入被拒」这条路），混进本轮会让两件事的负向证据互相稀释。
-- 建议修法：
-  1. `checkPromptSpec` 先用注册表的 `role.forbiddenContext`，冻结表只作缺省
-     （`resolveRole(...)?.forbiddenContext ?? FORBIDDEN_CONTEXT[roleId] ?? []`）；
-  2. 补一条测试：「frontmatter 覆盖能改变独立性判定」——正向（加一项 → 被拒）与
-     反向（删一项 → 放行）各一条，否则只测了「不炸」，没测「真的读了」。
-- 建议归属：独立任务（改的是所有角色的独立性判据，与本轮的裁决函数无耦合）
+- **修法（2026-11-23，两处缺一不可）**：
+  1. `checkPromptSpec` 新增 `roles` 参数，第 9 项**先查注册表记录**，冻结表只在记录
+     不存在时作缺省。顺序不能反 —— 反了就等于「覆盖只在冻结表没有该角色时生效」，
+     而那正好是 6 个角色之外的所有人，是一项永远不会被注意到的半修。
+  2. `compose` 的 CLI 把 `rolesFor(root)` 传进 spec。不传的话函数回落到 `defaultRoles()`
+     （框架注册表），项目的 `.claude/agents/` 里的覆盖会在派发时被静默忽略。
+  3. 通过时的理由多一句「（来源：注册表 / 冻结表）」—— 没有它，「覆盖生效」与
+     「恰好没有禁止项」在屏幕上同形。
+- **负向（`scripts/forbidden-override.test.mjs`，6 条，全部 spawn 真 CLI，实跑）**：
+  - 正向：加覆盖 → `independence` ✗、exit 1；
+  - 反向：**去掉**覆盖 → 同样的 `self_assessment` → ✓、exit 0（否掉「永远拒绝」）；
+  - 覆盖是**替换**不是合并：acceptor 只写 `self_assessment` 时 `review_score` 不再拦；
+  - 对照组：acceptor 不写覆盖时冻结表照旧拦住（否掉「改成只读注册表」的半修）；
+  - 回退：删掉 CLI 里的 `roles,` 那一行 → 3 条红（正向 + 替换 + 回退断言），实测贴：
+    ```
+    ✖ 正向：executor 的 frontmatter 加 forbiddenContext: self_assessment → independence 判 ✗
+    ✖ 正向：覆盖是**替换**不是合并 —— 只写一项时，冻结表里的其他项不再拦
+    ✖ 回退：CLI 不再把 roles 传进 spec → 覆盖立刻失效（这条判据必须变红）
+    ```
+- 建议归属：已完成
 
-### DF-080 [open] 交付裁决函数已实现且有 39 条测试，但**还没有任何调用点**
+### DF-080 [fixed] 交付裁决函数已实现且有 39 条测试，但**还没有任何调用点**
 
 - 发现于：2026-11-22 本轮自评（写了 `scripts/delivery-verdict.mjs` 之后回头找调用方）
 - 位置：`scripts/delivery-verdict.mjs` 的 `deliverVerdict()`；应接进
@@ -3457,7 +3545,32 @@ $ OVERWATCH_STATE_DIR=/tmp/fx node scripts/overwatch.mjs
      `tasks/runs/<run-id>/{acceptor,redteam}.md`，调 `deliverVerdict()` 打印裁决；
   3. **必须有负向测试**：「验收 PASS + 红队 BLOCK → 打印 BLOCKED」这条要在
      CLI 层跑一遍，不能只在纯函数层跑。
-- 建议归属：独立任务（需要先定 `redteam.md` 的落盘约定）
+- **修法（2026-11-23，第 2、3 项完成，第 1 项仍未做）**：
+  1. `delivery-verdict.mjs` 底部新增 `parseRedteamReport()`（表头驱动的红队报告读取）
+     与 `main()` + 入口守卫（CLI）。CLI 参数：`--acceptor` / `--redteam` /
+     `--key-paths` / `--required-strong` / `--subject` / `--deviation-refs` / `--json`。
+  2. **退出码就是裁决**：`0 PASS / 1 FAILED / 2 BLOCKED / 3 用法错误`。
+     `FAILED` 与 `BLOCKED` 分开，因为处置不同（修复后重验 vs 补采样/补强证据）。
+  3. `SKILL.md` 的 Phase E 新增第 0 条：先跑裁决，附完整命令 + 四行退出码对照表，
+     并写明「验收 PASS 但红队 BLOCK」是合法输入、裁决给 `BLOCKED`。
+  4. **读不到 ≠ 通过**：`--acceptor` 文件不存在时 exit 3；红队报告解析不出表时折成
+     一条 `dispatch=block` 的 malformed 条目 —— 一份判不了的红队报告不能当成
+     「没有阻断项」，那是静默共识。
+- **负向（`scripts/delivery-verdict-wiring.test.mjs`，14 条，实跑）**：
+  - 把 SKILL 里那条 `node scripts/delivery-verdict.mjs` 换成「主线程自己看着办」→
+    **2 条红**（「Phase E 段内有一条调用」+「回退断言」），实测：
+    ```
+    ✖ SKILL.md 的 Phase E 段内有一条 `node scripts/delivery-verdict.mjs` 调用
+    ✖ 回退：把 Phase E 里那条调用删掉，上面的判据必须变假
+    ```
+  - CLI 六个端到端用例（BLOCKED / PASS 对照 / FAILED / 读不到 / 缺 --acceptor /
+    key_path_undeclared）全部 spawn 真进程；「PASS + 红队 block → exit 2」
+    与「验收不通过 → exit 1」是分开的两条，混成一个码就无从知道下一步做什么。
+- **仍未做的（如实列出，不假装已做）**：第 1 项 —— `validate-run.mjs` 的派发前校验
+  **没有**接过 `keyPaths` 的合法性校验。`keypaths.json` 现在由主线程手写，
+  写成什么形状都不会在派发前被拒；它只会在收活时表现为「所有 block 条目都是
+  `key_path_undeclared`」。判据在收活侧仍然生效，但派发前就拦住更好。
+- 建议归属：主体已完成；`validate-run` 那一半是独立任务
 
 ### DF-081 [fixed] 失败处理的默认路径是「把失败上下文交给 repair」，而那正是锚定源
 
@@ -3506,3 +3619,258 @@ $ OVERWATCH_STATE_DIR=/tmp/fx node scripts/overwatch.mjs
   - 轮次与熔断（每子树 3 次 / 盲重采样 2 次）目前只有**文档判据**，没有脚本在数派发次数。
     要机械判定得让 `claim-ledger` 或 `compose` 记「这是第几次派这个子树」；
   - §8.5 的「7B 以上自修复」没有对照实验，也没有 ADR —— 它是**关闭**的，不是「待做」。
+
+### DF-082 [fixed] 主线程自己不在验证范围内：所有门禁都在核 Spoke，没有角色核 Hub 说过的话
+
+- 发现于：2026-11-23 主线程复盘本会话的错误分布（用户提出「不加架构的前提是架构是对的」）
+- 位置：门禁的角色分工 —— `oversight-acceptor` 核 Spoke 的交付物、
+  `oversight-redteam` 攻击 Spoke 的结论、`oversight-critic` 核拆解图。
+  **没有一条落在主线程的输出上。**
+- 证据（本会话实测）：
+  | 事实 | 数字 |
+  |---|---|
+  | 主线程（Hub）在本会话犯的错 | 7 次 |
+  | 其中被 Spoke（子 Agent）用可复现证据抓住 | 5 次 |
+  | 被用户抓住 | 1 次 |
+  | 自己后来发现 | 1 次 |
+  而 Hub 的错误里**一半是事实类断言**（说了一个数字/一句话）—— 这类错误不需要判断力
+  去发现，只需要有人跑一遍命令。此前没有任何角色被派去做这件事。
+- 影响：Hub 出错 → Spoke 打回 → Hub 修正这条链路是真的在起作用，但它**依赖 Spoke 恰好
+  需要用到那个事实**。一个没被下游用到的数字错了，就一直错着进交付物。
+- 修法：
+  1. `.claude/agents/oversight-verifier.md`（新角色，叶子）：
+     - `tools: Read, Grep, Glob, Bash, Write`，**无** `Task` / `Agent`（深度恒 1 不变）；
+     - 只核**四类可机械验证**的断言：数字 / 文件路径 / 命令输出 / grep 与行号。
+       **不核判断**（判断没有对错可判，塞进去会让它退化成第二份锐评）；
+     - 输入是主线程本轮输出的**原文**，不是自我总结；
+     - 判定只有三值：`成立` / `不成立` / `无法核验`。**「无法核验」不是「成立」。**
+  2. `SKILL.md` 新增 **Phase C.5**（汇总之后、验收之前）：派一个 `oversight-verifier`，
+     附 `compose` 命令、三种结论各自的处置。
+  3. 硬门新增 **`checkHubVerifier`**（`CHECK_NAMES` 28 → 29）：角色文件在、
+     `tools` 无派生工具、且 **SKILL.md 真的派发它**。第三条判据是「派 …」这种动词形态，
+     不是「名字出现过」—— `oversight-probe` 当年正是「定义在、从没派」。
+- **配套改动（必须写下来，因为它改变了硬门的一条规则）**：
+  `oversight-verifier` 是 `readonly: true` 且带 `Bash`。修前 `checkAgents()` 的规则是
+  「只读角色不得含 `Bash`」，理由是 `Bash` 能写盘。但核验类角色的职责**就是**跑只读命令，
+  没有 `Bash` 它只能退化成「读一遍源码觉得它对」—— 那是判断不是核验。
+  规则**没有放松**：`roles.mjs` 新增 `BASH_SCOPES = ['read-only']` 与 `bashScopeOf()`，
+  带 `Bash` 的只读角色必须 ① frontmatter 写 `bashScope: read-only`，**且**
+  ② 正文有 `## 允许的命令` 清单。两条缺一条照样红。认不出的值（`readonly` /
+  `read-only-bash`）一律当没写 —— 与 `truthyFlag` 同理，拼错的值不能静默变绿。
+- **负向（`scripts/hub-verifier.test.mjs`，9 条，硬门那三条跑真身 + 临时副本，实跑）**：
+  - SKILL 的「派」改成「本轮不使用」→ 红，报「只被提到、没被派发」，
+    且**未**误报「从不派发」另一分支（两条判据分支必须分开：功能被删 vs 接线断了）；
+  - `tools` 加 `Agent` + 删掉 SKILL 引用（同一份副本，一次门运行）→ 两条报错同时出现；
+  - 未改动的副本（对照组）→ exit 0（否掉「门永远红」）。
+- **这一轮修了一条自己的慢**：`hub-verifier.test.mjs` 第一版把两处变异分成两条用例，
+  各跑一次真门（各约 20–30 秒），合计 100 秒。改成「同一次运行里放两处独立变异」后
+  降到 17 秒，且**更强**：一次运行里两条报错都必须出现，「只出现一条」会让用例红 ——
+  那正是「某条判据悄悄失效」的形态。
+- 建议归属：已完成。**未做的事**留在这里：
+  - `oversight-verifier` 现在只有一条硬门守「被派发」，**没有任何东西守「派了之后真的在看」**。
+    一条「我核过了，全部成立」的空报告与真核过的报告在屏幕上同形 —— 这是下一个洞，
+    而堵它需要先定义「核验的最小覆盖」（例如「至少 N 条断言 + 每条带命令」），
+    那条判据现在还没写。
+
+### DF-083 [fixed] 五个成功指标一个都没在算，且「规范指定的归属键」实测 0 效率
+
+- 发现于：2026-11-23 目标 2。`docs/spec/success-metrics.md` 定义了五个指标，
+  但 `grep -rn "success-metrics" scripts/` 只命中它自己的文档引用 —— **零读取器**。
+- 位置：新增 `scripts/compute-metrics.mjs`（+ `compute-metrics.test.mjs`，27 条）
+- 证据（真实数据，本机 454 份 transcript / 730 MB）：
+  ```
+  $ node scripts/compute-metrics.mjs
+  | 1 | 每任务调用数 / token | 部分可算 | 454 份 transcript，去重后 55,656 次调用 / 231,056,476 计费 token；任务级归属 0/3 |
+  | 2 | 盲重采样命中率     | 不可算 | 分母可算（3 条 expect / 1 条 prompt），分子不可算 |
+  | 3 | 局部定位准确率     | 不可算 | C2（anchor ∈ outputs）4/5 · C1 机械部分 5/5 |
+  | 4 | 误放行 / 误拦截     | 不可算 | PASS 总数 7 · 1 条链「通过后又判不通过」（候选） |
+  | 5 | 一次 vs 终态成功率  | 不可算 | —（与 2 / 4 卡在同一条记录） |
+  ```
+- **本轮最硬的一条实测**：规范说任务归属用 `expect.nonce` + 首条 user 消息。
+  实测 **0/3**，且 `observe` 自己跑出同一个数：
+  ```
+  $ node scripts/claim-ledger.mjs observe --run 2026-11-13-output-reconciliation --session <会话>
+  扫了 256 份子 agent transcript，没有一份能归属到任务（nonce 对不上，也没有 --task）。
+  ```
+  真因不是 bug，是**数据形态**：nonce 在 transcript 的中段（实测 byte 288,185 / 423,275），
+  来自子 agent 自己 `Read` 了 `claims.jsonl`。`readHeadText` 只读前 64 KiB，永远读不到。
+  代理通道（outputs 写者）也归不了：每个任务有 **2 / 5 / 7** 份候选 transcript。
+- 影响：**「这个框架有没有用」至今没有任何数字**。而这一轮证明了：缺的不是五个能力，
+  是**同一条记录**（`kind:"verdict"`）—— 它一处落盘，指标 2 / 4 / 5 同时成立。
+- 三个口径决定（各自都有实测支撑，写在脚本注释里）：
+  1. token 去重**取最大**，不取第一条。实测 29,678 个 `message.id` 里 **5,177 个「0 与非 0 并存」**；
+     first-wins 少算 **15.0%**（81.65M vs 96.36M）；
+  2. 结局链**按声明轮次排**，不按完成时间。`50ec242b` 的 r2 最后完成，按时间排会得到
+     「不通过 → 不通过 → 通过 → 通过」这条**错的**链；
+  3. 同会话两套 AC 标准**按 AC 编号集合分组**。`71f44160` 的 10 项与 12 项是两个任务，
+     合成一条会串出假链。
+- **样本量必须说的话**：指标 2 / 5 的那两个数（平均重采样 2 次、first_pass 0/2）
+  **样本量不足以支撑结论**。n=2，且两条链全部来自 2026-10-29/30 两天的两个会话，
+  之后（11 月至今）**一条结局都没再产生过**。把它们当规律引用是错的。
+- 负向（都真跑过）：
+  - 删掉 `COMPUTE_METRICS_FNS` 登记 → 「未登记」提示从 0 条回到 **13 条**；
+  - `compute-metrics.test.mjs` 的 27 条里，钉住的是四种失效形态：不可算退化成 0、
+    小样本被当率、重复记录被当多干活、引用格式被当产出。每一条都有对应用例。
+- **这一轮我自己犯的错（必须记）**：初版 `metric1` 对「每任务 × 每 transcript」各读一次全文件，
+  在本仓语料上是 1062 次全文件读，命令 120s 超时被杀两次。改成「nonce 一次扫完 + 头部 64 KiB」
+  之后才能跑完。**如果不是被超时挡住，我会交出一个「跑不完的度量器」而不是一个错的数字** ——
+  后者更坏，因为前者至少会响。
+- 建议归属：已完成（度量器落地）。**未做的**：那三条记录点（`verdict` / `locator` / `usage`）
+  本轮**只写清加在哪，不实现** —— 因为加记录点要改 Phase E 的真实链路，
+  而 Phase E 现在刚接上 `deliverVerdict()`（DF-080），两个改动叠在一起会分不清是谁的回归。
+
+### DF-084 [fixed] 分域修法自己会复发：新加一条检查默认被当成「任何项目都该成立」
+
+- 发现于：2026-11-24 修完 DF-051 后自问「这个修法下一次怎么坏」
+- 位置：`scripts/check-structure.mjs` 的运行循环 + `scripts/check-config.mjs` 的 `CHECK_DOMAINS`
+- 性质：**这是 DF-051 修法自身的失效形态**，不是别人的缺陷。分域把「17 条产品规矩」
+  从任何项目里摘了出去，但摘的依据是 `CHECK_DOMAINS` 这张**手写表**。下一轮有人加一条
+  「本产品自身的规矩」，忘了登记域 → `domainOf()` 返回 `null` → 运行循环保守地当成
+  universal 执行 → **它在每个陌生项目里报红，而 DF-051 以「新加的一条规矩」的形式回来**。
+  这正是本仓最稳定的缺陷形态（手写清单 + 静默默认值）。
+- 修法：运行循环**不**把 `null` 当成 universal 兜底，而是把「未登记」这件事本身变成红 ——
+  `checkDispatchCoverage()` 新增一条比对：`CHECKS` 表里有名字 `domainOf()` 查不到 → fail，
+  报错文案写明「未声明 = 被当成任何项目都该成立，DF-051 会复发」。
+  运行循环仍然保守执行（宁可多查），但**屏幕上红着**，不会被忽略。
+- 负向证据：`check-config.test.mjs` 的「每一条检查都声明了适用域」直接遍历 `CHECK_NAMES`
+  断言 `domainOf(n)` 只能是 `universal` / `product`；拼错成 `universel` 会让那条检查
+  **永远不跑**（`PRODUCT_REPO === false && domain === 'product'` 判等失败），所以域值也一起核。
+- 代价：加一条检查现在必须回答两个问题（叫什么、属于哪一族），而不是一个。
+  这是有意的：那个问题本来就必须有人回答，只是以前默认答案是错的。
+
+### DF-085 [fixed] 「本产品自身的产物不在盘上」被逐份打印：3 条违规后面跟 60 行「未跑」
+
+- 发现于：2026-11-24 修 DF-051 时的第一次实跑（`D:\tmp-ext\pol3`）
+- 位置：`scripts/check-structure.mjs` 的 `requireProduct()` 与输出段
+- 证据：陌生项目里 `✗ 2 项违规` 之后跟 **61 处未跑**，其中 `docReferences` / `docCommands` /
+  `docConstants` 各 15 行（`livingDocs` 清单 16 份 × 3 条判据）。
+- 为什么这是缺陷而不是「详细」：DF-051 的判据是**观感**（「那不是检查，那是要求对方复制
+  我们整套文档」）。60 行「未跑」在屏幕上与 60 行违规没有区别 —— 读者只会去关掉这道门。
+  逐份打印说的是「你这儿少了一份 X」，而事实是「这条检查的覆盖面比它的名字窄」。**两件事。**
+- 修法：按检查聚合成**一行**（`检查名（N 处）`），并在摘要行里计入
+  「N 条因本产品的产物不在盘上而未覆盖」。`notApplicable`（整族不执行）与它分开列 ——
+  那是「这一族对你不适用」，不是「这条检查没查全」。
+- 负向证据：`check-config.test.mjs` 的陌生项目用例断言输出里必须出现
+  「本产品自身的规矩本轮不适用」与开关名字（不静默），同时违规行数 ≤ 5。
+  把聚合改回逐份打印**不会**让它红 —— 那一条靠的是「读者会不会被淹」这个判断，
+  不可机械判定。**如实记下：这一条修法没有测试守着，只有一次实测的前后对比。**
+
+### DF-086 [fixed] 测试文件模块级读本仓夹具，让「数测试条数」在别人项目里报假错
+
+- 发现于：2026-11-24 修 DF-050 时连带发现（同一次实跑的另一个症状）
+- 位置：`scripts/compose-agent-prompt.test.mjs:56-57`（修前）
+  `const ACCEPTOR_TEXT = read('.claude/agents/oversight-acceptor.md');`
+- 证据：陌生项目里结构门报
+  `[scripts/compose-agent-prompt.test.mjs] import 时就抛错，它的测试一条都不会被注册：ENOENT … .claude/agents/oversight-acceptor.md`
+- 性质：**这条报错本身是对的**（import 就炸的测试文件在全量跑里整块消失且不报错，
+  结构门该报它）。但它指向的是一份**只在本仓才有意义的夹具**，不是对方项目的缺陷。
+  与 DF-050 同源：`regression-count.mjs` 的探针会 import 每一个测试文件。
+- 修法：改**惰性读取**（`roleTextOrNull()`），import 永不抛；缺夹具时那两条用例
+  `t.skip(NEED_AGENTS)` 并写明原因 —— **不假装通过**。
+  刻意**不**写成「读不到就返回空串」：那会让断言对着空文本跑，失败信息变成
+  「tools 里没有 Bash」而不是「角色定义不在盘上」，一句指向错地方的诊断。
+- 负向证据：删掉角色目录后跑这两条用例必须 `skip`（不是 `pass`、不是 `fail`）；
+  结构门的「陌生项目」用例不再出现那条 import 报错。
+- **同类风险（未做，记在这里）**：`grep -n "^const .*readFileSync\|^const .*mkdtempSync" scripts/*.test.mjs`
+  还能再扫一轮 —— 本轮只修了实跑里**看得见**的那一处。别的测试文件如果在模块级读本仓夹具，
+  在陌生项目里会有同样的形态，只是当前没被 `regression-count` 的探针暴露（探针只 import 不跑）。
+
+### DF-087 [fixed] Stop hook 对「真实项目做没做完」实测拦截 0 次，而文档写的是「拦住过 2 条」
+
+- 发现于：2026-11-24 按 `docs/roadmap.md` 目标 4 复算（主线程亲自跑，不是 Agent 声称）
+- 位置：`README.md`「当前进度」表 + 旧「为什么不能自动接力」章节；`docs/CAPABILITIES.md` §3
+- 证据（复算 `tasks/runs/stop-hook/` + `%LOCALAPPDATA%/Overwatch/stop-hook/` 全部 412 条）：
+  ```
+  总 412 ｜ unparsable-input 214（51.9%，全是 11-18 前老格式）
+  能解析 198 ｜ no-checkable-claim 154 = 77.8%
+  action:"block" 8：
+    mode:"off" 观察记录            6   ← 不是拦截
+    合成会话（live-probe-2）        1   ← 不是真实项目
+    真 UUID 但 transcript 在         1   ← e2e 沙箱 hook-e2e-sandboxes/PC3-proj
+      e2e 沙箱（106aa1ae-…）
+  → 真实项目、真实会话的真实拦截 = 0。8 条 block 里 7 条不是真拦截。
+  ```
+  那唯一一条在**真实主机会话**上的判定（`ea4ef562-…`，87 条、跨 11-18→11-23，33 条有可核对断言）
+  全部 `allow`，**0 条被拦**。且被拦的 `106aa1ae` 之后**零条后续记录** —— 无「拦后补齐」闭环。
+- 影响：上一版 README 写「台账 355 条判定里拦住过 2 条」。355 是当时全量、2 是
+  `mode:"block"` 那两条 —— 而其中一条是合成会话、一条在 e2e 沙箱。**两个都不是真实项目。**
+  这不是精度问题，是把「脚本跑过这条路」当成了「它在真实项目里生效」。
+- 修法：README 新开「边界二」整节（判定表 + 412 条实测 + 怎么读这些数字），
+  功能条目 / 进度表 / CAPABILITIES §3 / 新增 ADR-0005 四处同步写实。
+  **没有改代码让它「看起来能拦更多」** —— 那会造出第二个 DF-056。
+- 建议归属：已完成（文档纠偏）。代码定位见 AD-005 / AD-006。
+
+### DF-088 [fixed] 验证白名单里「读一个名字像检查的文件」被算成一次验证
+
+- 发现于：2026-11-24 修 DF-058 时顺带负向测试 `isVerificationCommand`
+- 位置：`scripts/verify-claims.mjs` 的 `VERIFY_CMD_RE` 末段（裸文件名分支）
+- 证据（修前实测，四条全返回 `true`）：
+  ```
+  grep -n foo check-x.mjs        → true   ← 只是在读文件
+  cat check-gate.mjs             → true
+  git log --oneline check.mjs    → true
+  tail -20 scripts/check-structure.mjs → true
+  ```
+  测试里原本就把这条**钉成「本批未修」**（注释原文：「旧名字支至今按子串命中 ——
+  修它之前，这条断言保持 true 才是诚实的」）。
+- 影响：`vague-completion` 这一族要抓的是「一次检查都没做」，而任何会话都有大量
+  Read/grep 观测。只要被观测的文件名里带 `check`/`test`，这条就算「验证过」—— 本族形同虚设。
+- 修法：不动那条分支（它同时承载 `./run-tests.sh` 这类无解释器执行的正当用途），
+  在 `isVerificationCommand` **末尾**加只读否决 `isReadOnlyCommand()`：
+  整条命令按 `&& | || ;` 与换行切段，**每一段**去掉 `cd`/`export` 前缀后都要以读取动词开头，
+  且段内无执行动词、无重定向。任何一段不满足 → 不是只读 → 保持原判。
+- 实测代价（250 份真实 transcript、2207 次判为验证的调用）：翻成 false 的 **9 次（0.41%）**，
+  逐条看过全是真的只读（`grep … | head`、`sed -n '45,70p' run-tests.sh`、`head -50 build-apk.sh`）。
+- 负向证据：`verify-claims.test.mjs`「DF-058 负向：摘掉只读否决之后…」+ 原「既存缺陷」
+  那条测试**翻转**成「已修」并扩成 5 个只读形态 / 5 个执行形态。
+- 建议归属：已完成。
+
+### DF-089 [fixed] 「空输出」在真实语料里主要是宿主占位符，不是空串 —— 只判空串会漏 94%
+
+- 发现于：2026-11-24 修 DF-058 时，先量了「真实语料里空输出长什么样」而不是直接写判据
+- 位置：`scripts/verify-claims.mjs` `isSilentOutput()`
+- 证据（250 份真实 transcript、53,896 个 `tool_result`）：
+  ```
+  空字符串                                272 个
+  (Bash completed with no output)         437 个
+  (PowerShell completed with no output)    12 个
+  → 真实「空输出」里 94% 是宿主占位符，不是空串
+  ```
+  而**真实验证命令**里的空输出很少：363 次验证调用中 4 次（1.1%），
+  全是 pytest / `python -m …` 这类「真跑了但没打印」的形态。
+- 影响：只写 `text.trim() === ''` 的判据会**看起来修好了 DF-058，实际漏掉 94%**。
+  这个仓库已经吃过多次「判据写对了方向、量错了形态」的亏。
+- 修法：`EMPTY_OUTPUT_RE` 认两种形态并**同判**。另外必须区分第三件事：
+  「`content` 字段**缺失**」只出现在合成夹具里（实测 `replay-stop-gate.test.mjs`），
+  语义是「我们没读到输出」，不是「输出是空的」—— 混为一谈会把「我没读到」说成「你造了假」。
+- 代价（实测回归）：第一版没做这个区分，`replay-stop-gate.test.mjs` 从 4/4 变 2/4。
+  修法即上面那条区分，并补了一条测试钉住它。
+- 建议归属：已完成。
+
+### DF-026 补充（2026-11-23）：flaky 范围比原记录大，且全量跑必然出现
+
+**实测（本轮四个 Agent 并行 + 守护进程在跑时）**：
+```
+node --test scripts/   → tests 2080 / pass 2073 / fail 5  （两次）
+单跑同一批            → tests 12 / pass 12 / fail 0
+```
+**在干净 HEAD 的 worktree 上同样失败**：`tests 1998 / pass 1990 / fail 6`。
+所以**不是本轮改动引入的**，是既有问题。
+
+失败的 4-5 条全部集中在 `watch.test.mjs` 的 `DF-028` 组（进程存活探测）：
+- `DF-028 负向②：PID 存在（用自己的 PID 模拟）→ 必须报「还在但卡住了」`
+- `DF-028 负向③：PID 被复用（同 PID、启动时间对不上）→ 不得判成「还活着」`
+- `DF-028：心跳停了 + 进程还在 → 结论里说「卡住了，先看日志」`
+- `DF-028 写见证：claimOwnership 会带上 pid 与 startedAt，且跨调用稳定`
+
+共同特征：单条耗时 **5-6 秒**（正常应在百毫秒级），等于撞上了某个超时阈值。
+
+**推测（未验证）**：这组测试要 spawn `powershell -Command "Get-Process ..."` 或调
+`process.kill(pid, 0)`。并发负载下 powershell 启动慢，超过内部超时。
+**没有验证过**，不当作结论。
+
+**为什么没在本轮修**：它不在四个目标里，而且要修必须先稳定复现——
+本仓有先例（`DF-017` / `DF-026` 原文）：「没复现就改判据等于把『不知道』写成『知道』」。
+
+**影响**：每次全量测试都会红 4-6 条，导致「全绿才能提交」这条规则实际上做不到。
+这不是小问题——它会让所有人对红警免疫。

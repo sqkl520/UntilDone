@@ -355,10 +355,16 @@ export function stopConditionProblem(stop) {
  *  返回 `{ok, checks[], errors[], warnings[]}`。`checks` 按 REQUIRED_ELEMENTS 逐项给结果，
  *  这就是「提示词的可对账清单」——每一项都能回答「凭什么说它满足」。
  *
- *  `roleText` 让工具相容性可判；传 null 表示调用方自己已解析（测试与 CLI 都走这条）。 */
+ *  `roleText` 让工具相容性可判；传 null 表示调用方自己已解析（测试与 CLI 都走这条）。
+ *
+ *  `roles` 是**角色注册表**（`roles.mjs` 的 `discoverRoles()` / `rolesFor()` 的结果）。
+ *  独立性判定必须读它的 `forbiddenContext`，因为那份值已经把 frontmatter 的覆盖算进去了
+ *  （见 `checkPromptSpec` 第 9 项与 DF-079）。不传时回落到 `defaultRoles()`（框架注册表）；
+ *  那时 `role` 对应的记录仍带着 frontmatter 覆盖 —— 冻结表只在这条记录**不存在**时才用。 */
 export function checkPromptSpec({
   role,
   roleText = null,
+  roles = null,
   task,
   acceptance = [],
   shape,
@@ -480,15 +486,41 @@ export function checkPromptSpec({
   //  查表的键**先按传入的名字，再按 id**。原来只按 `role` 查，于是
   //  `--role oversight-acceptor` 拿到的是空清单 —— 「不该给的东西」照样被放行，
   //  而检查结果写着「该角色无额外禁止项」。名字的两种写法必须落到同一条记录上。
+  //
+  // ## 为什么读注册表，而不是直接读冻结表（DF-079）
+  //
+  //  `roles.mjs` 的注释写着「角色也可以在 frontmatter 写 `forbiddenContext: a, b` 覆盖它」，
+  //  注册表**确实**读到了这个字段。但修前这一项直接查 `FORBIDDEN_BY_ID[roleId]`，
+  //  于是**覆盖没有任何调用方消费** —— 实测（2026-11-22）：给 executor 的 frontmatter
+  //  加 `forbiddenContext: self_assessment`，注册表里 `executor.forbiddenContext`
+  //  是 `["self_assessment"]`，而这里仍判 `independence = true`，理由是
+  //  「该角色无额外禁止项」（冻结表里没有 executor）。
+  //
+  //  后果是**配置坏了但看起来一切正常**：项目以为自己加了一道闸，而那道闸没接线。
+  //
+  //  修法：**先查注册表记录，冻结表只在记录不存在时作缺省。** 顺序不能反 ——
+  //  反了就等于「覆盖只在冻结表没有该角色时生效」，而那正好是 6 个角色之外的所有人，
+  //  是一项永远不会被注意到的半修。
+  //
+  //  `roles` 没传时用 `defaultRoles()`（框架注册表）：那也是带 frontmatter 覆盖的同一份数据。
+  //  两者都拿不到记录时（角色名写错），退回冻结表 —— 与修前逐字相同，是**保守方向**：
+  //  冻结表只可能更严，不会更松。
   const roleId = (() => {
     const hit = resolveRole(defaultRoles(), role);
     return hit ? hit.id : String(role || '');
   })();
-  const forbidden = FORBIDDEN_BY_ID[roleId] || FORBIDDEN_BY_ID[role] || [];
+  const registry = Array.isArray(roles) ? roles : defaultRoles();
+  const record = resolveRole(registry, role)
+    || registry.find((r) => r && (r.id === roleId || r.name === roleId));
+  const forbidden = record && Array.isArray(record.forbiddenContext)
+    ? record.forbiddenContext
+    : (FORBIDDEN_BY_ID[roleId] || FORBIDDEN_BY_ID[role] || []);
   const present = forbidden.filter((k) => context && Object.prototype.hasOwnProperty.call(context, k));
   mark('independence', present.length === 0,
     `注入了不该给 ${role} 的内容：${present.join(', ')}——锚定无法用 prompt 撤销（契约 §3）`,
-    forbidden.length ? `未注入 ${forbidden.join('/')}` : '该角色无额外禁止项');
+    forbidden.length
+      ? `未注入 ${forbidden.join('/')}（来源：${record ? '注册表' : '冻结表'}）`
+      : '该角色无额外禁止项');
 
   // 10) 上次失败通知的形态（契约 §8.2）
   //
@@ -1145,6 +1177,11 @@ function main(argv) {
     const spec = {
       role, roleText, task: st.goal, acceptance, shape: st.shape, outputs,
       stopCondition, nonce, injected, context,
+      // **注册表必须传进去**（DF-079）。不传的话第 9 项回落到 `defaultRoles()`
+      // （框架注册表），而 CLI 解析角色用的是 `rolesFor(root)` —— 项目的 `.claude/agents`
+      // 里写的 `forbiddenContext` 覆盖会在派发时被静默忽略：角色解析对了、文件读对了，
+      // 只有独立性判据看的是另一份清单。这正是「配置坏了但看起来一切正常」的形态。
+      roles,
       // 契约 §8.2：这一项要是没传进 spec，「失败通知必须无内容」这条检查在真实调用中
       // 恒真 —— 那正是缺陷 B（`context` 恒传 `{}`）的同一形态，不能重演。
       priorFailure: args['prior-failure'] ? String(args['prior-failure']) : null,

@@ -10,6 +10,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+
+import { validateChecks } from './check-config.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -701,7 +703,7 @@ test('端到端：validate-run 在别人的项目里按**项目的**角色表判
 // 载荷形态的本质是「脚本的物理位置在 `<payload>/scripts`」，而 `import.meta.url`
 // 由文件位置决定，进程内无法伪造。同 DF-062 的原始复现路径一致。
 
-test('DF-062 端到端：载荷形态（<payload>/agents）下 validate-run 认到 12 个角色', () => {
+test('DF-062 端到端：载荷形态（<payload>/agents）下 validate-run 认到全部角色', () => {
   const src = tmp();
   const out = join(src, 'payload');
   const proj = tmp();
@@ -726,7 +728,9 @@ test('DF-062 端到端：载荷形态（<payload>/agents）下 validate-run 认�
     const text = `${r.stdout}${r.stderr}`;
     assert.match(text, /角色表 → 框架角色目录/, text);
     assert.ok(!/（0 个/.test(text), `载荷形态下角色表是空的 —— DF-062 原样复发：\n${text}`);
-    assert.match(text, /（12 个/, text);
+    // **不钉死总数**：角色数会变（2026-11-23 加了 verifier）。判据是「非零」——
+    // 上一行已经否掉了「（0 个」，这里再要求读得到一个数字。
+    assert.match(text, /（\d+ 个/, text);
     assert.match(text, /框架角色目录 .*agents/, `来源没指向 <payload>/agents：\n${text}`);
   } finally {
     rmSync(src, { recursive: true, force: true });
@@ -768,4 +772,42 @@ test('端到端：compose 用项目的角色 + 项目的 agentPrefix，模板仍
       `模板仍然走项目根（缺陷 2 的后半）：\n${out}`);
     assert.equal(r.status, 0, out);
   } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+
+// ── DF-064：「角色在哪」只有一套答案 ──────────────────────────────────
+//
+// 修前有三套：`checks.json` 的 `agentsDir`（硬门用）、`roles.mjs` 的
+// `agentsDirCandidates()` / `rolesDirFor()`（运行期用）、宿主自己加载的
+// `<项目根>/.claude/agents/`。三者可以各不相同，而**没有一个机制发现它们分叉了**。
+//
+// 修法不是「让 roles.mjs 也读 checks.json」（那是给「角色在哪」添第二个真源，
+// 而两份真源必然漂 —— 本仓为这件事付过账：DF-013/044/062）。修法是**删掉一个真源**：
+//   · `checks.json` 不再有 `agentsDir` 这个键（写进配置就是「未知的键」错误）；
+//   · 硬门的 `AGENTS_DIR` 从 `rolesDirFor(ROOT)` 取，不再自己拼；
+//   · `rolesDirFor()` 恒等于 `<根>/.claude/agents` —— 与宿主加载项目角色的路径**同一个**。
+// 剩下的唯一真源是 `rolesDirFor()`，它是纯路径拼接，没有「探测」「候选」这些分支。
+//
+// 下面两条钉住这个结论的可判定形态：配置键不存在，且三者指向同一个字符串。
+
+test('DF-064「角色在哪」只有一套答案：checks.json 不再接受 agentsDir 键', () => {
+  const v = validateChecks({ agentsDir: 'team/agents' });
+  assert.equal(v.ok, false,
+    'agentsDir 仍是合法配置键 —— 那意味着「角色在哪」又有两套答案（DF-064 原样复发）');
+  assert.ok(v.errors.some((e) => e.path === 'agentsDir' && /未知的键/.test(e.msg)),
+    `agentsDir 必须以「未知的键」被拒（配置坏了要当场报，不静默回落）：${JSON.stringify(v.errors)}`);
+});
+
+test('DF-064 硬门的 AGENTS_DIR 与运行期的 rolesDirFor() 是同一个字符串', () => {
+  // 硬门不是模块（一 import 就跑完全部门禁并 exit），所以从源码读它的取法。
+  // 判据必须是「它**没有**自己的答案」，不是「它提到了 rolesDirFor」——
+  // 后者能被注释骗过（本仓已吃过 `src.includes('X(')` 的亏）。
+  const src = readFileSync(join(REPO, 'scripts', 'check-structure.mjs'), 'utf8');
+  assert.match(src, /const AGENTS_DIR = rolesDirFor\(ROOT\)/,
+    '硬门的 AGENTS_DIR 不是从 rolesDirFor() 取的 —— 它又有了自己的答案（DF-064）');
+  assert.ok(!/CFG\.agentsDir/.test(src),
+    '硬门仍在读 CFG.agentsDir —— 那个键已经删了，这一行会永远拿到 undefined');
+  // 运行期那一侧：`rolesDirFor(root)` 恒等于 `<root>/.claude/agents`，与宿主加载
+  // 项目角色的路径逐字相同。这条同时证明「三者同一个」的第三项。
+  assert.equal(rolesDirFor('/proj'), join('/proj', '.claude', 'agents'));
 });

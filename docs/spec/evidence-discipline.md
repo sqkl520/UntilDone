@@ -178,32 +178,47 @@ criteria:
    独立性检查不过 → exit 1，输出 `independence — 注入了不该给 acceptor 的内容：review_score`
    且不落文件（`existsSync(out) === false`）。
    ```
-3. **冻结表来自 `roles.mjs` 的 `FORBIDDEN_CONTEXT`**：
+3. **独立性清单来自注册表**（`scripts/roles.mjs` 的 `discoverRoles()`）：
    `review: [self_assessment, execution_log, weak_points]`、
    `acceptor: [...] + review_score`、`redteam: [self_assessment, weak_points]`。
+   **frontmatter 可以覆盖它**（`forbiddenContext: a, b`，覆盖而非合并）——
+   覆盖会被 `checkPromptSpec` 第 9 项真的读到（见 §1.7.3）。
 
-### 1.7.3 已知缺口：frontmatter 的 `forbiddenContext` 覆盖路径是死的（DF-079）
+### 1.7.3 frontmatter 的 `forbiddenContext` 覆盖：已生效（原 DF-079，2026-11-23 修复）
 
-`scripts/roles.mjs:242` 的注释写着「角色也可以在 frontmatter 写 `forbiddenContext: a, b` 覆盖它」。
-注册表**确实**读到了这个字段（`discoverRoles()` 返回的 `role.forbiddenContext` 是对的），
-但**没有任何调用方消费它** —— `compose-agent-prompt.mjs` 的独立性检查直接查
-`FORBIDDEN_BY_ID[roleId]`（来自 `roles.mjs` 的冻结表），不查注册表里的那份。
+修前这是一条**死的路径**：`scripts/roles.mjs` 写着「角色也可以在 frontmatter 写
+`forbiddenContext: a, b` 覆盖它」，注册表**确实**读到了这个字段，但
+`checkPromptSpec` 直接查冻结表 `FORBIDDEN_BY_ID[roleId]` —— 覆盖**没有任何调用方消费**。
 
-实测（2026-11-22，临时项目 + 一份 `oversight-executor.md` 副本，往 frontmatter 加 `forbiddenContext: self_assessment`）：
+实测症状（2026-11-22，临时项目 + 一份 `oversight-executor.md` 副本）：
 
 ```
 注册表 executor.forbiddenContext = ["self_assessment"]
 compose independence = true | 该角色无额外禁止项      ← 覆盖没生效
 ```
 
-**后果**：任何依赖 frontmatter 覆盖来收紧独立性的项目，会以为自己加了一道闸，
-而那道闸没有接线。这与本仓台账里最高频的缺陷形态同形：**配置坏了但看起来一切正常**。
+后果是**配置坏了但看起来一切正常**：项目以为自己加了一道闸，而那道闸没接线。
 
-**状态**：已登记 `DF-079`，本轮**不修**（本轮范围是规格 + 裁决函数）。
-修法方向（给下一个接手的人）：`checkPromptSpec` 应优先用注册表里的 `forbiddenContext`，
-冻结表只作缺省；并补一条测试，断言「frontmatter 覆盖能改变独立性判定」。
-在那之前，**本节的约束只在冻结表覆盖的角色上成立**（`review` / `acceptor` / `redteam` /
-`critic` / `probe` / `safety`），别的角色写了覆盖**不会生效**。
+**现在的实现（两处，缺一不可）**：
+
+1. `checkPromptSpec` 收 `roles` 参数，第 9 项**先查注册表记录**，
+   冻结表只在记录不存在时作缺省。顺序不能反 —— 反了就等于「覆盖只在冻结表没有该角色时
+   生效」，而那正好是 6 个角色之外的所有人，是一项不会被注意到的半修。
+2. `compose` 的 CLI 把 `rolesFor(root)` 传进 spec。不传的话函数回落到 `defaultRoles()`
+   （框架注册表），**项目的**覆盖在派发时会被静默忽略。
+
+通过时的理由会写「（来源：注册表 / 冻结表）」—— 没有它，「覆盖生效」与
+「恰好没有禁止项」在屏幕上同形。
+
+**可复算的验证**（`scripts/forbidden-override.test.mjs`，6 条，全部 spawn 真 CLI）：
+
+| 场景 | 期望 |
+|---|---|
+| executor 加 `forbiddenContext: self_assessment`，注入 `self_assessment` | exit 1，`independence` ✗ |
+| 去掉覆盖，同样的注入 | exit 0，`independence` ✓ |
+| acceptor 只写 `self_assessment`，注入 `review_score` | exit 0（覆盖是**替换**不是合并） |
+| acceptor 不写覆盖，注入 `review_score` | exit 1（冻结表照旧生效） |
+| 回退：CLI 不再传 `roles` | 前两条 + 回退断言，共 3 条红 |
 
 ### 1.7.4 这条规则不能机械判定的部分
 
@@ -401,15 +416,38 @@ compose independence = true | 该角色无额外禁止项      ← 覆盖没生�
 也就是**下一轮**，不是这一轮的补救。事后往 `keyPaths` 里加一条就能让红队的阻断失效，
 那等于给阻断开了一个后门，而这正是硬约束 4 存在的理由。
 
-## 10. 交付裁决函数的调用位置
+## 10. 交付裁决函数：调用位置与调用形态
 
-| 调用点 | 时机 | 输入从哪来 |
+| 调用点 | 时机 | 输入从哪来 | 形态 |
+|---|---|---|---|
+| 派发红队前 | Phase B | `criteria` 来自 `task-graph.json` 的子树（`keyPaths` / `requiredStrong`），写进红队提示词的**预先声明**段 | 函数调用（`deliverVerdict()`） |
+| 收活时 | Phase E 第 0 步 | `--acceptor tasks/runs/<id>/acceptor.md`、`--redteam tasks/runs/<id>/redteam.md`、`--key-paths tasks/runs/<id>/keypaths.json`；`--deviation-refs tasks/accepted-deviations.md` | **CLI**：`node scripts/delivery-verdict.mjs` |
+
+**收活那条已经接上了**（2026-11-23，DF-080 关闭）。`SKILL.md` 的 Phase E 第 0 条就是它，
+退出码就是裁决：
+
+| exit | 裁决 | 下一步 |
 |---|---|---|
-| 派发红队前 | Phase B | `criteria` 来自 `task-graph.json` 的子树（`keyPaths` / `requiredStrong`），写进红队提示词的**预先声明**段 |
-| 收活时 | Phase D 之后 | `acceptor` 与 `redteam` 的报告文本；`deviationRefs` 来自 `tasks/accepted-deviations.md` |
+| 0 | `PASS` | 交付 / 进 Phase F |
+| 1 | `FAILED` | 修复后**完整**重验（§8） |
+| 2 | `BLOCKED` | 按输出的「回流」行处置（补采样 / 补强证据 / 补声明） |
+| 3 | 用法错误 | 先补报告文件，**不许当成通过** |
 
-> **当前状态：函数已实现并被测试钉住，但尚未接进 `validate-run.mjs` 的派发前校验，
-> 也没有一个读 `redteam.md` 的收活脚本。** 这一条是诚实的缺口，不是遗漏：
-> 接线需要一个 `tasks/runs/<run-id>/redteam.md` 的落盘约定与一个读取器，
-> 而本轮范围是规格与裁决函数本身。登记为 `DF-080`。
+三个设计点值得单独说，因为它们都是「读不到 ≠ 通过」的具体形态：
+
+1. **`--acceptor` 文件不存在 → exit 3**，不回落成「空报告 → 没有阻断项」。
+   「你说要给但文件不在」与「函数层的缺省」是两件事，后者只给**调用方已经决定不提供**
+   的场景用。
+2. **红队报告解析不出表 → 折成一条 `dispatch=block` 的 malformed 条目**。
+   一份判不了的红队报告不能当成「没有阻断项」，那正是 §2 说的静默共识。
+3. **报告的解析是表头驱动的**：列名换了措辞读对，列序换了也读对。按固定列号读会把
+   「说明」读成 `key_path`，于是强证据挂在一条不存在的路径上，判据永远判不过，
+   而屏幕上只看得出「红队判了阻断」——`parseAcceptorVerdict()` 的 `key_path` 一段
+   记着同一件事。
+
+**还没做的（如实列出）**：`validate-run.mjs` 的派发前校验**没有**接过 `keyPaths` 的
+合法性校验。也就是说，`keypaths.json` 现在由主线程手写，写成什么形状都不会在派发前被拒；
+它只会在收活时表现为「所有 block 条目都是 `key_path_undeclared`」。
+这条缺口的方向是对的（判据在收活侧仍然生效），但**派发前就拦住**比收活时才发现好 ——
+登记为后续任务，不假装已做。
 

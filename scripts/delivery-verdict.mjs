@@ -33,11 +33,17 @@
  * ## 为什么是纯函数
  *
  * 裁决会被三类调用方用：`validate-run` 的派发前校验、`compose` 派出红队时写进
- * 提示词的**预先声明**、以及将来读 `redteam.md` 的收活流程。它必须能被单测
- * 逐个分支钉死，所以这里不读盘、不看时钟、不读环境变量。
+ * 提示词的**预先声明**、以及收活流程（本文件的 CLI）。`deliverVerdict()` 本身
+ * 必须能被单测逐个分支钉死，所以它不读盘、不看时钟、不读环境变量。
+ * 读盘/解析报告的部分在**本文件底部**（`parseRedteamReport` / `main`），
+ * 它们是能力的入口，不是裁决本身 —— 把两者混在一起，裁决就再也无法被逐支钉死。
  *
  * 零依赖。
  */
+
+import { readFileSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /** 红队裁决的三档。**顺序无关**，判据是标签本身。
  *
@@ -569,4 +575,319 @@ export function deliverVerdict({
     phases: [],
     riskUnlogged: unlogged,
   };
+}
+
+// ── 红队报告的读取（`redteam.md` 的唯一解析入口）───────────────────────
+//
+// ## 为什么这一段必须在同一个文件里
+//
+// `parseAcceptorVerdict()` 与 `parseRedteamReport()` 是同一件事的两半：
+// 裁决函数的两个输入各有一个来源，而它们的**格式判据必须来自同一份规范**
+// （`oversight-redteam.md` 的「反例列表」表 / `oversight-acceptor.md` 的「逐项判定」表）。
+// 分成两个文件之后，改一个格式就会只改一处 —— 而那正是本仓「十种模板、零个解析器」
+// 的老病：红队的列名换了，收活脚本读到空数组，然后「没有阻断项」与「没读到」同形。
+//
+// ## 表格判据是**表头驱动**的，不按固定列序猜
+//
+// 理由与 `parseAcceptorVerdict()` 的 `key_path` 一段逐字相同：按列号读会把
+// 「说明」列读成 `key_path`，然后强证据挂在一条不存在的路径上，判据永远判不过，
+// 而屏幕上只看得出「红队判了阻断」。表头里有哪一列，就读哪一列。
+
+/** 红队反例表的列名 → 字段。**别名并列写**：红队是模型写的，列名会有措辞漂移，
+ *  而「漂了就读不到」的后果是整份报告被判 malformed —— 那对一次真实交付是过重的惩罚。
+ *  但**不猜语义**：只接受近义词，不接受「同义词表里没写的任何东西」。 */
+const RT_COLUMNS = Object.freeze({
+  id: /^#?$|^\s*$|编号|^id$/i,
+  trigger: /触发|trigger/i,
+  failure: /失败表现|后果|fail/i,
+  severity: /严重|severity/i,
+  dispatch: /dispatch|处置|裁决/i,
+  key_path: /关键路径|key_path/i,
+  evidence: /证据|evidence/i,
+  accepted_by: /接受者|accepted_by|谁接受/i,
+});
+
+/** 从 `redteam.md` 抄出 `{items, coverage}`。
+ *
+ *  ## 三条判据，都是可机械判定的
+ *
+ *  1. **只认「反例列表」节里的表**。正文别处也可能有表格（例如三档权限的说明表），
+ *     把它们当成反例会凭空造出阻断项。
+ *  2. **`## 覆盖声明` 整节原样带回去**（`coverage`），因为 `deliverVerdict()` 要用它
+ *     区分「查了没有问题」与「没有查」。
+ *  3. **读不到表就返回空 items + `problems`**，不返回 null ——
+ *     `null` 会让调用方误以为「这份报告不存在」，而「存在但读不出」是另一件事。
+ *
+ *  @returns {{items:object[], coverage:string, problems:string[]}}
+ */
+export function parseRedteamReport(markdown) {
+  const text = String(markdown == null ? '' : markdown);
+  const problems = [];
+
+  // 覆盖声明：从 `## 覆盖声明` 到下一个 `## ` 为止。它可以是四段列表，也可以是一段散文。
+  let coverage = '';
+  const covAt = text.search(/^##\s*覆盖声明\s*$/m);
+  if (covAt >= 0) {
+    const rest = text.slice(covAt);
+    const nextH2 = rest.slice(1).search(/^##\s/m);
+    coverage = (nextH2 < 0 ? rest : rest.slice(0, nextH2 + 1)).trim();
+  }
+
+  // 反例列表节：`## 反例列表` 到下一个 `## ` 为止。
+  const listAt = text.search(/^##\s*反例列表\s*$/m);
+  if (listAt < 0) {
+    problems.push('读不到「## 反例列表」一节 —— 红队报告的格式约定在 oversight-redteam.md，'
+      + '改格式必须同时改这里，否则收活读到的是空清单（而空清单看起来像「没发现问题」）');
+    return { items: [], coverage, problems };
+  }
+  const afterList = text.slice(listAt);
+  const nextH2 = afterList.slice(1).search(/^##\s/m);
+  const section = nextH2 < 0 ? afterList : afterList.slice(0, nextH2 + 1);
+
+  // 表头驱动：先定位一张含 `dispatch` 与 `evidence` 的表头，记下列号。
+  let cols = null;
+  const lines = section.split('\n');
+  for (const line of lines) {
+    if (!line.trim().startsWith('|')) continue;
+    const cells = line.split('|').map((c) => c.trim());
+    if (cells.length < 4) continue;
+    const found = {};
+    for (const [field, re] of Object.entries(RT_COLUMNS)) {
+      const i = cells.findIndex((c, idx) => idx > 0 && re.test(c));
+      if (i > 0) found[field] = i;
+    }
+    if (found.dispatch === undefined || found.evidence === undefined) continue;
+    // `id` 的别名规则太宽（空串 / `#`），最后再兜一次：默认为第一列。
+    if (found.id === undefined) found.id = 1;
+    cols = found;
+    break;
+  }
+  if (!cols) {
+    problems.push('「## 反例列表」里有表格，但表头读不到 dispatch / evidence 两列 —— '
+      + '表格形状变了，而按列号硬读会静默把「说明」读成证据');
+    return { items: [], coverage, problems };
+  }
+
+  const items = [];
+  for (const line of lines) {
+    if (!line.trim().startsWith('|')) continue;
+    const cells = line.split('|').map((c) => c.trim());
+    if (cells.length <= Math.max(cols.dispatch, cols.evidence)) continue;
+    const id = cells[cols.id] || '';
+    // 表头行与分隔行跳过：id 里不该出现 `-` 开头的分隔或「#」。
+    if (!id || /^#+$/.test(id) || /^-+$/.test(id)) continue;
+    const get = (k) => (cols[k] !== undefined && cells[cols[k]] !== undefined ? cells[cols[k]] : '');
+    const item = {
+      id,
+      trigger: get('trigger'),
+      failure: get('failure'),
+      severity: get('severity'),
+      dispatch: get('dispatch'),
+      evidence: get('evidence'),
+    };
+    const kp = get('key_path');
+    if (kp) item.key_path = kp;
+    const acc = get('accepted_by');
+    if (acc) item.accepted_by = acc;
+    items.push(item);
+  }
+  if (!items.length) {
+    // 空反例清单是**合法**的（真的没发现问题），所以这里不判 problem。
+    // 但它必须配覆盖声明 —— 那条判据在 `deliverVerdict()` 里，不在这里重复。
+  }
+  return { items, coverage, problems };
+}
+
+// ── CLI：收活时打印裁决 ───────────────────────────────────────────────
+//
+// ## 它治的是什么（DF-080）
+//
+// 这个文件在 2026-11-22 有 39 条测试、零调用点。一个没有调用点的门与不存在同形
+// （DF-042 的原始形态）。SKILL.md 的 Phase E 现在必须调用它，而**调用形态必须是一条
+// 能贴进流程的命令** —— 「另行写个脚本读它」等于把接线又推给下一个人。
+//
+// 退出码是**判据的一部分**：
+//   0 = PASS（可交付）
+//   1 = FAILED（验收判了不通过，修复后重验）
+//   2 = BLOCKED（红队阻断 / 读不出结论 / 弱证据替代强证据）
+//   3 = 用法错误（缺参数、文件读不到、JSON 坏）
+// 分开而不是「非零即失败」：FAILED 的下一步是修复，BLOCKED 的下一步是补采样/补强证据，
+// 这两件事混成一个码，拿到裁决的人不知道该做什么。
+
+const CLI_HELP = `delivery-verdict — 收活时对「这份交付能不能发」给出唯一裁决。
+
+用法：
+  node scripts/delivery-verdict.mjs --acceptor tasks/runs/<run-id>/acceptor.md
+                                    --redteam  tasks/runs/<run-id>/redteam.md
+                                    --key-paths <keypaths.json>
+                                    [--required-strong <requirements.json>]
+                                    [--subject <被验对象的名字>]
+                                    [--deviation-refs <table.md>]
+                                    [--json]
+
+  --acceptor        验收报告（Markdown）。不传 = 没有验收结论 = BLOCKED（不是放行）。
+  --redteam         红队报告（Markdown）。不传 = 红队缺席 = 没有覆盖声明，
+                    **裁决会给 BLOCKED（exit 2）**，不是「没有阻断项」。
+                    一份没有覆盖声明的红队报告无法区分「查了没有问题」与「没有查」。
+  --key-paths       派发前声明的关键路径清单：[{"id":"K1","path":"src/app.ts","why":"..."}]
+                    不传 = 没有任何路径被声明过，于是红队的 block 条目会在**派发阶段**
+                    被判 key_path_undeclared（这不是 bug，是「关键必须预先声明」的落点）。
+  --required-strong 强证据要求：[{"key_path":"K1","kinds":["test","artifact"]}]
+  --subject         被验对象的名字。与证据的 producedBy 相同则判「自证不算强证据」。
+  --deviation-refs  偏差台账（tasks/accepted-deviations.md）。advisory 条目未登记时给
+                    riskUnlogged: true —— 不阻断，但「记录在案」与「没人看见」要分得开。
+                    （登记格式按 DF-xxx / AD-yyy 编号，与红队条目的 id 对应）
+  --json            机器可读输出（同一份数据）。
+
+退出码：0 PASS / 1 FAILED / 2 BLOCKED / 3 用法错误。
+
+**读不到 ≠ 通过。** 报告文件不存在时直接 exit 3，不回落成「空报告 → 没有阻断」。
+`;
+
+function readTextOrNull(p) {
+  try { return readFileSync(p, 'utf8'); } catch { return null; }
+}
+
+/** `--deviation-refs` 读的是**台账文件**，要从中抽出已登记的编号。
+ *
+ *  为什么不在调用方现写一个数组：台账是给人写的 markdown，人不会维护第二份 JSON。
+ *  抽出 `DF-xxx` / `AD-yyy` 两种编号（红队条目通常用 `RT1` 这类 id，
+ *  但「登记到偏差台账」这件事的落点是台账自己的编号 —— 一个条目被接受时，
+ *  红队会把它写成 `DF-082` 之类）。读不到就返回空集合，**不报错**：
+ *  `riskUnlogged` 只会变得更保守（更多条目被标成未登记），不会更松。 */
+export function deviationRefsFrom(text) {
+  const out = new Set();
+  for (const m of String(text == null ? '' : text).matchAll(/\b((?:DF|AD)-\d{3})\b/g)) out.add(m[1]);
+  return [...out];
+}
+
+function parseCliArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--help' || a === '-h') { args.help = true; continue; }
+    if (a === '--json') { args.json = true; continue; }
+    if (!a.startsWith('--')) return { error: `无法识别的参数：${a}` };
+    const key = a.slice(2);
+    const val = argv[i + 1];
+    if (val == null || val.startsWith('--')) return { error: `${a} 缺少取值` };
+    args[key] = val;
+    i++;
+  }
+  return args;
+}
+
+/** JSON 文件读取。**解析失败不回落成 `[]`** —— 回落等于「你给的 keyPaths 被静默丢掉」，
+ *  于是全部红队 block 条目都会变成 key_path_undeclared，而屏幕上看起来像红队写错了。 */
+function readJsonArg(path, label) {
+  const text = readTextOrNull(path);
+  if (text == null) return { error: `${label} 读不到：${path}` };
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (e) { return { error: `${label} 不是合法 JSON：${e.message}` }; }
+  if (!Array.isArray(parsed)) return { error: `${label} 必须是数组（它是一张清单，不是一个对象）` };
+  return { value: parsed };
+}
+
+/** 主流程。**返回退出码，不调用 process.exit** —— 这样测试能直接调它，
+ *  而 CLI 包装只在文件被直接执行时把返回值交给 process.exit。 */
+export function main(argv = process.argv.slice(2)) {
+  const args = parseCliArgs(argv);
+  if (args.error) { console.error(args.error); console.error(CLI_HELP); return 3; }
+  if (args.help || !argv.length) { console.log(CLI_HELP); return args.help ? 0 : 3; }
+
+  // ── 输入。**每一个缺失都是「读不到」，不是「空」** ──────────────────
+  //
+  //  这条与 `deliverVerdict()` 的缺省值不是一回事：函数层缺省 acceptor = UNKNOWN
+  //  （BLOCKED），那是给**调用方已经决定不提供**的场景用的；CLI 层是「你说要给，
+  //  但文件不在」—— 那必须立刻停下，而不是往下走。
+  if (!args.acceptor) {
+    console.error('缺 --acceptor：没有验收报告就没有验收结论，而缺席不是放行');
+    return 3;
+  }
+  const accText = readTextOrNull(args.acceptor);
+  if (accText == null) { console.error(`--acceptor 读不到：${args.acceptor}`); return 3; }
+
+  let redteam = null;
+  if (args.redteam) {
+    const rtText = readTextOrNull(args.redteam);
+    if (rtText == null) { console.error(`--redteam 读不到：${args.redteam}`); return 3; }
+    const parsed = parseRedteamReport(rtText);
+    // 解析问题**写进 coverage 之外单独带回去**：`deliverVerdict()` 不认识 problems，
+    // 所以这里把「读不出表」折成一条 malformed 条目 —— 一份读不出的红队报告
+    // 不能被当成「没有阻断项」，那是静默共识（契约 §8 的第 2 条同源）。
+    for (const p of parsed.problems) {
+      parsed.items.push({ id: '(unparsable)', dispatch: 'block', failure: p, severity: 'high', evidence: p });
+    }
+    redteam = { items: parsed.items, coverage: parsed.coverage };
+  } else {
+    // ## 不传 `--redteam` **不是**「红队没发现问题」
+    //
+    // 第一版这里留 `null`，于是 `deliverVerdict()` 里那句
+    // `if (redteam && items.length === 0)` 短路 → 没有任何 redteam 判据生效 →
+    // 裁决给 `PASS`。实测就是 `exit 0 / 无阻断项、无风险项`。
+    // 而帮助文本写着「不传 = 红队缺席；**不是**「没有阻断项」」—— **文案与代码相反**，
+    // 正是本仓反复批评的那种形态（说了却没人执行）。
+    //
+    // 正确的语义：红队缺席 = 没有覆盖声明 = 无法区分「查了没有问题」与「没有查」。
+    // 所以这里显式造一份「空清单 + 无覆盖声明」的报告，让 `deliverVerdict()` 的
+    // `redteam_no_coverage` 把它判成 `BLOCKED` —— 判据留在函数里，CLI 只负责
+    // **不要用 null 把它短路掉**。判成 BLOCKED 而不是用法错误（exit 3），
+    // 是因为它是一个**结论**（「这份交付现在不能发」），不是「你命令打错了」。
+    redteam = { items: [], coverage: '' };
+  }
+
+  let keyPaths = [];
+  if (args['key-paths']) {
+    const r = readJsonArg(args['key-paths'], '--key-paths');
+    if (r.error) { console.error(r.error); return 3; }
+    keyPaths = r.value;
+  }
+  let requiredStrong = [];
+  if (args['required-strong']) {
+    const r = readJsonArg(args['required-strong'], '--required-strong');
+    if (r.error) { console.error(r.error); return 3; }
+    requiredStrong = r.value;
+  }
+  let deviationRefs = [];
+  if (args['deviation-refs']) {
+    const t = readTextOrNull(args['deviation-refs']);
+    if (t == null) { console.error(`--deviation-refs 读不到：${args['deviation-refs']}`); return 3; }
+    deviationRefs = deviationRefsFrom(t);
+  }
+
+  const acceptor = parseAcceptorVerdict(accText);
+  const result = deliverVerdict({
+    acceptor,
+    redteam,
+    criteria: { keyPaths, requiredStrong, subject: args.subject || null },
+    deviationRefs,
+  });
+
+  if (args.json) {
+    console.log(JSON.stringify({ ...result, acceptor: { verdict: acceptor.verdict, items: acceptor.items } }, null, 2));
+  } else {
+    console.log(`交付裁决：${result.verdict}`);
+    if (acceptor.verdict !== result.verdict) console.log(`  验收结论：${acceptor.verdict}`);
+    for (const b of result.blocking) console.log(`  [阻断 ${b.code}] ${b.detail}`);
+    for (const r of result.risky) console.log(`  [风险 ${r.dispatch}] ${r.id}：${r.detail}`);
+    for (const r of result.reasons.filter((x) => x.startsWith('[risk_unlogged]'))) console.log(`  ${r}`);
+    for (const p of result.phases) console.log(`  回流：${p}`);
+    if (result.verdict === 'PASS' && !result.risky.length && !result.reasons.length) {
+      console.log('  无阻断项、无风险项。');
+    }
+  }
+  if (result.verdict === 'FAILED') return 1;
+  if (result.verdict === 'BLOCKED') return 2;
+  return 0;
+}
+
+/** 「我是不是被直接执行」——比的是**真实路径**。`resolve()` 只规范化路径、不解析
+ *  符号链接，而 `fileURLToPath(import.meta.url)` 已经是真实路径；通过目录符号链接执行
+ *  （`npm link` / `npm i -g .` / pnpm 的 store）时两边必然不等，程序会静默 exit 0、零输出。
+ *  realpath 失败（路径不存在）退回 resolve：一次失败不能让正常执行也坏掉。 */
+const realOrResolve = (p) => {
+  try { return realpathSync(p); } catch { return resolve(p); }
+};
+if (process.argv[1] && realOrResolve(process.argv[1]) === realOrResolve(fileURLToPath(import.meta.url))) {
+  process.exit(main(process.argv.slice(2)));
 }

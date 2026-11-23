@@ -15,7 +15,7 @@
 3. **锐评的结论不能由执行 Agent 自己写**，且锐评的 prompt 中不得包含执行 Agent 的自我评价。
 4. **验收 Agent 一票否决**。标准必须预先声明，不得事后编造。
 5. **禁止静默共识**。多 Agent 结论相同时，至少一个被要求找反面证据。找不到反例 ≠ 结论正确。
-6. **递归派生：本版深度是 1 层**（主线程 + 一层执行者）。12 份角色定义的 `tools` 白名单均不含派生工具，物理上派不出下一层。宿主支持 3 层是**平台能力**，不是本仓架构承诺。见 `docs/spec/dispatch-contract.md §7`。
+6. **递归派生：本版深度是 1 层**（主线程 + 一层执行者）。13 份角色定义的 `tools` 白名单均不含派生工具，物理上派不出下一层。宿主支持 3 层是**平台能力**，不是本仓架构承诺。见 `docs/spec/dispatch-contract.md §7`。
 7. **全量重跑仅适用于 `FAILED` 态**。`EXPLORING` 态严禁重跑。
 8. 派发时必须声明产出形态（`artifact` / `exploration` / `hybrid`）与预算。未声明视为规划缺陷。
 
@@ -43,7 +43,7 @@ node scripts/scan-sessions.mjs --days 3        # 扫描会话，判定状态（�
 node scripts/scan-sessions.mjs --json          # 机器可读
 node scripts/verify-claims.mjs --days 3        # 「AI 说它做完了」有没有证据
 node scripts/check-structure.mjs               # 结构硬门
-node --test scripts/                 # 全量回归测试（1998 条，硬门会对账这个数字）
+node --test scripts/                 # 全量回归测试（2080 条，硬门会对账这个数字）
 ```
 
 **任何改动后必须跑 `check-structure.mjs` 和全量测试。** 两者都绿才能提交。

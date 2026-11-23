@@ -248,6 +248,11 @@ test('丙', () => {});
 test('删掉声明本身也要红——「没人再核它」比写错更坏', () => {
   const d = tmpRepo();
   try {
+    // 「必须声明测试数」是 **product 域**的规矩（DF-051）：它是本产品对外的自证位置。
+    // 别人的项目 README 里没有这个数，不是缺陷 —— 所以那条规则只在 productRepo=true 时判。
+    // 本用例要验的正是「本产品自己的仓库删掉声明会不会红」，因此显式声明 productRepo。
+    mkdirSync(join(d, '.untildone'), { recursive: true });
+    writeFileSync(join(d, '.untildone', 'checks.json'), JSON.stringify({ productRepo: true }, null, 2));
     const scripts = join(d, 'scripts');
     mkdirSync(scripts, { recursive: true });
     writeFileSync(join(scripts, 'a.test.mjs'), `
