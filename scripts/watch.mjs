@@ -30,17 +30,30 @@
 import {
   existsSync, readdirSync, statSync, readFileSync, writeFileSync,
   mkdirSync, renameSync, rmSync, copyFileSync, appendFileSync, openSync, readSync, closeSync,
+  realpathSync,
 } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+// **`spawnSync` 已移除**（DF-092）：判活曾靠 `spawnSync('powershell', …)`
+// 取目标 PID 的启动时刻，本机实测 5–24 秒、每次都撞超时，于是 `--health`
+// 永远说「判不了」。现在判活走命名管道（`proc-liveness.mjs`），这条路不再有意义。
+// 只剩 `spawn`，它服务的是 `runScan`（扫描子进程），与判活无关。
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { classifyStop, openWaitingToolUseIds } from './classify-stop.mjs';
 import { sessionIdOf } from './asked.mjs';
 import { resolveJobEventTime } from './job-event-time.mjs';
 import { resolveStateDir } from './state-dir.mjs';
+import {
+  BEAT_TIMEOUT_MS, livenessEndpoint, makeNonce, probeLiveness, startLivenessServer,
+} from './proc-liveness.mjs';
+
+/** 判活超时的口径要在**判据这一层**也能读到（测试与文档引用它）。
+ *  转发而不是各写一份：两份常量必然漂，而这里漂的表现是「文档说 800ms，
+ *  实际等 5 秒」—— 正是 DF-092 要消灭的那类不一致。 */
+export { BEAT_TIMEOUT_MS };
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 
@@ -237,10 +250,30 @@ export function processStartedAt() {
   return new Date(selfStartedAtCache).toISOString();
 }
 
-/** 写进程见证。返回 { ok, path, pid, startedAt, error }。写不了也继续跑。 */
-export function writeProcWitness(stateDir, { pid = process.pid, startedAt = processStartedAt(), nowMs = Date.now() } = {}) {
+/** 写进程见证。返回 { ok, path, pid, startedAt, endpoint, nonce, error }。写不了也继续跑。
+ *
+ *  **`nonce` / `endpoint` 是 DF-092 加的**，也是「判活」从 spawn 改成管道后的全部接口：
+ *    · 守护进程启动时生成一个随机 nonce，用它建判活端点（见 `proc-liveness.mjs`）；
+ *    · 这里把 nonce 与端点名一起写进 proc.json —— `--health` 靠它找到端点。
+ *
+ *  老见证（没有 nonce）仍然可读：`judgeProcess` 会走「没有判活端点」那条路，
+ *  报 `unknown` 并说清「这份见证来自旧版本」—— 不编造死活。 */
+export function writeProcWitness(stateDir, {
+  pid = process.pid, startedAt = processStartedAt(), nowMs = Date.now(),
+  nonce = null, endpoint = null, listenError = null,
+} = {}) {
   const p = procWitnessPath(stateDir);
-  const rec = { version: 1, pid, startedAt, writtenAt: new Date(nowMs).toISOString() };
+  const rec = {
+    version: 2,
+    pid,
+    startedAt,
+    writtenAt: new Date(nowMs).toISOString(),
+    // nonce 与 endpoint 是判活的**唯一**入口。写 null 表示「本进程没有判活端点」，
+    // 那不是「健康」，`--health` 会如实说「判不了」。
+    nonce: nonce || null,
+    endpoint: endpoint || null,
+  };
+  if (listenError) rec.listenError = String(listenError);
   try {
     mkdirSync(String(stateDir), { recursive: true });
     writeFileSync(p, JSON.stringify(rec, null, 2) + '\n', 'utf8');
@@ -259,113 +292,190 @@ export function readProcWitness(stateDir) {
   } catch { return null; }
 }
 
-/** 判据容差。**它同时是这道判据的误差边界**，取值有代价的权衡：
+/** 判据容差。**它不再是主判据，只是第二道交叉核对**（DF-092）。
  *
- *  太小 → 把「就是我们这个进程」误判成 PID 复用（假阴性：说它还活着，实际被换了）；
- *  太大 → 把「PID 被复用」误判成「还活着」（假阳性：说它卡住了，实际早就死了）。
+ *  改法之前的语义：拿 `Get-Process().StartTime` 与见证里的 `startedAt` 比，差不超过
+ *  这个容差就算「还是那个进程」。它有两条已知缺陷：
+ *    1. 取那个时刻**只能 spawn**（`powershell` / `ps`），本机实测 5–24 秒 → 每次超时
+ *       → 判不了（DF-028 的现场）；
+ *    2. 容差本身是个窗口：新进程若在旧进程死后 2 秒内抢到同一个 PID，会被当成「还在」。
  *
- *  2 秒的来由：`process.uptime()` 推导值实测偏早 68ms（Windows）；POSIX 上用
- *  `ps -o etimes=`（秒级）反推，误差最大约 1 秒。取 2 秒把这两种都容下。
- *
- *  **已知误判条件**：若旧进程与占用其 PID 的新进程启动时刻相差不到 2 秒，
- *  这道判据会把它当成「还在」。守护进程被外部杀掉后 2 秒内恰好有进程抢到同一个 PID，
- *  才有这个可能 —— 概率极低，但它是一个**已知的**边界，不是「已保证正确」。 */
+ *  现在主判据是**判活端点上的 nonce**（见 `proc-liveness.mjs`）：PID 被复用必然
+ *  意味着换了一个 nonce，端点也对不上，与时间无关，没有窗口可钻。
+ *  这个常量保留下来做 beat 帧里 `started` 字段的交叉核对 —— 它是「第二道」，
+ *  任何一道不符都判 `reused`。取 2 秒的理由不变：`process.uptime()` 推导的
+ *  `startedAt` 与本进程真实启动时刻实测差 68ms，留足余量。 */
 export const PROC_TOLERANCE_MS = 2000;
 
-/** 取某个 PID 当前持有者的启动时刻（毫秒）。取不到返回 null（**不是**抛错）。
+/** PID 还在不在。**只用来区分「gone」与「unknown」**，绝不用来判「活着」。
  *
- *  为什么只能 spawn 外部命令：Node 没有读别的进程 creation time 的内置能力。
- *  这条路只在**心跳已经停了**的时候才走（见 healthCheck），正常路径零成本。
- *  实测量级：Windows 355–390ms（含 powershell 启动），`--health` 本来就要 300ms 以上，
- *  而它一天跑不了几次 —— 这个代价换的是「不再把 PID 复用报成还活着」，值。
- *
- *  Windows 用 `Get-Process .StartTime`（实测 355–390ms，含 powershell 启动）；
- *  POSIX 用 `ps -o etimes=`（已运行秒数，避免解析本地化的 lstart 文本）。 */
-function probeStartTimeOf(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    if (process.platform === 'win32') {
-      const r = spawnSync('powershell',
-        ['-NoProfile', '-NonInteractive', '-Command',
-          `try{(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')}catch{exit 1}`],
-        { encoding: 'utf8', timeout: 5000, windowsHide: true });
-      const iso = String((r && r.stdout) || '').trim();
-      const t = Date.parse(iso);
-      return Number.isFinite(t) ? t : null;
-    }
-    const r = spawnSync('ps', ['-o', 'etimes=', '-p', String(pid)],
-      { encoding: 'utf8', timeout: 3000 });
-    const sec = Number(String((r && r.stdout) || '').trim());
-    return Number.isFinite(sec) ? Date.now() - sec * 1000 : null;
-  } catch { return null; }
-}
-
-/** 进程存活判据。返回 { alive, verdict, reason, pid, startedAt }。
- *
- *  `alive` 是 **true / false / null**，null = 判不了。三态是必须的：把「不知道」
- *  写成 false 就等于宣称「进程死了」，而这个任务全部的要点就是别把不知道说成知道。
- *
- *  verdict：
- *    'gone'        PID 不存在 → 该重启
- *    'reused'      PID 存在，但启动时刻对不上 → PID 被别的进程占了，守护进程已死
- *    'stuck'       PID 存在且确实是它 → 卡住了，重启前先看日志
- *    'unknown'     PID 存在，但探不到它的启动时刻 → 无法确认归属
- *    'unverified'  没有见证文件（老版本写的 / 从没跑过）
- *
- *  **为什么不能只看 `process.kill(pid, 0)`**：Windows 上它还接受 pid 0（实测返回成功），
- *  更要命的是 PID 会被复用 —— 一个死掉的 PID 被别的进程拿去后，`kill(pid,0)` 照样成功，
- *  于是「进程死了」被报成「进程还活着但卡住了」，处置从「重启」变成「先看日志」，
- *  而根本没有日志可看。所以必须加上启动时刻的双向核对。
+ *  这条区分是 DF-028 反复强调的：`process.kill(pid, 0)` 成功**不等于**那是我们的
+ *  进程 —— 一个死掉的 PID 被别的进程拿去后它照样成功。所以本函数只回答
+ *  「这个号有没有被占」，`judgeProcess` 里没有任何一条分支会因为它的结果为 true
+ *  而返回 `alive: true`。
  *
  *  实测（Windows 10 19045 / Node 26，2026-11-18）：
  *    process.kill(process.pid, 0)      → 成功
  *    process.kill(999999, 0)           → 抛 ESRCH（不存在的 PID）
  *    process.kill(4, 0)                → 抛 EPERM（存在但无权限，System 进程）
- *    process.kill(刚退出的子进程, 0)    → 抛 ESRCH
- *    process.kill(0, 0)                → 成功（POSIX 语义「当前进程组」，不是「不存在」）
- *  即：**ESRCH = 不存在，EPERM = 存在但没权限，两者都不能当成「不存在」或「存在」之外**。 */
-export function judgeProcess(witness, { nowMs = Date.now(), toleranceMs = PROC_TOLERANCE_MS, probeStartTime = probeStartTimeOf } = {}) {
+ *    process.kill(0, 0)                → 成功（POSIX 语义「当前进程组」，不是「不存在」） */
+export function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM = 进程**存在**，只是不允许发信号。把它当成「不存在」会把一个活着的
+    // 进程报成「已退出」。
+    return Boolean(e && e.code === 'EPERM');
+  }
+}
+
+/** 把探针的 `state` 翻译成一句**说实话**的理由（DF-091）。
+ *
+ *  改法之前，所有失败都在同一句里：「无权限 / 命令不可用」。而本机实测的失败
+ *  100% 是**超时**。用户照着那句话去查权限，永远查不到东西 —— 一个把原因说错的
+ *  错误信息，比没有错误信息更坏，因为它会把人送到错误的方向上。
+ *
+ *  四种原因各有各的处置，所以必须分开说：
+ *    timeout       进程在，但事件循环没响应 → 先看日志
+ *    not-found     端点没了 → 该重启（PID 还在的话另说）
+ *    eperm         连不上，权限不足 → 换用户 / 加权限，别急着重启
+ *    parse-failed  读到了，但不是本协议的帧 → 版本不匹配 / 端点被别人占了 */
+export function probeFailureReason(state, { pid, detail = null } = {}) {
+  const tail = detail ? `（${detail}）` : '';
+  switch (state) {
+    case 'timeout':
+      return `PID ${pid} 的判活端点连上了，但 ${BEAT_TIMEOUT_MS}ms 内没有读出 beat —— `
+        + `进程可能还在，但它的主循环没有响应${tail}`;
+    case 'not-found':
+      return `PID ${pid} 的判活端点不存在 —— 那个进程已经不在了${tail}`;
+    case 'refused':
+      return `PID ${pid} 的判活端点存在但拒绝连接（POSIX 残留的 socket 文件，监听进程已退出）${tail}`;
+    case 'closed':
+      return `PID ${pid} 的判活端点接受连接后没有写出任何字节 —— 监听进程可能正在退出${tail}`;
+    case 'eperm':
+      return `PID ${pid} 的判活端点连不上：**权限不足**（不是超时）${tail}`;
+    case 'parse-failed':
+      return `PID ${pid} 的判活端点回了一个不是本协议的帧（版本不一致，或端点被别的程序占了）${tail}`;
+    default:
+      return `PID ${pid} 的判活端点探测失败（${state}）${tail}`;
+  }
+}
+
+/** 进程存活判据。**异步**，因为判活要读管道，而同步读在没有应答时会永久阻塞
+ *  （实测，见 `proc-liveness.mjs` 头注释）。
+ *
+ *  返回 `{ alive, verdict, reason, pid, startedAt, state, ms }`。
+ *
+ *  `alive` 是 **true / false / null**，null = 判不了。三态是必须的：把「不知道」
+ *  写成 false 就等于宣称「进程死了」，而这个任务全部的要点就是别把不知道说成知道。
+ *
+ *  verdict：
+ *    'gone'         判活端点不在，且 PID 也没了 → 该重启
+ *    'reused'       端点回了帧，但帧里的 nonce / pid / started 与见证对不上
+ *                   → 那个 PID 已经被别的进程（或另一个实例）占用，守护进程已死
+ *    'stuck'        端点答了，而且就是它 → 进程活着但心跳停了，重启前先看日志
+ *    'unresponsive' 端点连得上但读不到 beat → 进程可能在，但主循环无响应
+ *    'unknown'      PID 还在，但无法确认是不是它（没有端点 / 权限 / 帧不认识）
+ *    'unverified'   没有见证文件（老版本写的 / 从没跑过）
+ *
+ *  **为什么端点不在 + PID 还在时判 `unknown` 而不是 `gone`**：那两种可能都成立
+ *  （守护进程的监听挂了 / PID 被复用），而本仓的规矩是「不知道就说不知道」。
+ *  判 `gone` 会让人重启一个可能还活着的进程；判 `alive` 则是 DF-028 本身。
+ *
+ *  注入点（`probe` / `isAlive`）只为了可测：`probe` 是唯一被判据使用的存活证据来源。
+ *  **代码里没有任何一条分支会仅凭 PID 存在就返回 `alive: true`** —— 那会把 DF-028
+ *  整个删掉，是这次改动明令禁止的退路。 */
+export async function judgeProcess(witness, {
+  nowMs = Date.now(),
+  toleranceMs = PROC_TOLERANCE_MS,
+  probe = probeLiveness,
+  isAlive = pidIsAlive,
+  timeoutMs = BEAT_TIMEOUT_MS,
+} = {}) {
+  void nowMs;
   const w = witness && typeof witness === 'object' ? witness : null;
   const pid = Number(w && w.pid);
   if (!w || !Number.isInteger(pid) || pid <= 0) {
-    return { alive: null, verdict: 'unverified', pid: null, startedAt: null,
+    return { alive: null, verdict: 'unverified', pid: null, startedAt: null, state: null,
       reason: '没有进程见证（proc.json 缺失或没有 pid）—— 判不了进程死活' };
   }
   const startedAtMs = Date.parse(w.startedAt || '');
   const startedAt = Number.isFinite(startedAtMs) ? new Date(startedAtMs).toISOString() : null;
 
-  let exists = false;
+  // 端点：见证里写下的那个。没有它就没有判活依据 —— **不猜**。
+  const endpoint = typeof w.endpoint === 'string' && w.endpoint ? w.endpoint : null;
+  const nonce = typeof w.nonce === 'string' && w.nonce ? w.nonce : null;
+
+  if (!endpoint || !nonce) {
+    // 旧版见证（version 1）或 `--once` 这种没有常驻监听的一次性运行。
+    // 这里**必须**退到「号还在不在」，因为它是唯一还剩的事实。
+    if (!isAlive(pid)) {
+      return { alive: false, verdict: 'gone', pid, startedAt, state: null,
+        reason: `进程已退出（PID ${pid} 已不在；这份见证没有判活端点，所以只能看 PID）` };
+    }
+    return { alive: null, verdict: 'unknown', pid, startedAt, state: null,
+      reason: `PID ${pid} 还在，但见证里没有判活端点（旧版本写的 proc.json，或来自 --once）`
+        + ' —— 无法确认是不是它' };
+  }
+
+  let r;
   try {
-    process.kill(pid, 0);
-    exists = true;
+    r = await probe({ endpoint, nonce, timeoutMs });
   } catch (e) {
-    // EPERM 表示进程**存在**，只是不允许对它发信号（Windows 上 System 进程就是这种）。
-    // 把 EPERM 当成「不存在」是错的，那会让一个活着的进程被报成「已退出」。
-    exists = e && e.code === 'EPERM';
+    // 探针自己抛错也是一种「不知道」，不能变成「死了」。
+    return { alive: null, verdict: 'unknown', pid, startedAt, state: 'error',
+      reason: `判活探针自身出错（${(e && e.message) || e}）—— 判不了进程死活` };
+  }
+  const state = (r && r.state) || 'error';
+
+  if (state === 'beat') {
+    const f = r.frame || {};
+    // **`startedAt` 不可解析时，不得判 `reused`**（DF-099，锐评 2026-11-24 抓到的退化）。
+    //
+    // 原来写成 `startDiff = ... : Infinity`，而 `startDiff > toleranceMs` 对 Infinity
+    // 恒为 true —— 于是一个**正在应答 beat 的活进程**，只因见证里缺 `startedAt`
+    // 就被判 `alive:false / reused`，处置从「先看日志」变成「直接重启」。
+    // 更刺眼的是文案生成处特意加了 `startDiff !== Infinity` 来避免打印 Infinity，
+    // 却在**判决**上漏了同一个判断：守卫了消息、没守卫结论。
+    //
+    // 时间判不了 → 这一道核对**弃权**，交给 nonce / pid 两道（它们本就足够强：
+    // nonce 是每个进程现生成的随机串）。三态原则：不知道不等于证伪。
+    const timeComparable = Number.isFinite(f.startedMs) && Number.isFinite(startedAtMs);
+    const startDiff = timeComparable ? Math.abs(f.startedMs - startedAtMs) : null;
+    const idMismatch = f.nonce !== nonce || Number(f.pid) !== pid;
+    const timeMismatch = timeComparable && startDiff > toleranceMs;
+    if (idMismatch || timeMismatch) {
+      const why = [];
+      if (f.nonce !== nonce) why.push(`端点应答的 nonce 是 ${String(f.nonce).slice(0, 12)}…，见证里是 ${nonce.slice(0, 12)}…`);
+      if (Number(f.pid) !== pid) why.push(`应答的 PID 是 ${f.pid}，见证里是 ${pid}`);
+      if (timeMismatch) why.push(`应答的启动时刻 ${f.startedAt} 与见证的 ${startedAt} 差 ${startDiff}ms`);
+      return { alive: false, verdict: 'reused', pid, startedAt, state,
+        reason: `进程已退出，这个 PID / 端点已被别的进程复用（${why.join('；')}）` };
+    }
+    return { alive: true, verdict: 'stuck', pid, startedAt, state, ms: r.ms,
+      beats: f.beats,
+      reason: `进程还在（PID ${pid}，启动于 ${startedAt}，判活端点应答了第 ${f.beats} 次 beat），`
+        + '但心跳已停 —— 它卡住了，重启前先看日志' };
   }
 
-  if (!exists) {
-    return { alive: false, verdict: 'gone', pid, startedAt,
-      reason: `进程已退出（PID ${pid} 已不在）` };
+  // 端点这条路没给出「活着」的证据。区分「号没了」与「号还在但说不清」。
+  if (state === 'not-found' || state === 'refused' || state === 'closed') {
+    if (!isAlive(pid)) {
+      return { alive: false, verdict: 'gone', pid, startedAt, state, ms: r && r.ms,
+        reason: probeFailureReason(state, { pid, detail: r && r.detail }) };
+    }
+    return { alive: null, verdict: 'unknown', pid, startedAt, state, ms: r && r.ms,
+      reason: `PID ${pid} 还在，但它的判活端点不在了 —— 可能是守护进程的监听挂了，`
+        + '也可能是这个 PID 已被别的进程占用。两者后果相反，所以不猜（要确认就重启后再看）' };
   }
-
-  // PID 存在。是不是**我们这个**进程？只有启动时刻能回答。
-  if (!startedAt) {
-    return { alive: null, verdict: 'unknown', pid, startedAt: null,
-      reason: `PID ${pid} 存在，但见证里没有可解析的启动时刻 —— 无法确认是不是它` };
+  if (state === 'timeout') {
+    return { alive: null, verdict: 'unresponsive', pid, startedAt, state, ms: r && r.ms,
+      reason: probeFailureReason(state, { pid, detail: r && r.detail }) };
   }
-  const holderStart = probeStartTime(pid);
-  if (!Number.isFinite(holderStart)) {
-    return { alive: null, verdict: 'unknown', pid, startedAt,
-      reason: `PID ${pid} 存在，但探不到它的启动时刻（无权限 / 命令不可用）—— 无法确认是不是它` };
-  }
-  if (Math.abs(holderStart - startedAtMs) > toleranceMs) {
-    return { alive: false, verdict: 'reused', pid, startedAt,
-      reason: `进程已退出，PID ${pid} 已被别的进程复用（见证启动于 ${startedAt}，`
-        + `当前持有者启动于 ${new Date(holderStart).toISOString()}）` };
-  }
-  return { alive: true, verdict: 'stuck', pid, startedAt,
-    reason: `进程还在（PID ${pid}，启动于 ${startedAt}），但心跳已停 —— 它卡住了，重启前先看日志` };
+  return { alive: null, verdict: 'unknown', pid, startedAt, state, ms: r && r.ms,
+    reason: probeFailureReason(state, { pid, detail: r && r.detail }) };
 }
 
 /** 声明/校验归属。返回 { owner, previous, conflict, written }。
@@ -378,13 +488,24 @@ export function judgeProcess(witness, { nowMs = Date.now(), toleranceMs = PROC_T
  *       11-14 死后，是我自己手动跑 `status` / `--health` 把这个字段刷成了「刚刚」。
  *       节流之后它只在**进程首次声明**时推进，于是它描述的是「哪个进程什么时候接手」，
  *       而不是「最近有没有人碰过这个目录」。真正的心跳在 state.json，不在这里。
- *       冲突时仍然照写 —— 那一条是本次调用的**结论**，不能被节流吞掉。 */
-export function claimOwnership(stateDir, repoPath, { nowMs = Date.now() } = {}) {
+ *       冲突时仍然照写 —— 那一条是本次调用的**结论**，不能被节流吞掉。
+ *
+ *  **DF-092：`liveness` 参数。** `claimOwnership` 把「本进程的判活端点」写进 proc.json。
+ *  它**不**负责起监听 —— 起监听是 `startWatch` 的事（只有常驻进程才有意思：
+ *  `--once` 跑完就退，端点随进程消失，「连不上」恰好是正确答案）。
+ *  不传时写成 null，`--health` 会如实说「没有判活端点」而不是编一个健康。 */
+export function claimOwnership(stateDir, repoPath, { nowMs = Date.now(), liveness = null } = {}) {
   const prev = readOwner(stateDir);
   const me = String(repoPath || '').replace(/[\/]+$/, '');
   const conflict = Boolean(prev && prev.repo && me && prev.repo !== me);
   const pid = process.pid;
   const startedAt = processStartedAt();
+  // 判活端点的三元组。`liveness` 不传时一律 null —— **不编一个名字**：
+  // 一个写进 proc.json 却没人监听的名字，会让 --health 每次都要等满 BEAT_TIMEOUT_MS
+  // 才发现「连得上但没人应答」，把一次快速探活变成一段固定延迟。
+  const liveNonce = (liveness && liveness.nonce) || null;
+  const liveEndpoint = (liveness && liveness.endpoint) || null;
+  const liveError = (liveness && !liveness.ok && liveness.error) || null;
   const record = {
     repo: me,
     firstSeenAt: conflict ? (prev.firstSeenAt || new Date(nowMs).toISOString()) : (prev?.firstSeenAt || new Date(nowMs).toISOString()),
@@ -393,6 +514,8 @@ export function claimOwnership(stateDir, repoPath, { nowMs = Date.now() } = {}) 
     // 「这个目录现在是哪个进程在用」，不必去开第二个文件。
     pid,
     startedAt,
+    nonce: liveNonce,
+    endpoint: liveEndpoint,
     // 冲突时保留上一个仓库，让人能看到是谁在抢
     // 只记**别的**仓库。早版本把 prev.repo 也塞进来，而冲突时 prev.repo 就是别人，
     // 但去掉冲突后它仍留在列表里，于是自己出现在「还被这些仓库用过」里——读数时误导。
@@ -404,7 +527,7 @@ export function claimOwnership(stateDir, repoPath, { nowMs = Date.now() } = {}) 
   // 本进程已经声明过同一个仓库 → 落盘没有新信息。仍要写进程见证（它可能被删了）。
   const unchanged = !conflict && prev && prev.repo === me && prev.pid === pid && prev.startedAt === startedAt;
   if (unchanged) {
-    writeProcWitness(stateDir, { pid, startedAt, nowMs });
+    writeProcWitness(stateDir, { pid, startedAt, nowMs, nonce: liveNonce, endpoint: liveEndpoint, listenError: liveError });
     return { owner: prev, previous: prev, conflict, written: false };
   }
 
@@ -412,7 +535,7 @@ export function claimOwnership(stateDir, repoPath, { nowMs = Date.now() } = {}) 
     mkdirSync(String(stateDir), { recursive: true });
     writeFileSync(ownerPath(stateDir), JSON.stringify(record, null, 2) + '\n', 'utf8');
   } catch { /* 写不了也继续跑，这只是元数据 */ }
-  writeProcWitness(stateDir, { pid, startedAt, nowMs });
+  writeProcWitness(stateDir, { pid, startedAt, nowMs, nonce: liveNonce, endpoint: liveEndpoint, listenError: liveError });
   return { owner: record, previous: prev, conflict, written: true };
 }
 
@@ -1281,6 +1404,87 @@ export function foldProbe(previous, current) {
 }
 
 // ── L-full / 增量：调 scan-sessions.mjs ──────────────────────────────
+
+/**
+ * 在**子进程**里跑 `asked.mjs --json` 的扫描（DF-097）。
+ *
+ * ## 为什么必须起子进程，不是「优化一下」
+ *
+ * `scanAll()` 同步读本机全部 transcript（实测 1.3 GB / 70–72 秒）。它在事件循环里跑，
+ * 这段时间守护进程**完全不能响应**：判活端点连得上但写不出 beat，于是 `--health`
+ * 报 `unresponsive`（「进程卡住了」）—— 一个新的假告警，与 DF-028 那一类同源。
+ * 实测：tick 间隔出现 103000ms / 97000ms 两处（正常 15000ms）。
+ *
+ * 放进子进程之后，这件事与「守护进程活不活」彻底解耦：子进程慢，端点照样应答。
+ *
+ * ## 判据没有第二份
+ *
+ * 子进程跑的是 `asked.mjs` **自己**的 `--json` 入口（那个 CLI 用同一份 `scanAll`），
+ * 这里只负责把 JSON 读回来。所以「什么算一个未回答的问题」仍然只有一个答案来源。
+ *
+ * ## 失败必须能被调用方区分
+ *
+ * 返回 `null` 表示「跑完了，没有结果」；返回 `{ __failed: '...' }` 表示「子进程没跑成」。
+ * **不能都返回空数组** —— 那会把「我读不到」说成「没有人在问」，
+ * 而后者会让 `lastAskedScanAt` 被推进，下一次要再等一个 `changed` 才重试。
+ */
+export function runAskedScanInChild({ root, nowMs = Date.now(), minHours = 1, timeoutMs = 300_000, nodePath = process.execPath } = {}) {
+  const askedScript = join(dirname(fileURLToPath(import.meta.url)), 'asked.mjs');
+  const args = [askedScript, '--json', '--hours', String(minHours), '--no-save'];
+  // **根与时钟必须显式传**（DF-097）。不传的话子进程读 `$HOME/.claude` 与挂钟，
+  // 而 `runTick` 的 `root` / `nowMs` 可能是注入的（测试、`--now`、`CLAUDE_CONFIG_DIR`）。
+  // 那会让「同一轮里两个时钟」重现 —— `runScan` 的注释里记过同一类缺陷。
+  // `--no-save`：历史文件由守护进程那一侧统一管，子进程不该竞争写它。
+  if (root) {
+    args.push('--projects-root', join(String(root), 'projects'));
+    args.push('--sessions-root', join(String(root), 'sessions'));
+  }
+  if (Number.isFinite(nowMs)) args.push('--now', new Date(nowMs).toISOString());
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(nodePath, args, {
+        windowsHide: true,
+        // **`asked.mjs` 的路径根与时钟都从环境注入**：它读 `$HOME/.claude` 与挂钟，
+        // 而 `runTick` 的 `root` / `nowMs` 可能是被注入的（测试与 `--now`）。
+        // 不传的话子进程会去扫**真实**语料 —— 那既慢，又让「同一轮里两个时钟」重现。
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      resolve({ __failed: `无法启动 asked 扫描：${e.message}` });
+      return;
+    }
+    let out = '';
+    let err = '';
+    let done = false;
+    const finish = (payload) => { if (!done) { done = true; resolve(payload); } };
+    const timer = setTimeout(() => {
+      finish({ __failed: `asked 扫描超时（${timeoutMs}ms）` });
+      try { child.kill(); } catch { /* 已退 */ }
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { out += d.toString('utf8'); });
+    child.stderr.on('data', (d) => { err += d.toString('utf8'); });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      finish({ __failed: `asked 扫描子进程出错：${e.message}` });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      // `asked.mjs --json` 的 stdout 就是结果 JSON；它自己的进度/警告一律走 stderr。
+      let parsed;
+      try { parsed = JSON.parse(out); } catch {
+        finish({ __failed: `asked 扫描输出不是 JSON（exit=${code}）：${(err || out).trim().slice(0, 200)}` });
+        return;
+      }
+      if (code !== 0 && !parsed) {
+        finish({ __failed: `asked 扫描以 ${code} 退出：${(err || '').trim().slice(0, 200)}` });
+        return;
+      }
+      finish(parsed);
+    });
+  });
+}
 
 /**
  * 跑一次扫描。`project` 为 null 时是全量（约 20s），否则单项目（约 1.5–2s）。
@@ -2287,6 +2491,7 @@ export async function runTick({
   scan = runScan,
   classify = null,
   observations = null,
+  liveness = null,
 } = {}) {
   const stateDir = dir || defaultStateDir(env);
   const log = logger || createLogger(stateDir);
@@ -2295,7 +2500,8 @@ export async function runTick({
   // 完整性检查必须在 mkdirSync 之前：一旦建了目录，「丢了」和「首次运行」就分不出来了。
   // 归属检查：同一台机器上两份克隆会静默共用同一个 state.json。
   // 不改变路径（那会让「换目录就丢数据」），只让冲突可见。
-  const claim = claimOwnership(stateDir, ROOT_DIR, { nowMs });
+  // `liveness`（DF-092）：常驻进程的判活端点，`startWatch` 起好后一路传进来。
+  const claim = claimOwnership(stateDir, ROOT_DIR, { nowMs, liveness });
   if (claim.conflict) {
     const prevRepo = claim.previous && claim.previous.repo;
     const msg = `state-shared: 数据目录 ${stateDir} 已被另一个仓库使用（${prevRepo}）。` +
@@ -2436,23 +2642,38 @@ export async function runTick({
     const askedDue = forceFull || changed.length > 0 || !state.lastAskedScanAt;
     if (askedDue && !firstProbe) {
       try {
-        const { scanAll } = await import('./asked.mjs');
         const t0 = process.hrtime.bigint();
-        // `sessionsRoot` 必须给：`asked.mjs` 从「只看文本结尾」升级为「做现状对账」后，
-        // 静默过久 / 宿主已不在等 / 同项目别处已回应 这三类都在这一层被拦掉。
-        // 不给的话它退化成老行为（`freshness: 'host-unknown'`）——那正是 2026-11-02 误报的形态。
-        const asked = scanAll({
-          projectsRoot: join(root, 'projects'),
-          sessionsRoot: join(root, 'sessions'),
-          nowMs,
-          minHours: ASKED_MIN_HOURS,
-        });
+        // **在子进程里跑，不在事件循环里跑（DF-097）。**
+        //
+        // 实测：`scanAll()` 在本机 1.3 GB 语料上要 **70–72 秒**，而它是**同步的** ——
+        // 一跑就把守护进程的事件循环整个占住 70 秒以上。后果不是「慢」，是
+        // **判活端点答不出 beat**：`--health` 在这段时间里连得上、读不到帧，
+        // 于是报 `unresponsive`（「进程卡住了，先看日志」）—— 而那正是本任务要修的
+        // DF-028 那一类假告警，只是换了个原因。
+        //
+        // 实测证据（真守护进程、90 秒 tick 间隔）：日志里 tick 间隔出现
+        // **103000ms / 97000ms** 两处（正常 15000ms），而同期 `--health` 恰好
+        // 报 `3000ms 内没有读出 beat`。
+        //
+        // 为什么不在进程内改成异步：`readRecords` 读 1.3 GB 全是同步 IO 与同步 JSON
+        // 解析，拆成异步要把整条链路重写，而这条链路的成本本来就不该由守护进程付。
+        // 放进子进程还顺带把「它慢」与「守护进程活不活」彻底解耦：
+        // 子进程慢，端点照样应答。
+        //
+        // `scanAll` 的判据**一个字没动** —— 这里换的只是它在哪里执行。
+        const asked = await runAskedScanInChild({ root, nowMs, minHours: ASKED_MIN_HOURS });
         summary.ran.push('asked');
         summary.timings.askedMs = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
-        const ac = askedCandidates(asked, { nowMs });
-        candidates = candidates.concat(ac);
-        summary.askedFound = ac.length;
-        state.lastAskedScanAt = new Date(nowMs).toISOString();
+        if (asked && asked.__failed) {
+          // 子进程失败不等于「没有人在问」—— 必须进 errors，不许当成空结果。
+          summary.errors = [...(summary.errors || []), new Error(asked.__failed)];
+          log.error(`asked-scan-failed: ${asked.__failed}`);
+        } else if (asked) {
+          const ac = askedCandidates(asked, { nowMs });
+          candidates = candidates.concat(ac);
+          summary.askedFound = ac.length;
+          state.lastAskedScanAt = new Date(nowMs).toISOString();
+        }
       } catch (e) {
         summary.errors = [...(summary.errors || []), e];
         log.error(`asked-scan-failed: ${e.message}`);
@@ -2575,21 +2796,53 @@ export async function startWatch({
   const interval = Number.isFinite(tickMs) && tickMs >= 1000 ? tickMs : 15_000;
   const log = logger || createLogger(stateDir, { mirror: (l) => process.stdout.write(l + '\n') });
   log.info(`watch 启动 dir=${stateDir} tick=${interval}ms`);
+
+  // **判活端点必须在第一轮 tick 之前建好**（DF-092）。
+  //
+  // 顺序很重要：`runTick` 会把 nonce / endpoint 写进 proc.json，而 `--health` 读的是
+  // proc.json。先起监听、再写见证，中间那段时间里 proc.json 描述的是一个"还没在听"的
+  // 端点 —— 那一段只会持续几毫秒，且此时 `--health` 会看到「连得上但没 beat」，
+  // 判 `unresponsive` 而不是误判「健康」。反过来（先写见证后起监听）在崩溃窗口里
+  // 会留下一个**永远**连不上的端点，那才是更坏的方向。
+  const nonce = makeNonce();
+  let liveness = null;
+  try {
+    liveness = await startLivenessServer({
+      endpoint: livenessEndpoint({ nonce, stateDir, platform: process.platform }),
+      nonce, pid: process.pid, startedAt: processStartedAt(), logger: log,
+    });
+  } catch (e) {
+    // 起不来不是致命错误（判活端点起不来不该杀死守护进程），
+    // 但必须留痕：`--health` 会因为「没有判活端点」而说「判不了」。
+    log.error(`liveness-start-failed: ${(e && e.message) || e} —— --health 会报「判不了进程死活」，这是如实降级`);
+    liveness = { ok: false, nonce: null, endpoint: null, error: String((e && e.message) || e) };
+  }
+  if (liveness.ok) log.info(`liveness 端点已就绪 ${liveness.endpoint}`);
+
   let stop = false;
   const stopper = () => { stop = true; };
   if (signal && typeof signal.addEventListener === 'function') {
     signal.addEventListener('abort', stopper, { once: true });
   }
 
-  while (!stop) {
-    try {
-      await runTick({ dir: stateDir, claudeDir, notifier, logger: log, env, dryRun });
-    } catch (e) {
-      // 单轮失败不该杀死守护进程，但必须留 ERROR
-      log.error(`tick-failed: ${e.message}`);
+  try {
+    while (!stop) {
+      try {
+        await runTick({ dir: stateDir, claudeDir, notifier, logger: log, env, dryRun, liveness });
+      } catch (e) {
+        // 单轮失败不该杀死守护进程，但必须留 ERROR
+        log.error(`tick-failed: ${e.message}`);
+      }
+      if (stop) break;
+      await new Promise((r) => setTimeout(r, interval));
     }
-    if (stop) break;
-    await new Promise((r) => setTimeout(r, interval));
+  } finally {
+    // **退出时必须关端点**。POSIX 的 socket 文件不会随进程消失（Windows 管道会），
+    // 残留文件会让 `probeLiveness` 连上但读不到 beat，把「已经退出」误报成
+    // 「unresponsive」（进程卡住）—— 那会把处置从「重启」误导成「先看日志」。
+    if (liveness && typeof liveness.close === 'function') {
+      try { await liveness.close(); } catch { /* 退出路径不抛 */ }
+    }
   }
   log.info('watch 退出');
 }
@@ -2829,7 +3082,19 @@ export const HEALTH_PERIODS = Object.freeze({
   probe: PROBE_INTERVAL,
 });
 
-export function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIODS, logHealth = undefined, procWitness = undefined, judge = judgeProcess } = {}) {
+/** 守护进程健康度。**异步**（DF-092）：进程层要对判活端点采证，而采证必须异步——
+ *  同步读管道在没有应答时永久阻塞（实测，见 `proc-liveness.mjs`）。
+ *
+ *  返回 `{ healthy, reasons[], layers[], process? }`。reasons 为空才算健康。
+ *
+ *  ⚠ 签名变更是**故意的不兼容**：改成一个同步的实现就要么回到 spawn（DF-092 的原病），
+ *  要么接受「冻结的守护进程会把 --health 挂死」（比原来的超时更坏）。
+ *  调用方只有三处（`--health` / `--inbox` / TUI），都在这一个仓库里，全部已改。
+ *
+ *  `judge` 只能是异步的（`judgeProcess` 默认就是）—— 传同步函数会在 `await` 时被
+ *  当成普通值，仍然是对的（`await` 一个非 Promise 是合法的），所以注入假判据的测试
+ *  不必跟着改成 async。 */
+export async function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIODS, logHealth = undefined, procWitness = undefined, judge = judgeProcess } = {}) {
   const layers = [];
   const reasons = [];
 
@@ -2899,15 +3164,21 @@ export function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIOD
   }
   // 进程层（DF-028）。**只在心跳已经停了的时候才说话。**
   //
-  // 为什么不在健康时也报一句「进程还在」：那样每次 --health 都要 spawn 一次 powershell
-  // （实测 360ms），而它在健康时提供零信息 —— 「心跳在走」已经蕴含「进程活着」。
-  // 反过来，健康时不产出 `process` 字段，是为了让调用方**无法**误读它：
-  // 一个永远存在、永远说 alive 的字段，迟早会被人拿去当「进程检查通过」用。
+  // 为什么不在健康时也报一句「进程还在」：healthy 时那一条提供零信息 ——
+  // 「心跳在走」已经蕴含「进程活着」。反过来，健康时不产出 `process` 字段，是为了让
+  // 调用方**无法**误读它：一个永远存在、永远说 alive 的字段，迟早会被人拿去当
+  // 「进程检查通过」用。
+  //
+  // DF-092 之后，这条路的成本从「spawn 一次 powershell（本机 5–24 秒，必超时）」
+  // 降到「连一次命名管道 + 读一帧（实测 3–70ms；端点不在时 8–11ms）」。所以它现在
+  // 是**有界**的：最坏情况是 `BEAT_TIMEOUT_MS`（3000ms，取值依据见该常量注释），不会像同步读那样挂死。
   //
   // `judge` 参数只为了可测：注入假判据就能验「未在运行时到底调用没调用它」。
+  // 它是 `await` 的 —— 假判据可以是同步函数（`await` 非 Promise 是合法的），
+  // 所以既有测试不必改写。
   let processVerdict;
   if (reasons.length > 0 && procWitness !== undefined) {
-    processVerdict = judge(procWitness, { nowMs });
+    processVerdict = await judge(procWitness, { nowMs });
     layers.push({ name: 'proc', verdict: processVerdict.verdict, alive: processVerdict.alive, reason: processVerdict.reason });
   }
 
@@ -2951,8 +3222,11 @@ export function formatHealth(result) {
   // 它没有 interval / ageMs —— 走上面那个循环会被印成「上限 NaN 天」，
   // 那正是本仓反对的「看起来精确的假数字」。
   for (const l of result.layers.filter((x) => x && x.name === 'proc')) {
-    const mark = (l.verdict === 'gone' || l.verdict === 'reused' || l.verdict === 'stuck') ? '✗' : '？';
-    lines.push(`  ${mark} proc   ${l.reason}`);
+    // `unresponsive` 也是 ✗：那说明端点答不了 beat，处置是「先看日志」，
+    // 与 `unknown`（真的判不了）不是一回事 —— 打 `？` 会把这两件事混起来。
+    const bad = l.verdict === 'gone' || l.verdict === 'reused'
+      || l.verdict === 'stuck' || l.verdict === 'unresponsive';
+    lines.push(`  ${bad ? '✗' : '？'} proc   ${l.reason}`);
   }
   lines.push('');
   if (result.healthy) {
@@ -2977,9 +3251,23 @@ export function formatHealth(result) {
       lines.push('处置：**进程还在，但卡住了**。');
       lines.push('  **先看日志再重启**——直接重启会丢掉它是怎么卡的现场：');
       lines.push('  数据目录下的 `watch.log` 与 `log-health.json`（`--stats` 看观察日志分布）。');
+    } else if (p.verdict === 'unresponsive') {
+      // 这一档是 DF-092 新加的，也是**旧实现吐不出来的结论**：端点连得上，
+      // 证明 OS 那一侧还在；没有 beat，证明进程的用户态没在跑。
+      // 它与 `unresponsive` 的处置跟 `stuck` 一样（先看日志），但**理由不同**，
+      // 所以文案分开 —— 混起来会让「主机还在但僵住」看起来像「普通卡顿」。
+      lines.push('处置：**进程的判活端点连得上，但它没有应答**。');
+      lines.push('  这比「PID 还在」更强：它证明进程对象还在 OS 里，只是主循环不再响应。');
+      lines.push('  **先看日志**（`watch.log` / `log-health.json`），再看它是不是在等一个不会返回的 IO。');
     } else {
-      lines.push('注意：进程死活**判不了**。别按「卡住了」去猜——');
-      lines.push('  先确认 PID 是否还存在，或重启后观察。');
+      // 剩下的是 unknown / unverified / 端点缺失 —— 全部是「判不了」，
+      // 而**不是**「死了」。这句话必须说准：它决定了用户下一步该重启还是该继续看。
+      // DF-092 之前这里说的是「无权限 / 命令不可用」，而真实原因是超时（DF-091）。
+      // 现在把最后一层的原因原样带出来（`proc` 层的 reason 已经写清哪一种）。
+      lines.push('注意：进程死活**判不了**。别按「卡住了」或「已经死了」去猜——');
+      lines.push('  上面 proc 那一行写的是**具体哪一种判不了**（超时 / 权限 / 端点缺失）。');
+      lines.push('  先确认 `node scripts/install-watcher.mjs status` 与数据目录下的 proc.json；');
+      lines.push('  若 proc.json 是旧版本（没有 nonce / endpoint），重启后即可获得新的判活端点。');
     }
   }
   return lines.join('\n');
@@ -3057,7 +3345,7 @@ async function main(argv) {
       console.log('无法读取状态文件——守护进程可能从未运行过。');
       process.exit(1);
     }
-    const r = healthCheck(state, { nowMs: Date.now(), logHealth: readLogHealth(dir), procWitness: readProcWitness(dir) });
+    const r = await healthCheck(state, { nowMs: Date.now(), logHealth: readLogHealth(dir), procWitness: readProcWitness(dir) });
     if (flags.has('--json')) {
       console.log(JSON.stringify({ generatedAt: new Date().toISOString(), ...r }, null, 2));
     } else {
@@ -3085,7 +3373,7 @@ async function main(argv) {
       if (!items.length) {
         // 复用 `--health` 的同一个判据（`healthCheck`），不另写一份
         // —— 「守护进程在不在工作」这个问题只能有一个答案来源。
-        const h = healthCheck(state, { nowMs: Date.now(), logHealth: readLogHealth(dir), procWitness: readProcWitness(dir) });
+        const h = await healthCheck(state, { nowMs: Date.now(), logHealth: readLogHealth(dir), procWitness: readProcWitness(dir) });
         if (h && h.healthy === false) {
           console.log('');
           console.log('↑ 这个「空」不可信：后台监视没有在工作。');
@@ -3182,7 +3470,35 @@ async function main(argv) {
   await startWatch({ notifier, signal: ac.signal, dryRun });
 }
 
-const isDirect = process.argv[1] && /watch\.mjs$/.test(process.argv[1].replace(/\\/g, '/'));
+/** 「我是不是被直接执行」——比的是**真实路径**，不是 `argv[1]` 的后缀。
+ *
+ *  ## 旧判据为什么必须换（DF-095）
+ *
+ * 旧写法是 `/watch\.mjs$/.test(process.argv[1])`。它的两个方向都错，而且都在本仓
+ * 造成过实际后果：
+ *
+ *   **假阳性（更严重）**：`overwatch.mjs` 也以 `watch.mjs` 结尾。于是 `doctor`
+ *   一旦 import 本模块就会**当场启动守护进程** —— 它自己那条 `★ doctor 不会变成 watch`
+ *   测试就是为这件事写的，而规格 `2026-11-14-entry-point.md` §5.1 因此断言
+ *   「`watcher` 的存活判定走 spawn，**不能不 spawn**」。
+ *   实测代价：`doctor` 的 watcher 那一项要 **3451ms**（spawn 一个 node 去问一个 2ms
+ *   的问题——判活本身现在只要 1–20ms，见 DF-092）。1000ms 的硬预算里这一项永远超支。
+ *
+ *   **假阴性**：经目录符号链接执行（`npm link` / pnpm store / junction）时
+ *   `argv[1]` 是链接里的路径、`import.meta.url` 是真实路径，两边后缀碰巧都匹配，
+ *   但 `render-plan.mjs` 那类比真实路径的判据能过、比后缀的判据在别的入口上不过。
+ *   本仓已有先例（`entry-symlink.test.mjs` 的整组用例）。
+ *
+ * 现在与 `render-plan.mjs` / `launch.mjs` / `delivery-verdict.mjs` 用**同一份**判据：
+ * realpath 两边、比较相等。失败退回 `resolve()`（脚本被删 / 被挪走时不能让 import 抛）。
+ *
+ * 换掉之后 `doctor` 可以**在进程内** import 本模块拿 `healthCheck`，
+ * 不必为了问一句健康度 spawn 一整个 node —— 那条 spawn 是它超预算的根因。 */
+const realOrResolve = (p) => {
+  try { return realpathSync(p); } catch { return resolve(p); }
+};
+const isDirect = Boolean(process.argv[1])
+  && realOrResolve(process.argv[1]) === realOrResolve(fileURLToPath(import.meta.url));
 if (isDirect) {
   main(process.argv.slice(2)).catch((e) => {
     console.error(e.stack || e.message);

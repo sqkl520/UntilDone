@@ -3874,3 +3874,383 @@ node --test scripts/   → tests 2080 / pass 2073 / fail 5  （两次）
 
 **影响**：每次全量测试都会红 4-6 条，导致「全绿才能提交」这条规则实际上做不到。
 这不是小问题——它会让所有人对红警免疫。
+
+### DF-090 [fixed] 硬门在认证一句假话：「2078 条 pass」是它自己逼着写的
+
+- 发现于：2026-11-24 修 DF-028 时，跑全量测试核对 `docs/GUIDE.md:512` 的那句话
+- 位置：`scripts/check-structure.mjs` 的 `checkTestCount()` / `TALLY_SITES`；`docs/GUIDE.md:512`
+- 证据（改前）：
+  ```
+  docs/GUIDE.md:512
+    **56 个测试文件，2080 项全绿**（…其中 **2078 条 pass、2 条按平台 skip**…）
+  node --test scripts/   →  ℹ tests 2080 / pass 2070 / fail 8 / skipped 2
+  ```
+  2080 这个总数是真的（注册数），所以「对账通过」也真的成立 —— 而「全绿」是假的。
+  更糟的是那处取数正则原本是 `(\d+)\s*项全绿`：**想通过硬门，文档里就必须出现「全绿」二字**。
+  门不只在盖章，它是这句话的作者。
+- 影响：一句需要**跑完全量测试**才能验证的话，被一句**只 import 不执行**的检查盖了绿章。
+  这比没有检查更坏：它让「硬门绿」这件事本身失去意义，而本仓把「硬门绿」当成提交门槛。
+- 评估过的三条修法（都否掉了，理由写进 `checkNoExecutionClaims()` 头注释）：
+  1. 硬门跑全量测试：实测 **258 秒**，且本门会被 `dispatch-coverage.test.mjs` 在副本里
+     跑多次；并发下那 7-8 条 flaky 用例会让门随机变红（DF-026，红警驯化成噪音）。
+  2. 硬门跑粗筛子集：仍要几十秒，且造出新的假话「粗筛全绿所以全量全绿」——
+     一条更隐蔽的同一类错误。
+  3. CI 跑、硬门核「与最近一次 CI 结果一致」：要把结果写回仓库，那份文件在本地永远旧，
+     「本地门绿」变成「上次 CI 时是对的」—— 一条**看不见它坏**的判据，比没有更坏。
+- 修法（第四条）：让文档**不再声称**它核不了的事。这不是降低标准，是把断言强度收回
+  到证据能支撑的位置：「N 条已注册」可核（import 数一遍）保留，「N 条 pass」核不了删掉，
+  「全绿」是前一句的推论随之删掉。
+  - `TALLY_SITES` 里 GUIDE 那行的正则改成 `(\d+)\s*条已注册`，与其余四处同一个命题。
+  - 新增硬门检查 `executionClaims`：扫四份自证文档（README / CLAUDE / GUIDE / CAPABILITIES），
+    行内同时出现「测试语汇」与「执行结果断言」即红。
+  - **跳过围栏代码块**：README 那段「AI 说 BUILD SUCCESS — 1341 例全绿」是被批判的反例，
+    不是对仓库的断言。不跳围栏会逼人删掉本产品最核心的那张图（实测 7 处误报）。
+  - **放行条件式 / 定义式**（「才能提交」/「绿的标准」/「不算绿」）：那是规矩，不是当前状态。
+- 负向证据（5 条，`regression-count.test.mjs` §4，全部真跑硬门子进程）：
+  ```
+  ✔ 文档声称「测试全绿」而硬门只核条数 → 必须红
+  ✔ 「2078 条 pass」这种带数的执行结果断言同样必须红
+  ✔ 负向：条件式「全绿才能提交」不是断言当前状态 —— 不许误报
+  ✔ 负向：围栏代码块里的反例不许误报（README 那张「AI 说 BUILD SUCCESS」就是这种）
+  ✔ 负向：讨论「这条测试为什么失败」不是执行结果断言 —— 不误报
+  ```
+  以及手工负向：把 GUIDE 那句假话放回去 →
+  `✗ [docs/GUIDE.md] 第 512 行 出现「全绿」—— 这是对执行结果的断言…`
+- 顺带抓出的漂移：`README.md` 两次写「29 项检查」，实际 30 条（本轮新增一条检查后由既有
+  的「N 项检查」对账抓出 —— 那条检查本身是好的，它证明了「数字漂了会被抓住」）。
+- 代价：结构门 +0 个子进程、+0.1 秒（纯文本扫描）；四份文档各改一行。
+- 建议归属：已完成。
+
+### DF-093 [fixed] 文档里的测试数漂了 11 条，而「四处同源」的机制本身没坏
+
+- 发现于：2026-11-24 加 DF-090 的测试后跑硬门
+- 位置：`README.md` / `CLAUDE.md` / `docs/GUIDE.md` / `.github/workflows/validate.yml`
+- 证据：改前四处写 2080，实跑注册 2093；硬门报
+  `[README.md] 回归测试数写的是 2082，实跑注册 2093 条（56 个文件）；换成 linux 平台也是 2093 条 → 与平台无关，是漏改文档`
+- 影响：无（这道门工作正常，红的就是它该红的）。**登记它的理由是反过来的**：
+  它是「门发现漂移」的正面样本，与 DF-090 的「门盖章假话」正好相反 ——
+  同一个文件里两条检查，一条在数事实（好），一条在认证结论（坏）。
+  这个对比值得留档：**判据该核事实，不该核结论**。
+- 修法：四处 2080 → 2107（测试数；并发 Agent 的 proc-liveness.test.mjs 同时进来，最终计数以硬门为准）；README 两处「29 项检查」→「30 项检查」。
+- 负向证据：改完重跑硬门 → `✓ 已执行的 30 条检查全部通过`。
+- 建议归属：已完成。
+
+### DF-091 [fixed] 探针失败一律说成「无权限 / 命令不可用」，而真实原因 100% 是超时
+
+- 发现于：2026-11-24 修 DF-028（判活探针在生产路径上完全失效）时
+- 位置：`scripts/watch.mjs` 的 `judgeProcess()`，`PID 存在但探不到启动时刻` 那条分支
+- 证据：本机复现（`OVERWATCH_STATE_DIR` 指向一份心跳停 4 天的状态目录）：
+  ```
+  ？ proc   PID 49984 存在，但探不到它的启动时刻（无权限 / 命令不可用）—— 无法确认是不是它
+  ```
+  而同一个 PID 真的在跑（`tasklist` 有它、`process.kill(pid, 0)` 成功），
+  真实原因是 `spawnSync('powershell', …, timeout: 5000)` **每次都撞满 5 秒超时**、
+  `stdout` 为空、`Date.parse('')` = NaN → 返回 null。
+  探针本身实测 **5–24 秒**（不是代码注释里那个 355–390ms 的旧数）。
+- 影响：用户照着「无权限 / 命令不可用」去查权限和 PATH，永远不会查到这里。
+  **一条把原因说错的错误信息比没有错误信息更坏**：它把人送到错误的方向，
+  而且看起来像已经排除了一种可能。
+- 修法：探针的失败原因升级成**枚举**（`PROBE_STATES`：`not-found` / `refused` /
+  `timeout` / `eperm` / `parse-failed` / `closed` / `error`），每个状态有自己的文案
+  （`probeFailureReason()`），且 `judgeProcess` 按状态落到不同的 verdict：
+  超时 → `unresponsive`（进程可能在，主循环没响应），端点不存在 → `gone`，
+  权限 → `unknown`（**判不了，不许说成死了**）。
+- 负向证据：`watch.test.mjs` 的
+  `DF-091 负向：端点连得上但读不到 beat → unresponsive，且文案说的是「超时」不是「无权限」`
+  —— 它同时断言 `reason` 含「没有读出 beat|超时」且**不含**「无权限|命令不可用」。
+  把旧文案放回去，这条立刻红。
+- 建议归属：已完成。
+
+### DF-092 [fixed] 判活的唯一实现依赖 spawn，而本机任何 spawn 都慢到必超时（DF-028 的根因）
+
+- 发现于：2026-11-24，`--health` 在守护进程明明在跑的时候说「判不了」
+- 位置：`scripts/watch.mjs` 的 `probeStartTimeOf()`（已删除）
+- 证据（全部本机实测，可复现）：
+  ```
+  powershell Get-Process .StartTime   5–24 秒   （超时 5000ms → 每次都杀）
+  累积的 powershell 进程               22 个 / 9 小时 / 约 1.7GB，每个 CPU 8–9 秒
+  where /q node（什么都不干）          2957ms
+  os.getPriority()                     10 = BelowNormal（Process Lasso 压的）
+  A/B：BelowNormal 13759ms → NORMAL 2804ms（即使 NORMAL 仍 2.8–6.3 秒，仍超时）
+  ```
+  结论：**不是 powershell 慢，是这台机器上任何 spawn 都慢**。缩短超时 / 换更轻的命令
+  都没有出路 —— 判活这条路必须不 spawn。
+- 影响：`--health` 的进程层**永远是 `unknown`**，而它的全部意义是区分
+  「进程死了（该重启）」与「进程卡住了（先看日志）」。这条判据存在但从未工作过。
+  `--inbox` 复用同一个判据，被连带打穿；`doctor` 的 watcher 项同理（连带造成 4600ms+ 的墙钟）。
+- 修法（新增 `scripts/proc-liveness.mjs`，`watch.mjs` 的判活改成调它）：
+  1. 守护进程启动时生成随机 **nonce**（12 字节 → 24 个十六进制字符），
+     用它建判活端点：Windows `\.\pipe\untildone-<nonce>`，POSIX `<stateDir>/liveness-<nonce>.sock`；
+  2. nonce / endpoint / pid / startedAt 一起写进 `proc.json`（version 2）；
+  3. **判活 = 连上端点 且读到一个 beat**。只判「连上」不够 —— 实测主线程冻结时
+     OS 仍接受连接（管道对象由内核持有），那会把 DF-023 那类「进程在、没在跑」判成健康；
+  4. 读 beat 的超时是新参数 `BEAT_TIMEOUT_MS = 800`（毫秒级，不是秒级）。
+- 实测（本机）：
+  ```
+  活着的端点：连上 + 读到 beat    首帧 13–35ms，后续 1–4ms
+  已关闭的端点：ENOENT            1–7ms
+  连得上但不应答：按注入的超时返回  300ms 用例实测 431ms 墙钟
+  ```
+- **为什么改成异步**：同步 `fs.openSync` + `fs.readSync` 在「端点存在但不回 beat」时
+  **永久阻塞**（实测 20 秒未返回；Windows 上 `O_NONBLOCK` 对命名管道无效）。
+  那比原来的 5 秒超时**更坏** —— 它会把 `--health` 整个挂死。所以
+  `probeLiveness` / `judgeProcess` / `healthCheck` 全部改成 Promise，三处调用方
+  （`--health` / `--inbox` / TUI）已同步改。
+- **PID 复用免疫（DF-028 的核心，不许为绿而削弱）**：判据从「时间容差」升级为
+  「**端点归属**」。PID 被复用 → 新进程用**它自己的** nonce，旧端点名不存在 →
+  连不上 → 判 `gone`/`unknown`，**与时间无关，没有 2 秒窗口可钻**。
+  时间容差降级为第二道交叉核对（帧里回带 pid / startedAt / nonce，任何一道不符 → `reused`）。
+  代码里**没有任何一条分支**会仅凭「PID 存在」返回 `alive: true`：那条退路配了两条负向用例
+  （端点关掉但 PID 在、nonce 不匹配但时间完全一致），它们都会红。
+- 负向证据（全真跑，见回复正文）：把 `probeLiveness` 改成永远返回 `timeout` →
+  `proc-liveness.test.mjs` **5 条红**，而 `watch.test.mjs` 的 DF-028 组 **12 条仍全绿**
+  （AC-4：逻辑与环境解耦）；`--health` 端到端在有真守护进程跑着时读到了真的 beat
+  （见下条「生产实测」）。
+- 代价：`healthCheck` 从同步变异步（签名不兼容，调用方三处全改）；新增一个模块
+  （14 条测试）。DFS-06/DF-069 等既有用例只加了 `await`，**断言一条未改**。
+- 建议归属：已完成。
+
+### DF-094 [fixed] 我给探针选的超时（800ms）会造出假告警 —— 而它当初的理由是「拍的三倍余量」
+
+- 发现于：2026-11-24 修完 DF-092 后，用真守护进程连探 60 次做验收，其中 **1 次**报
+  `unresponsive`（「进程卡住了，先看日志」），而那个守护进程一切正常
+- 位置：`scripts/proc-liveness.mjs` 的 `BEAT_TIMEOUT_MS`
+- 证据（本机实测，91 次真实 tick 的同步段耗时可复算）：
+  ```
+  p50     约   15ms   （jobs=8ms + probe 未到期）
+  次大   1059 / 1128ms
+  最大   2001ms       （probe=1992ms，一次 L-mid 扫了两个项目）
+  ```
+  第一版注释写的理由是「一次 tick 的同步段在 300ms 以内，取 800 是三倍余量」。
+  **那个 300ms 我没有量过，是估的**，而 91 条真实日志里最长的一次是 2001ms —— 差 6.7 倍。
+- 影响：800ms 会把**正常的慢 tick** 判成 `unresponsive`。这不是小概率：
+  实测 60 次探测里命中 1 次（约 1.7%）；L-mid 每 5 分钟一次、每次 0.4–2 秒，
+  在高峰期这个比例会更高。假告警的代价在本仓有明确判词 ——
+  「一条误报的代价是用户开始忽略所有通知，是断崖式的」。
+- 修法：`BEAT_TIMEOUT_MS` 800 → **3000**。取值有可复核的下界（必须 > 实测最大值 2001）
+  与可说明的余量（1.5 倍，给更慢的机器）。仍远在 AC-1 的 10 秒上限内。
+- **这一条为什么必须单独记**：它是「我用一个没量过的数当判据」的实例，而且是**我自己**
+  在同一次改动里犯的。修复前那版注释还写着「与 healthCheck 里 interval*3 的口径同构」——
+  那是在为一个拍出来的数找一个听起来有出处的说法。本仓反对的正是这个。
+- 负向证据：`proc-liveness.test.mjs` 的「探针默认超时必须是毫秒级」把它钉在
+  `>0 && <5000`；另有「超时判据必须按注入的 timeoutMs 生效」一条钉住它真的被用上。
+  改回 800 时，那条用例不会红（800 也在区间内）—— **这是已知的覆盖缺口**：
+  阈值本身只能靠「拿真实 tick 分布去核」来守，而那需要生产日志，不适合放进单测。
+  所以这条记录就是它的守卫。
+- 建议归属：已完成。
+
+### DF-095 [fixed] 「watch.mjs 只能 spawn 不能 import」是**一条入口守卫写错**造成的假约束，代价是 doctor 永远超预算
+
+- 发现于：2026-11-24 修完 DF-092 后复核 doctor（AC-8 要求 `WATCHER_COST_MS` 与实测同量级）
+- 位置：`scripts/watch.mjs` 的主模块判据；`scripts/overwatch.mjs` 的 `checkWatcherLive()`
+- 证据（本机实测）：
+  ```
+  doctor 的 watcher 那一项     3451ms      ← spawn 一整个 node
+  它问的那个问题（healthCheck）    2ms      ← 判活端点 1–20ms
+  ```
+  1000ms 的硬预算里 3451ms 永远超支 —— `docs/spec/2026-11-14-entry-point.md` §4
+  那句「1000ms 是硬约束」因此一直是假话。
+- 根因：`watch.mjs` 的「我是不是被直接执行」判据是 `/watch\.mjs$/`，而 `overwatch.mjs`
+  **以 `watch.mjs` 结尾** → import 会当场启动守护进程。当年（`2026-11-14`）的处置是
+  「那就 spawn 吧」，并把它写进了规格 §5.1 当作架构约束：
+  > `watcher` 的存活判定走 spawn —— 不能不 spawn，见 §5.1
+- 影响：**一条实现细节的副作用被当成了架构要求**。它的代价不只是慢：`doctor` 的
+  `watcherUnhealthy` / `watcherChecked` 两个结论全靠这一项，而它在默认预算下常常
+  直接被跳过（见下条 DF-096），于是「后台监视没在跑」这件事在 doctor 上大半时候看不见。
+- 修法：判据换成 `render-plan.mjs` / `launch.mjs` / `delivery-verdict.mjs` 已经用的
+  **同一份 realpath 比较**（两边 realpath 相等才算直接执行；失败退回 `resolve()`）。
+  然后 `doctor` 改成**在进程内** `import('./watch.mjs')` 调 `healthCheck()`，
+  只在导出形状变了时退回 spawn（不许猜）。
+- 实测（改后）：watcher 那一项 **3451ms → 34ms**（约 100 倍）；`doctor` 的 `workMs`
+  **762ms**（预算内）。`WATCHER_COST_MS` 420 → 120（420 与 34 差 12 倍，
+  撞 AC-8 的「不得差 10 倍以上」；120 = 34 × 3.5，给慢机器三倍余量）。
+- 负向证据：把守卫改回 `/watch[.]mjs$/` → `★ doctor 不会变成 watch` **红**
+  （实测 `Error: 入口超时或被信号终止（signal=SIGTERM … ETIMEDOUT） args=["doctor","--budget","30000"]`，
+  而手工跑会看到 stdout 里一行行 `tick …` 永不结束）。
+- 规格同步：`2026-11-14-entry-point.md` §5.1 / §5.2 原写着「必须 spawn」，
+  已改成「曾经必须，2026-11-24 修掉了根因」，并把「一条实现细节的副作用被写成架构要求」
+  这句话留在那里 —— 那是这一条真正的教训。
+- 建议归属：已完成。
+
+### DF-096 [fixed] 那条标着 `★` 的守护测试一直是**假绿**：它守的事从来没被执行过
+
+- 发现于：2026-11-24 做 DF-095 的负向验证时（把守卫改坏，它居然还是绿的）
+- 位置：`scripts/overwatch.test.mjs` 的 `★ doctor 不会变成 watch`
+- 证据：把 `watch.mjs` 的守卫改回 `/watch[.]mjs$/`（也就是把它改坏）后：
+  ```
+  ✔ ★ doctor 不会变成 watch … (2705ms)   ← 仍然是绿的
+  而手工跑：timeout 40 node scripts/overwatch.mjs --budget 30000 → exit 124，stdout 里 tick 一直刷
+  ```
+- 根因是**两个前置条件都没满足**，缺一不可：
+  1. 原来跑的是 `run(['doctor'])`（默认预算 1000ms），而 `watcher` 那一项在
+     「剩余 < `WATCHER_COST_MS`」时**整个被跳过** —— `checkWatcherLive` 根本没调；
+  2. 就算给了预算，`checkWatcherLive` 在「数据目录没有 `state.json`」时也**提前 return**
+     （「从未运行过」的正常分支），而 import 那一步在它**之后**。临时目录里当然没有 state.json。
+- 影响：这是本仓最该有牙齿的一条测试（它守的是「自检命令别把自己变成守护进程」），
+  而它**从来没有牙齿**。它绿的时候，读者会以为这件事被守住了。
+- 修法：夹具补上 `state.json`、预算给 30000，并**加一条前置断言**
+  （`watcher` 那一行必须出现在输出里、且不是「预算内没时间跑」）——
+  这样「测试没跑到」与「测试通过了」在报告里不同形。判据本身一字未改。
+- 负向证据：改坏守卫 → 该条 **红**，原话
+  `Error: 入口超时或被信号终止（signal=SIGTERM error=spawnSync … ETIMEDOUT）`。
+- **这一条与 DF-090 同构**：一条测试绿了，而它守的那件事根本没被执行。
+  区别是 DF-090 是硬门盖章（文档说全绿而没跑），这条是测试自己静默跳过自己的前置条件。
+- 建议归属：已完成。
+
+### DF-097 [fixed] 判活修好之后，同一个假告警从另一个原因又冒出来：`asked` 层把事件循环占住 70–103 秒
+
+- 发现于：2026-11-24 用真守护进程做 AC-1 验收（连探 90 秒），
+  `--health` 报 `3000ms 内没有读出 beat — 进程可能还在，但它的主循环没有响应`
+- 位置：`scripts/watch.mjs` `runTick()` 的 L-mid 段，`scanAll()` 的调用点
+- 证据（全部实测）：
+  ```
+  scanAll() 单次耗时                72306ms / 70039ms      （本机 1.3 GB transcript）
+  守护进程 tick 间隔 top2           103000ms / 97000ms     （正常 15000ms）
+  同期 --health                     3000ms 内没有读出 beat
+  ```
+  而 `--health` 那条结论是**对的** —— 事件循环真的被占住了 70 秒。
+  也就是说：`DF-092` 换掉探针之后，**判活第一次有能力看见这个既有缺陷**；
+  旧探针从未报过它（旧探针自己就超时，永远是 `unknown`，掩盖了这件事）。
+- 影响：`asked` 层每 5 分钟把守护进程冻住 70–100 秒。这段时间里：
+  · 判活端点答不出 beat（`unresponsive`，用户被告知「先看日志」）；
+  · L-fast（15 秒一次）的 job 探测**被整段跳过** —— DF-023 那一类「进程在、没在跑」
+    每 5 分钟复发一次，每次 70 秒。
+- 修法：把 `scanAll()` 挪到**子进程**（`runAskedScanInChild()`，跑 `asked.mjs --json`）。
+  判据一个字没动 —— 子进程跑的是同一个 `scanAll`，这里只换了执行位置。
+  同时给 `asked.mjs` 的 CLI 加三个注入点（`--projects-root` / `--sessions-root` / `--now`），
+  让子进程扫**同一个**语料、用**同一个**时钟（不传就会去扫真实语料，重现「同一轮两个时钟」）。
+  `--no-save`：历史文件由守护进程侧统一管，子进程不竞争写它。
+- 实测（改后）：tick 间隔 top5 = **17000 / 16000 / 16000 / 16000 / 16000**
+  （正常值）；150 秒内连探 **630 次，0 次非 beat，最大延迟 995ms**。
+- 失败语义：子进程没跑成时返回 `{ __failed }` 而不是空数组 —— 空数组会把
+  「我读不到」说成「没有人在问」，并且会推进 `lastAskedScanAt`，让下一次重试再等一个
+  `changed`。这是 `DF-089` 同一条纪律：**「没读到」与「读到空的」不许同形**。
+- 建议归属：已完成。
+
+### DF-098 [open] `readonly: true` 只是注释，7 个只读角色里 5 个仍持有 `Write` 工具
+
+- 发现于：2026-11-24 用户问「锐评为什么在改文件」时，主线程核对角色定义
+- 证据（实测，逐份 frontmatter）：
+  ```
+  oversight-acceptor    readonly=true   tools=Read, Grep, Glob, Write
+  oversight-critic      readonly=true   tools=Read, Grep, Glob, Write
+  oversight-redteam     readonly=true   tools=Read, Grep, Glob, Write
+  oversight-review      readonly=true   tools=Read, Grep, Glob, Write
+  oversight-verifier    readonly=true   tools=Read, Grep, Glob, Bash, Write
+  oversight-probe       readonly=true   tools=Read, Grep, Glob          ← 无 Write
+  oversight-safety      readonly=true   tools=Read, Grep, Glob          ← 无 Write
+  ```
+  **7 个 `readonly: true` 里，5 个仍持有 `Write`。**
+- 性质：`readonly` 是**本仓自己的约定字段**，宿主的 `tools` 白名单不知道它。
+  `roles.mjs` 的 `discoveryRoles()` 会读 `readonly` 并标进注册表，
+  但**没有任何机制据此收回 `Write`**。也就是说「只读角色」只读是因为它们**自觉**，
+  不是因为它们**不能**。
+- 与既有条目的关系：这与 `DF-079`（`forbiddenContext` 覆盖没消费者）是同一形态
+  ——**写了约束，没有执行它的机制**。本仓最稳定的缺陷类型。
+- 影响：
+  1. 派一个锐评/验收 Agent 去评审时，它**有能力**顺手改交付物。评审者与被评审者
+     的边界靠 prompt 里的「禁止修改」维持，不靠工具白名单。
+  2. 更隐蔽的一面：如果评审 Agent 改了文件而我们没注意，**评审报告本身会失真**
+     （它评的是自己改过的版本）。
+- 现在的缓解（不是修复）：派 Agent 时 prompt 里明写「禁止修改仓库文件」，
+  并在评审前后比对 `git status` 与文件 mtime。本轮实测两个评审 Agent 运行 1 小时内
+  文件时间戳未变（20:19 / 21:58 / 21:34 均早于它们启动），**本次未被改动**。
+- 修法方向（不在此条内定）：
+  1. 把 5 个角色的 `Write` 收窄到一个受限路径（如果宿主支持工具级路径限制），或
+  2. 让 `checkAgents()` 增加一条：`readonly: true` 且 `tools` 含 `Write` 时，
+     必须同时声明写入范围（如 `writeScope: tasks/runs/**`），否则红；或
+  3. 承认 `readonly` 只是文档约定，把它改名为 `reportsOnly` 并写清它不提供保护。
+- 建议归属：独立任务（与 DF-079 同批）
+
+### DF-099 [fixed] 我自己写的 `startDiff = Infinity` 会把一个**正在应答 beat 的活进程**判成「已退出」
+
+- 发现于：2026-11-24/25 锐评（另一个 Agent 复审 DF-092 的实现时抓到）
+- 位置：`scripts/watch.mjs` 的 `judgeProcess()`，`state === 'beat'` 那条分支
+- 证据：原写法
+  ```js
+  const startDiff = Number.isFinite(f.startedMs) && Number.isFinite(startedAtMs)
+    ? Math.abs(f.startedMs - startedAtMs)
+    : Infinity;
+  if (f.nonce !== nonce || Number(f.pid) !== pid || startDiff > toleranceMs) → reused
+  ```
+  `Infinity > toleranceMs` 恒为 true。于是**只要见证里的 `startedAt` 不可解析**，
+  一个 honestly 应答 beat 的活进程就被判 `alive:false / reused`。
+- 影响：处置方向正好反了 —— 从「先看日志」变成「直接重启」，而重启会把现场丢掉。
+  这正是本仓最反对的那类失效：**不知道被写成了证伪**。
+  更刺眼的是**消息生成处**特意写了 `startDiff !== Infinity` 来避免打印 `Infinity`，
+  却在**判决**上漏了同一个判断 —— 守住了消息，没守住结论。
+- 修法（锐评给的）：时间判不了 → 这一道核对**弃权**，交给 nonce / pid 两道
+  （它们本就足够强：nonce 是每个进程现生成的随机串）。
+  ```js
+  const timeComparable = Number.isFinite(f.startedMs) && Number.isFinite(startedAtMs);
+  const startDiff = timeComparable ? Math.abs(f.startedMs - startedAtMs) : null;
+  const timeMismatch = timeComparable && startDiff > toleranceMs;
+  ```
+- 负向证据：`watch.test.mjs` 的两条
+  - `DF-099：见证里缺 startedAt 时，端点正常应答 ≠ 判成 reused`
+  - `DF-099 反向：时间可判且差太多时，仍然要判 reused（别为了修上一条而削弱判据）`
+  两条一起钉住「弃权不等于放行」。
+- **记这一条的理由**：它是「我自己在同一轮里犯的第二种同型错误」——
+  DF-094 是拿没量过的数当判据，这条是把「判不了」编码成了「证伪」。
+  两者都发生在这次改动里，都被别人量出来 / 看出来，而不是我自己发现的。
+- 建议归属：已完成。
+
+### DF-100 [fixed] 负向验证脚本卡住 3.5 小时，末尾的 `cp 备份 → 原文件` 在文件已被改好之后才执行，把 20 分钟的修复整个盖掉
+
+- 发现于：2026-11-25 用户问「似乎有三个东西还在跑」时排查
+- 位置：我自己的调试脚本，以及 `scripts/watch.mjs`
+- 现场证据（进程的父 bash 命令行还留着）：
+  ```
+  node scripts/overwatch.mjs --budget 30000 > /tmp/neg-doctor.txt 2>&1
+  grep -nE "watch 启动|tick=|watcher " /tmp/neg-doctor.txt | head -5
+  cp /tmp/watch.bak scripts/watch.mjs; echo restored
+  ```
+  前一句把 `watch.mjs` 换成**旧判据**（为了负向验证「doctor 会变成 watch」），
+  中间那句 `node scripts/overwatch.mjs` **真的变成了守护进程**，永远不返回 ——
+  于是 `cp` 那句在 3.5 小时后、文件早已改好之后才执行，用 20:25 的备份覆盖了 21:44 的工作。
+- 损失：DF-099（`startDiff = Infinity`）与 DF-097（`runAskedScanInChild` 接线）两处修复消失。
+  `git diff --stat scripts/watch.mjs` 从 `444 insertions` 掉到 `322 insertions`。
+- **为什么这次能恢复**：`watch.test.mjs` 没有被覆盖，里面两条 DF-099 测试与三条 DF-097 测试
+  仍然描述着正确行为。**测试是唯一忠实于「我们想要什么」的副本**，而它比任何 `.bak` 都可信。
+  找回方式：`/tmp/watch2.bak`（21:44，含 DF-097 缺 DF-099）+ 重新应用 DF-099 + 两条负向验证。
+- 三条教训：
+  1. **负向验证必须用临时副本，不许原地改被测文件。** 原地改的脚本一旦中途卡住，
+     恢复语句就排在一个可能永不返回的命令后面 —— 这不是「运气不好」，
+     是「把清理动作放在了不可靠的续行上」。
+  2. **`cp file.bak file` 是最危险的回滚方式**：它不检查目标有没有更新过。
+     正确的做法是 `git stash` / 独立 worktree / 或者干脆不改树里的文件。
+  3. **备份文件名里的时间戳要当场看，不许凭「它叫 .bak」就当基线。**
+     这次 `/tmp/watch.bak`(20:25) 与 `/tmp/watch2.bak`(21:44) 差了 79 分钟，
+     而我一直以为它们是同一个东西。
+- 附带发现（同日独立记入 DF-101）：9 个 `watch.mjs` 孤儿进程同时在往同一个
+  `state.json` 写，tick 率实测 **4–10 次/分（应为 4）**，而 `claimOwnership` 只 warn 不拦。
+- 建议归属：已完成（文件已恢复 + 全量测试 2111 pass / 0 fail）。
+
+### DF-101 [open] 没有任何单例保护：9 个 `watch.mjs` 同时跑，共写一份 `state.json`，tick 率 4–10 次/分（应为 4）
+
+- 发现于：2026-11-25 用户报告「执行似乎也做完了，但还有东西在 run」时排查
+- 位置：`scripts/watch.mjs` 的 `claimOwnership()`（只记日志）、`startWatch()`
+- 实测现场（2026-11-25 02:30 左右，本机）：
+  ```
+  14476  node scripts\watch.mjs                          常驻，18.5 小时，CPU 16600s
+  49984  node scripts\watch.mjs                          常驻，15.2 小时，CPU 15838s
+  42420/22180/54780/45400/38156/18280/52448  watch.mjs  各 40–4000s CPU
+  50844  node scripts/overwatch.mjs --budget 30000       预算 30 秒，实际跑了 3.5 小时
+  ```
+  其中 7 个能一一对上 `%TEMP%\ow-*\proc.json` —— 是我 2026-11-24 测 DF-092 时
+  用 `OVERWATCH_STATE_DIR=$T node scripts/watch.mjs &` 起的，脚本退出后它们成了孤儿。
+  另外 2 个（14476 / 49984）用的是**真实**数据目录。
+- 后果（实测，不是推测）：
+  - `watch.log` 每分钟 **4–10 条 tick**，而 `tick=15000ms` 只该有 4 条；
+    18:35 / 18:36 / 18:41 / 18:42 各 8–10 条。
+  - `owner.json` 与 `proc.json` **互相覆盖**：查到的瞬间 `owner.json` 写着 PID 50844
+    (`overwatch doctor`)，`proc.json` 写着 PID 49984 —— 两份见证由不同进程各写各的。
+  - `--health` 因此指着一个**不是守护进程**的 PID 做判活，报
+    「判活端点连上了，但 3000ms 内没有读出 beat」。
+- **修法要修的是产品，不只是清理**：`claimOwnership()` 现在对「同一仓库的第二份进程」
+  只 `log.warn`，然后两份都继续跑。按本仓自己的规矩（DF-028 就是「静默失效」），
+  这里应当**要么拦、要么让状态可见地分叉**，不能只是打一行没人看的日志。
+  候选：启动时读 `proc.json` + 判活端点，若那份还活着且就是本仓库 → 拒绝启动并退出码非 0。
+  **不采用**「检测到就复用/接管」：两个进程都以为自己活着，比一个不启动更难查。
+- 清理动作（已完成，2026-11-25 03:15）：杀掉全部 10 个进程，删掉 7 个 `%TEMP%\ow-*` 调试目录。
+- 建议归属：下一个改动轮。**它不阻塞当前 PR**，因为当前 PR 的内容与单例无关。
