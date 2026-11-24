@@ -32,7 +32,7 @@ import {
   pidIsAlive, probeFailureReason, BEAT_TIMEOUT_MS,
   requestIdTime, lastTimelineStateTime, resolveJobEventTime, BLOCKED_MAX_AGE,
   readLogHealth, logHealthPath, LOG_HEALTH_FILE,
-  convergeBySession, runAskedScanInChild,
+  convergeBySession, runAskedScanInChild, checkSingleton,
 } from './watch.mjs';
 import {
   makeNonce, livenessEndpoint, startLivenessServer, probeLiveness, parseBeatFrame, stateOfErrorCode,
@@ -2606,6 +2606,133 @@ test('claimOwnership：末尾斜杠不影响判定', () => {
     claimOwnership(dir, '/repo/a', { nowMs: now });
     assert.equal(claimOwnership(dir, '/repo/a/', { nowMs: now + 1 }).conflict, false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── DF-101：单例守卫。「已经有一个在跑」必须被证实，不是被推断 ──────────
+//
+// 现场（2026-11-25）：本机同时跑着 9 个 watch.mjs，全写同一份 state.json。
+// watch.log 每分钟 4–10 条 tick（应 4 条）；owner.json 与 proc.json 被不同进程
+// 互相覆盖；`--health` 指着一个不是守护进程的 PID 做判活。
+// 原来的处理是 log.warn 一句然后两份继续跑 —— 一行没人看的日志等于静默失效。
+//
+// 这组测试的核心是**两个方向的错误都要拦住**：
+//   拦得太松 = 原来的 bug；拦得太紧 = 一个误判的 timeout 让整台机器没有监控。
+
+/** 造一份「另一个进程正拿着这个目录」的见证。pid 用一个几乎不可能存在的值。 */
+function seedWitness(dir, { pid = 999_999, nonce = 'deadbeefdeadbeefdeadbeef' , endpoint = '\\\\.\\pipe\\untildone-test-seed', startedAt = new Date(Date.now() - 60_000).toISOString() } = {}) {
+  writeProcWitness(dir, { pid, startedAt, nonce, endpoint });
+  return { pid, startedAt, nonce, endpoint };
+}
+
+test('DF-101：端点应答 beat 且归属一致 → 拒绝启动（这是唯一该拦的情形）', async () => {
+  const dir = tmp();
+  try {
+    const w = seedWitness(dir);
+    const r = await checkSingleton(dir, {
+      probe: async () => ({ state: 'beat', frame: { nonce: w.nonce, pid: w.pid, startedMs: Date.parse(w.startedAt), beats: 7 } }),
+      isAlive: () => true,
+    });
+    assert.equal(r.guarded, true, `端点应答了且就是它，必须拦：${JSON.stringify(r)}`);
+    assert.equal(r.verdict, 'stuck');
+    assert.match(r.reason, /已经有一个守护进程在跑/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：端点不在 + PID 也没了 → 放行（该接手）', async () => {
+  const dir = tmp();
+  try {
+    seedWitness(dir);
+    const r = await checkSingleton(dir, {
+      probe: async () => ({ state: 'not-found' }),
+      isAlive: () => false,
+    });
+    assert.equal(r.guarded, false, '上一个已经死了，必须放行，否则永远起不来');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：判不了（timeout/eperm）→ 放行，只留痕 —— 宁可多跑一个也不让监控停掉', async () => {
+  const dir = tmp();
+  try {
+    seedWitness(dir);
+    for (const state of ['timeout', 'eperm', 'parse-failed', 'error']) {
+      const r = await checkSingleton(dir, {
+        probe: async () => ({ state }),
+        isAlive: () => true,   // PID 还在，但端点说不出话 —— 仍然不许拦
+      });
+      assert.equal(r.guarded, false, `${state} 是「判不了」，不是「确定在跑」，不许借此拦启动`);
+      assert.match(r.reason, /无法确认/, `${state} 的理由要说清是判不了：${r.reason}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：旧版见证（没有端点）→ 不拦 —— 「号还在」不足以断言它是守护进程', async () => {
+  const dir = tmp();
+  try {
+    writeProcWitness(dir, { pid: 999_999, nonce: null, endpoint: null });
+    const r = await checkSingleton(dir, { isAlive: () => true, probe: async () => ({ state: 'not-found' }) });
+    assert.equal(r.guarded, false, '旧见证只有 PID，不能据此拒绝启动');
+    assert.match(r.reason, /没有判活端点/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：见证里的 PID 就是自己 → 放行（--once 先 claim 再检查时不许自锁）', async () => {
+  const dir = tmp();
+  try {
+    writeProcWitness(dir, { pid: process.pid, nonce: 'x', endpoint: '\\\\.\\pipe\\self' });
+    const r = await checkSingleton(dir, {
+      selfPid: process.pid,
+      probe: async () => ({ state: 'beat', frame: { nonce: 'x', pid: process.pid, startedMs: Date.now(), beats: 1 } }),
+      isAlive: () => true,
+    });
+    assert.equal(r.guarded, false, '不能把自己当成「另一个守护进程」');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：空目录（首次运行）→ 放行', async () => {
+  const dir = tmp();
+  try {
+    const r = await checkSingleton(dir, { probe: async () => ({ state: 'not-found' }), isAlive: () => false });
+    assert.equal(r.guarded, false);
+    assert.match(r.reason, /没有进程见证/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：端点应答了但 nonce 不符（PID 被复用）→ 放行', async () => {
+  const dir = tmp();
+  try {
+    const w = seedWitness(dir);
+    const r = await checkSingleton(dir, {
+      // 帧里的 nonce 是**别人**的 —— 说明这个端点不是见证里那个进程的。
+      probe: async () => ({ state: 'beat', frame: { nonce: 'someone-else', pid: w.pid, startedMs: Date.parse(w.startedAt), beats: 3 } }),
+      isAlive: () => true,
+    });
+    assert.equal(r.guarded, false, 'nonce 不符 = 不是同一个进程，不该拦');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101 接线：守卫必须在 startWatch 里、且在**建判活端点之前**', () => {
+  // 上面七条测的是 `checkSingleton` 本身。**但「它判对了」与「启动路径用它」
+  // 是两件事** —— DF-096 记过这个坑：把接线拆掉，那七条仍然全绿。
+  //
+  // 而这里有一个**比「有没有调用」更强的约束**：位置。第一版把它放进 `runTick`，
+  // 于是第二个实例 ① 先把自己的判活端点建好 ② 然后每 15 秒被拒一次、永不退出
+  // （实测 `timeout 40` 杀掉，exit=124）。两条都必须被钉住。
+  const src = readFileSync(join(import.meta.dirname, 'watch.mjs'), 'utf8');
+  const code = src.split('\n')
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n');
+  const guardAt = code.indexOf('await checkSingleton(');
+  const serverAt = code.indexOf('await startLivenessServer(');
+  assert.ok(guardAt > 0, 'startWatch 里必须调 checkSingleton（守卫没接上）');
+  assert.ok(serverAt > 0, '找不到 startLivenessServer 调用点，这条断言本身要更新');
+  assert.ok(guardAt < serverAt,
+    `守卫必须在建判活端点之前（guard@${guardAt} vs server@${serverAt}）—— `
+    + '反了就会先注册端点再拒绝，一个该退出的进程不该留下监听');
+  // 守卫只该出现在 startWatch：`runTick` 里来一份就会每 15 秒重试一次、永不退出。
+  assert.equal(code.split('await checkSingleton(').length - 1, 1,
+    'checkSingleton 只许在启动路径上调一次；放进 runTick 会让被拒的实例永不退出');
+  assert.match(code, /r\.refused === 'already-running'\) process\.exitCode = 4/,
+    '被拒时必须非零退出：退出码 0 会让调用方把「什么都没启动」当成成功');
 });
 
 // ── ASKED 接入轮询（2026-11-01）────────────────────────────────────

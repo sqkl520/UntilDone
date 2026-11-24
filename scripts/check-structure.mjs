@@ -1439,6 +1439,10 @@ const SANDBOX_ARGS = {
   // `writeProcWitness` 写到沙箱（`_sandbox` 由探针注入），不碰真实数据目录。
   procWitnessPath: '["/nonexistent"]', readProcWitness: '["/nonexistent"]',
   processStartedAt: '[]', judgeProcess: '[null]',
+  // DF-101：`checkSingleton` 读见证 + 可能探一次端点。传不存在的目录 → 没有见证 →
+  // 走「首次运行」分支，**不发探针、不读真实数据目录**。
+  // 探针与 isAlive 都注入成不产生副作用的常量，避免结构门真的去连管道或发信号。
+  checkSingleton: '["/nonexistent", { probe: async () => ({ state: "not-found" }), isAlive: () => false }]',
   // DF-092 的两个新判据（纯函数，喂最小可构造输入即可）：
   //   · `pidIsAlive(0)` → false（pid 必须为正整数；Windows 上 kill(0,0) 会成功，
   //     那是「当前进程组」不是「进程存在」，所以判据里先挡掉它）；
@@ -1705,6 +1709,9 @@ function checkUnregisteredExports() {
   'LIVENESS_PROTOCOL', 'PROBE_STATES', 'PROBE_OUTCOME', 'beatFrame',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath', 'askedCandidates',
+    // DF-101（2026-11-25）：单例守卫。进 PROBE_ARGS 实际调用一次
+    // （不存在的目录 → 没有见证 → 「首次运行」分支，不发探针、不读真实数据目录）。
+    'checkSingleton',
     'requestIdTime', 'lastTimelineStateTime', 'resolveJobEventTime', 'BLOCKED_MAX_AGE',
   // job-event-time.mjs（2026-11-10 抽出）：跨层去重的地基。
   // 三个函数已进 PROBE_ARGS 实际调用；常量是数据，不是函数。

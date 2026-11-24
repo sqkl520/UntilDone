@@ -12,7 +12,7 @@
 ![CI](https://github.com/sqkl520/UntilDone/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4%20%C2%B7%20tests%2020.16%2B-blue?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
-![Tests](https://img.shields.io/badge/regression%20tests-2117-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/regression%20tests-2125-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 **零依赖** · **不用安装** · **不登录也能核对证据** —— `git clone` 之后 `node scripts/overwatch.mjs` 就行
@@ -177,7 +177,7 @@
 | 层 | 用了什么 |
 |---|---|
 | 运行时 | Node（工具 ≥ 18.20.4，测试 ≥ 20.16.0），**无 `package.json`、无 `node_modules`** |
-| 代码量 | 62 个生产脚本 + 57 个测试文件（2117 条回归测试，硬门数**真实注册**对账） |
+| 代码量 | 62 个生产脚本 + 57 个测试文件（2125 条回归测试，硬门数**真实注册**对账） |
 | 接口面 | 宿主 hooks（`PreToolUse` / `Stop`）+ 命令行 + 纯文本 / JSON 输出 |
 | 角色 | `.claude/agents/` 13 份 markdown 定义 + 1 个调度 skill（宿主直接加载） |
 | 存储 | 宿主 transcript 只读；自己的状态落在 `tasks/runs/`（gitignored）与用户状态目录 |
@@ -446,7 +446,7 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
 ```bash
 node scripts/check-structure.mjs     # 结构硬门：30 项检查，0 违规才绿
 node scripts/check-links.mjs         # 文档相对链接不悬空（170 份 .md，0 断链）
-node --test scripts/                 # 全量回归：57 个文件、2117 条（注册数；pass/fail 以当场输出为准）
+node --test scripts/                 # 全量回归：57 个文件、2125 条（注册数；pass/fail 以当场输出为准）
 ```
 
 `check-structure.mjs` 与全量测试**都必须绿才能提交**。两条命令都在一秒到半分钟量级，
@@ -471,7 +471,7 @@ CI 上跑的是同一套（[`validate.yml`](.github/workflows/validate.yml)）�
   它只说事实，正好是排查需要的那一份。
 - **想改代码请先开个 Issue 说一声**，避免白写。
 - **安全报告**：**不要开公开 issue**，见 [`SECURITY.md`](SECURITY.md)。
-- **跑测试**：`node --test scripts/`（2117 条回归测试；**这个数字由硬门对账**：它 import 每个测试文件
+- **跑测试**：`node --test scripts/`（2125 条回归测试；**这个数字由硬门对账**：它 import 每个测试文件
   数**真实注册**了几条，与 `ℹ tests` 逐条相等，写错即红。所以照抄即可、不必手工数）。
 
 > **贡献者名单和 Star 曲线这里目前都没有。** star 数是 0，star-history 会画出一张空图；

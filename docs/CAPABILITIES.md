@@ -38,6 +38,7 @@
 | Stop hook 验证闸：AI 想收工时替你把关 | `node scripts/stop-verify-hook.mjs`（由宿主调用，见 §3） | 判定写进 `<状态目录>/stop-hook/<日期>.jsonl`（`%LOCALAPPDATA%/UntilDone/`，不在你的项目里）。**它验的是「你说过的检查有没有做」，不是「活儿有没有做完」** —— 见 §3 开头 |
 | 看 Stop hook 放行样本的分布 | `node scripts/analyze-hook-samples.mjs` | 含完成语义但一次测试都没跑的候选 |
 | 后台守护进程的健康度 | `node scripts/watch.mjs --health` | 各轮询层「多久没扫过」，判断是活着还是在空转 |
+| 起常驻守护进程 | `node scripts/watch.mjs` | **同一个状态目录只允许一个实例**：已有活着的守护进程时拒绝启动并 **exit 4**（不是 0 —— 退出码 0 会让开机自启和 `install` 把「什么都没启动」当成功）。判据是判活端点应答，**判不了时放行**（宁可多跑一个，也不让监控整个停掉） |
 | 通知的可追溯率（生产指标） | `node scripts/watch.mjs --trace` | 每条通知能不能追到一次真实事件 |
 | 开机自启 + 桌面通知（Windows） | `node scripts/install-watcher.mjs status` | 已安装 / 未安装（`install` / `uninstall` 同理） |
 | 结构硬门（改动后必跑） | `node scripts/check-structure.mjs` | 0 违规才绿；含测试数对账、文档路径、能力清单 |

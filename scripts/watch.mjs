@@ -539,6 +539,101 @@ export function claimOwnership(stateDir, repoPath, { nowMs = Date.now(), livenes
   return { owner: record, previous: prev, conflict, written: true };
 }
 
+/** 单例守卫：确认「这个状态目录已经有一个活着的守护进程」了吗（DF-101）。
+ *
+ *  ## 为什么必须做这件事
+ *
+ *  2026-11-25 实测：本机同时跑着 **9 个 `watch.mjs`**，全部写同一个
+ *  `%LOCALAPPDATA%\Overwatch\state.json`。后果不是「慢」，是三件互相矛盾的事：
+ *
+ *    · `watch.log` 每分钟 **4–10 条 tick**，而 `tick=15000ms` 只该有 4 条；
+ *    · `owner.json` 与 `proc.json` 被不同进程**互相覆盖** —— 查到的瞬间两份分别
+ *      写着 PID 50844 与 PID 49984，于是 `--health` 指着一个**不是守护进程**的
+ *      PID 做判活，报「端点连上了但 3000ms 内没读出 beat」；
+ *    · `state.notified` 是**读-改-写**，两个进程同时跑就会互相吞掉对方的通知记录
+ *      → 要么重复通知，要么漏通知。这正是 `claimOwnership` 原本要防的
+ *      「state-shared」（两份克隆共用目录），但同仓多实例从来没被拦过。
+ *
+ *  原来的处理是 `log.warn` 一句然后**两份都继续跑**。按本仓自己的规矩这不合格：
+ *  一行没人看的日志，等于静默失效（DF-028 整条就是这个形态）。
+ *
+ *  ## 判据：只有**肯定**证据才拦
+ *
+ *  「有另一个活着的守护进程」必须是被证实的，不能被推断：
+ *
+ *    beat（端点应答了帧，且 nonce/pid 与见证一致）  → 活着，**拦**
+ *    pid 存活 且 见证没有判活端点（旧版或 --once）  → 无法排除，**不拦**（只告警）
+ *    端点不在 / 超时 / 无权限 / 判不了               → **不拦**（只告警）
+ *
+ *  第三行是关键：`--health` 那条路要的是「宁可说不知道」；这一条路要的是
+ *  **「宁可多跑一个，也不要让监控整个停掉」**。一个被误判的 `timeout`（机器卡了
+ *  3 秒）如果拦住启动，用户得到的是一台**没有任何监控**的机器，而屏幕上写着
+ *  「已经有一个在跑」。监控坏了的第一反应不该是「干脆不监控」——
+ *  这条原则在 `state-lost` 的处理里已经写过一次（见上面 runTick 的注释）。
+ *
+ *  ## 为什么拒绝而不是「接管」
+ *
+ *  接管（后者杀前者 / 共享端点 / 让位给更新的）会让「哪个进程在管事」变成一个
+ *  运行时协商的结果 —— 两个进程都以为自己活着时最难查。直接拒绝则把问题
+ *  变成一个当场可见的事实：非零退出 + 一句能照着做的事。
+ *
+ *  @returns {Promise<{guarded: boolean, holder: object|null, verdict: string|null, reason: string, probeState?: string|null}>}
+ *  `guarded: true` 表示**该拒绝启动**。 */
+export async function checkSingleton(stateDir, {
+  nowMs = Date.now(),
+  probe = probeLiveness,
+  isAlive = pidIsAlive,
+  timeoutMs = BEAT_TIMEOUT_MS,
+  selfPid = process.pid,
+} = {}) {
+  const w = readProcWitness(stateDir);
+  if (!w || !Number.isInteger(Number(w.pid)) || Number(w.pid) <= 0) {
+    return { guarded: false, holder: null, verdict: null, reason: '没有进程见证（首次运行，或见证被删）' };
+  }
+  // 同一个 PID 就是自己：`--once` 会先 claim 再检查，不能把自己当成别人。
+  if (Number(w.pid) === Number(selfPid)) {
+    return { guarded: false, holder: w, verdict: null, reason: '见证里的 PID 就是本进程' };
+  }
+
+  const endpoint = typeof w.endpoint === 'string' && w.endpoint ? w.endpoint : null;
+  const nonce = typeof w.nonce === 'string' && w.nonce ? w.nonce : null;
+  let probeState = null;
+  let frame = null;
+
+  if (endpoint && nonce) {
+    let r;
+    try { r = await probe({ endpoint, nonce, timeoutMs }); } catch { r = { state: 'error' }; }
+    probeState = (r && r.state) || 'error';
+    frame = (r && r.frame) || null;
+  }
+
+  // 判据与 `judgeProcess` **同源**，不只是同一张表：叫它来判，免得两处对
+  // 「beat 但 nonce 不符」这类边界各执一词。
+  const v = await judgeProcess(w, { nowMs, probe, isAlive, timeoutMs });
+
+  if (v.verdict === 'stuck' && v.alive === true) {
+    return {
+      guarded: true, holder: w, verdict: v.verdict, probeState,
+      reason: `已经有一个守护进程在跑（PID ${w.pid}，启动于 ${w.startedAt}，判活端点应答了第 ${frame && frame.beats} 次 beat）`,
+    };
+  }
+  if (!endpoint || !nonce) {
+    // 旧版见证：没有判活端点，只剩「号还在不在」这一条事实。**不足以拒绝启动。**
+    return {
+      guarded: false, holder: w, verdict: v.verdict, probeState,
+      reason: isAlive(Number(w.pid))
+        ? `PID ${w.pid} 还在，但它的见证没有判活端点（旧版本写的）—— 无法确认它是不是守护进程，不拦`
+        : `上一份见证的 PID ${w.pid} 已经退出`,
+    };
+  }
+  return {
+    guarded: false, holder: w, verdict: v.verdict, probeState,
+    reason: v.verdict === 'gone' || v.verdict === 'reused'
+      ? `上一份见证 PID ${w.pid} 已经不是守护进程了（${v.verdict}），可以接手`
+      : `无法确认 PID ${w.pid} 是不是还活着（${v.verdict}）—— 宁可多跑一个，也不让监控停掉`,
+  };
+}
+
 /** 默认状态目录。**解析逻辑在 `state-dir.mjs`** —— 这里只是一个转调，
  *  因为此前 `watch` / `asked` / `notify` / `install-watcher` 各写了一份，
  *  每份都注释着「与另一份保持一致」。靠注释一致的东西必然漂移。
@@ -2499,6 +2594,9 @@ export async function runTick({
 
   // 完整性检查必须在 mkdirSync 之前：一旦建了目录，「丢了」和「首次运行」就分不出来了。
   // 归属检查：同一台机器上两份克隆会静默共用同一个 state.json。
+  // **单例守卫不在这里** —— 它在 `startWatch` 的最前面，见那边的注释（DF-101）。
+  // 放在这里的第一个版本是错的：`runTick` 每 15 秒跑一次，于是一个该被拒绝的
+  // 实例会先建好自己的判活端点、再每轮被拒一次、永不退出（实测 exit=124）。
   // 不改变路径（那会让「换目录就丢数据」），只让冲突可见。
   // `liveness`（DF-092）：常驻进程的判活端点，`startWatch` 起好后一路传进来。
   const claim = claimOwnership(stateDir, ROOT_DIR, { nowMs, liveness });
@@ -2818,6 +2916,32 @@ export async function startWatch({
   const log = logger || createLogger(stateDir, { mirror: (l) => process.stdout.write(l + '\n') });
   log.info(`watch 启动 dir=${stateDir} tick=${interval}ms`);
 
+  // **单例守卫必须在最前面** —— 在建判活端点之前、在第一轮 tick 之前（DF-101）。
+  //
+  // 这个位置是被实测逼出来的：第一版把它放进 `runTick`，于是第二个实例
+  // ① 先把自己的判活端点建好（日志里出现「liveness 端点已就绪」），
+  // ② 然后每 15 秒被拒一次、**永不退出**（实测 `timeout 40` 杀掉了它，exit=124）。
+  // 两条都不对：一个明确该拒绝的进程不该先注册任何东西，更不该留在原地重试。
+  //
+  // 也不能放进 `runTick` 的另一个理由：`--once` 走的是 `runTick`，而一次性运行
+  // 本来就该允许并存（它跑完就退，不留监听）。
+  if (!dryRun) {
+    const guard = await checkSingleton(stateDir, { nowMs: Date.now() });
+    if (guard.guarded) {
+      const msg = `already-running: ${guard.reason}。`
+        + '同一个状态目录只能有一个守护进程 —— 多份同时跑会互相覆盖 proc.json / '
+        + 'owner.json 并吞掉对方的通知记录（DF-101）。'
+        + '本进程不启动。要查它：`node scripts/watch.mjs --health`；'
+        + '要换掉它：先 `node scripts/install-watcher.mjs uninstall` 再 install。';
+      if (log) log.error(msg);
+      return { refused: 'already-running', reason: msg, holder: guard.holder, verdict: guard.verdict };
+    }
+    if (guard.verdict && guard.verdict !== 'gone' && guard.verdict !== 'reused') {
+      // 判不了 ≠ 可以启动，也 ≠ 不许启动。这里**放行但留痕**，理由见 checkSingleton 的注释。
+      if (log && typeof log.warn === 'function') log.warn(`singleton-check: ${guard.reason}`);
+    }
+  }
+
   // **判活端点必须在第一轮 tick 之前建好**（DF-092）。
   //
   // 顺序很重要：`runTick` 会把 nonce / endpoint 写进 proc.json，而 `--health` 读的是
@@ -2866,6 +2990,7 @@ export async function startWatch({
     }
   }
   log.info('watch 退出');
+  return { ok: true };
 }
 
 /** 通知可追溯率：生产环境中唯一能独立判定真伪的指标。
@@ -3520,7 +3645,11 @@ async function main(argv) {
   const ac = new AbortController();
   process.on('SIGINT', () => ac.abort());
   process.on('SIGTERM', () => ac.abort());
-  await startWatch({ notifier, signal: ac.signal, dryRun });
+  const r = await startWatch({ notifier, signal: ac.signal, dryRun });
+  // 「已经有一个在跑」必须是**非零退出**（DF-101）：退出码 0 会让调用方
+  // （`install-watcher install`、开机自启、用户手敲）把「什么都没启动」当成成功，
+  // 而屏幕上那句日志通常没人看 —— 那就又回到「静默失效」。
+  if (r && r.refused === 'already-running') process.exitCode = 4;
 }
 
 /** 「我是不是被直接执行」——比的是**真实路径**，不是 `argv[1]` 的后缀。
