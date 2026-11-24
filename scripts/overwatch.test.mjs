@@ -462,16 +462,47 @@ test('doctor 遇到损坏的 state.json 不说「没在工作」，也不改名�
 test('★ doctor 不会变成 watch：入口名以 watch.mjs 结尾，导入 watch.mjs 会启动守护进程', () => {
   withTmp((dir) => {
     // 这是本文件覆盖到的最危险的一处，值得单独一条。
-    // `watch.mjs` 的「我是不是主模块」判据是 `/watch\.mjs$/.test(process.argv[1])`，
-    // 而本入口叫 `overwatch.mjs` —— **以 watch.mjs 结尾**。若 doctor import 它，
-    // watch 会当场启动守护进程：实测输出里出现 `watch 启动 dir=… tick=15000ms`
-    // 且进程永不退出（定时器还活着）。
     //
-    // 判据：doctor 的输出里不许出现 watch 自己的启动日志；退出码必须是 0 而不是挂住。
-    const r = run(['doctor'], { env: { OVERWATCH_STATE_DIR: join(dir, 'state'), CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
+    // ## 判据守的是行为，不是实现方式
+    //
+    // 历史：`watch.mjs` 的「我是不是主模块」判据原本是 `/watch\.mjs$/`，而本入口叫
+    // `overwatch.mjs` —— **以 watch.mjs 结尾**，import 会当场启动守护进程。
+    // 2026-11-24（DF-095）那个判据换成了 realpath 比较，`doctor` 于是可以 import 它。
+    // **这条测试的判据一个字没改**，它照样守着「输出里不许出现 watch 的启动日志」。
+    //
+    // ## ⚠ 它曾经是一条**假绿**（2026-11-24 实测，两处原因叠加）
+    //
+    // 原来跑的是 `run(['doctor'])`，默认预算 1000ms。而 `watcher` 那一项在
+    // 「剩余预算 < WATCHER_COST_MS」时**整个被跳过**（`checkWatcherLive` 根本不调），
+    // import 也就不会发生 —— 于是这条测试在「判据确实是坏的后缀版」时**照样绿**。
+    //
+    // 修完预算之后**还是绿的**，第二次的原因是：`checkWatcherLive` 在
+    // 「数据目录里没有 `state.json`」时**提前 return**（那是「从未运行过」的正常分支），
+    // 而 import 那一步在它之后。临时目录里当然没有 state.json —— 于是又什么都没验。
+    // 实测：把守卫改回 `/watch[.]mjs$/`，`timeout 40 node scripts/overwatch.mjs --budget 30000`
+    // 会**挂死**（exit 124，stdout 里一行行 `tick …` 永不结束），而这条测试仍然是绿的。
+    //
+    // 两个条件都必须满足才能真的走到 import：**预算够** + **state.json 存在**。
+    // 所以下面把 state.json 写出来，且预算给到 30000。
+    //
+    // 这与本仓 DF-090 记的那条同构：一条测试绿了，而它守的那件事根本没被执行。
+    const stateDir = join(dir, 'state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'state.json'), JSON.stringify({
+      version: 1,
+      lastJobsScanAt: new Date(Date.now() - 10_000).toISOString(),
+      lastProbeAt: new Date(Date.now() - 60_000).toISOString(),
+    }));
+    const r = run(['doctor', '--budget', '30000'], { env: { OVERWATCH_STATE_DIR: stateDir, CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
     assert.equal(r.code, 0, `doctor 必须正常退出（挂住/变成 watch 都是缺陷）：${r.code}`);
+    // **前置条件：watcher 那一项真的被执行了。** 没有这一条，上面那段理由就会
+    // 再一次悄悄失效（预算不够 → 跳过 → 什么都没验，而测试是绿的）。
+    assert.match(r.out, /^\[\s*\d+ms\] watcher\s+\S/m,
+      `watcher 那一项没有出现在输出里 —— 它被预算跳过了，这条测试因此什么都没验：\n${r.out}`);
+    assert.doesNotMatch(r.out, /预算内没时间跑[^\n]*watcher/,
+      `watcher 被预算跳过了，这条测试因此什么都没验（把 --budget 调大）：\n${r.out}`);
     assert.ok(!/watch 启动|tick=\d+ms/.test(r.out + r.err),
-      `doctor 把 watch 的守护进程日志打出来了 —— 它 import 了 watch.mjs：\n${r.out}\n${r.err}`);
+      `doctor 把 watch 的守护进程日志打出来了 —— 它 import 了 watch.mjs 且守卫判成了主模块：\n${r.out}\n${r.err}`);
     // 也要确认它没在别的输出行里混进「候选/去重」这类只有守护进程才有的词。
     assert.ok(!/candidates=\d+/.test(r.out + r.err), '输出里出现了 watch 的 tick 统计');
   });

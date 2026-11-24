@@ -749,17 +749,38 @@ function main(argv) {
   const noSave = argv.includes('--no-save');
   const hi = argv.indexOf('--hours');
   const minHours = hi >= 0 ? Number(argv[hi + 1]) : DEFAULT_MIN_HOURS;
+
+  // **三个「注入点」是给 `watch.mjs` 的子进程调用用的（DF-097）。**
+  //
+  // `watch.mjs` 的 `runTick` 拿到的 `root` 与 `nowMs` 可能来自调用方注入
+  // （测试、`--now`、`CLAUDE_CONFIG_DIR`），而这个 CLI 原来只读 `$HOME/.claude`
+  // 与挂钟。子进程若不去读注入值，它扫的是**真实**语料 —— 既慢（本机 1.3 GB）
+  // 又让「同一轮里两个时钟」重现（那正是 `runScan` 注释里记过的那类缺陷）。
+  //
+  // 三个都**默认回落到原行为**，所以命令行直接敲 `node scripts/asked.mjs --json`
+  // 与以前逐字相同。
+  const pick = (flag) => {
+    const i = argv.indexOf(flag);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+  };
+  const projectsRootArg = pick('--projects-root');
+  const sessionsRootArg = pick('--sessions-root');
+  const nowArg = pick('--now');
+  const nowMsArg = nowArg ? Date.parse(nowArg) : NaN;
+
   if (argv.includes('--help') || argv.includes('-h')) {
     console.log('用法：node scripts/asked.mjs [--json] [--hours N] [--history] [--no-save]');
     console.log('  找出「AI 问了具体问题，人还没回答」的会话。不依赖宿主状态。');
     console.log(`  --hours N   只看停了 N 小时以上的（默认 ${DEFAULT_MIN_HOURS}）`);
     console.log('  --history   看历史统计：发现多少、被回答多少、平均多久回');
     console.log('  --no-save   只查不记（默认每次运行都会更新历史）');
+    console.log('  --projects-root <dir> / --sessions-root <dir> / --now <iso>');
+    console.log('              注入扫描根与时钟（watch.mjs 的子进程调用用；默认读本机）');
     console.log(`  历史文件：${historyPath()}`);
     return 0;
   }
 
-  const nowMs = Date.now();
+  const nowMs = Number.isFinite(nowMsArg) ? nowMsArg : Date.now();
   const histFile = historyPath();
 
   if (showHistory) {
@@ -777,7 +798,8 @@ function main(argv) {
     nowMs,
     minHours: Number.isFinite(minHours) ? minHours : DEFAULT_MIN_HOURS,
     // 现状对账需要宿主状态。默认读 ~/.claude/sessions（与 watch.mjs 同源）。
-    sessionsRoot: join(homedir(), '.claude', 'sessions'),
+    sessionsRoot: sessionsRootArg || join(homedir(), '.claude', 'sessions'),
+    ...(projectsRootArg ? { projectsRoot: projectsRootArg } : {}),
   });
 
   let merged = null;

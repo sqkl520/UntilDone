@@ -12,7 +12,7 @@
 ![CI](https://github.com/sqkl520/UntilDone/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4%20%C2%B7%20tests%2020.16%2B-blue?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
-![Tests](https://img.shields.io/badge/regression%20tests-2080-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/regression%20tests-2113-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 **零依赖** · **不用安装** · **不登录也能核对证据** —— `git clone` 之后 `node scripts/overwatch.mjs` 就行
@@ -65,7 +65,7 @@
 
 - **唯一入口** —— `overwatch.mjs` 报 8 项前提事实，**1000ms 预算且会把超支说出来**（本机实测 1133ms，输出末尾直接写「1133ms / 预算 1000ms」），不扫语料
 - **起一个挂了载荷的会话** —— `launch`，先 `--dry-run` 逐字看清会执行什么；`--verify` 只验载荷，不需要登录
-- **结构硬门** —— 29 项检查（测试数对账、文档路径与命令、能力清单、内外链、台账格式、派发深度与返回格式……）
+- **结构硬门** —— 30 项检查（测试数对账、文档路径与命令、能力清单、内外链、台账格式、派发深度与返回格式……）
 - **两本台账** —— `tasks/dev-findings.md`（范围外发现）、`tasks/accepted-deviations.md`（已知偏差）
 
 > 每条能力对应的**确切命令**见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) ——
@@ -177,7 +177,7 @@
 | 层 | 用了什么 |
 |---|---|
 | 运行时 | Node（工具 ≥ 18.20.4，测试 ≥ 20.16.0），**无 `package.json`、无 `node_modules`** |
-| 代码量 | 61 个生产脚本 + 56 个测试文件（2080 条回归测试，硬门数**真实注册**对账） |
+| 代码量 | 62 个生产脚本 + 57 个测试文件（2113 条回归测试，硬门数**真实注册**对账） |
 | 接口面 | 宿主 hooks（`PreToolUse` / `Stop`）+ 命令行 + 纯文本 / JSON 输出 |
 | 角色 | `.claude/agents/` 13 份 markdown 定义 + 1 个调度 skill（宿主直接加载） |
 | 存储 | 宿主 transcript 只读；自己的状态落在 `tasks/runs/`（gitignored）与用户状态目录 |
@@ -444,9 +444,9 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
 **环境要求**：Node ≥ 18.20.4（跑工具）/ ≥ 20.16.0（跑测试）。
 
 ```bash
-node scripts/check-structure.mjs     # 结构硬门：29 项检查，0 违规才绿
+node scripts/check-structure.mjs     # 结构硬门：30 项检查，0 违规才绿
 node scripts/check-links.mjs         # 文档相对链接不悬空（170 份 .md，0 断链）
-node --test scripts/                 # 全量回归：56 个文件、2080 条
+node --test scripts/                 # 全量回归：57 个文件、2113 条（注册数；pass/fail 以当场输出为准）
 ```
 
 `check-structure.mjs` 与全量测试**都必须绿才能提交**。两条命令都在一秒到半分钟量级，
@@ -471,7 +471,7 @@ CI 上跑的是同一套（[`validate.yml`](.github/workflows/validate.yml)）�
   它只说事实，正好是排查需要的那一份。
 - **想改代码请先开个 Issue 说一声**，避免白写。
 - **安全报告**：**不要开公开 issue**，见 [`SECURITY.md`](SECURITY.md)。
-- **跑测试**：`node --test scripts/`（2080 条回归测试；**这个数字由硬门对账**：它 import 每个测试文件
+- **跑测试**：`node --test scripts/`（2113 条回归测试；**这个数字由硬门对账**：它 import 每个测试文件
   数**真实注册**了几条，与 `ℹ tests` 逐条相等，写错即红。所以照抄即可、不必手工数）。
 
 > **贡献者名单和 Star 曲线这里目前都没有。** star 数是 0，star-history 会画出一张空图；

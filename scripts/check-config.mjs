@@ -169,6 +169,7 @@ export const CHECK_DOMAINS = Object.freeze({
   emptyDirs: 'universal',
   capabilityDisclosure: 'product',
   testCount: 'universal',
+  executionClaims: 'universal',
   syntax: 'universal',
   importable: 'universal',
   unregisteredExports: 'product',

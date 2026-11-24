@@ -126,7 +126,13 @@ function syncTestCount(dir) {
   const sites = [
     ['README.md', /（(\d+)\s*条回归测试/g],
     ['CLAUDE.md', /全量回归测试（(\d+)\s*条/g],
-    ['docs/GUIDE.md', /(\d+)\s*项全绿/g],
+    // **这里的正则必须与 `check-structure.mjs` 的 `TALLY_SITES` 同形。**
+    // 2026-11-24 实测：GUIDE 那处的口径从「N 项全绿」改成了「N 条已注册」
+    // （DF-090：旧正则的形状在逼文档断言执行结果），而本文件仍匹配旧串 →
+    // 「未改动的副本应当绿」这条对照用例红了，报的却是「文档数字对不上」。
+    // 判据漂移的表现是「对照组变红」，而红的那句话指向的是别人的错 —— 这正是
+    // 本仓反复记的那类「判据自己错、报出来的却是被判断对象」。
+    ['docs/GUIDE.md', /(\d+)\s*条已注册/g],
     ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/g],
     // README 的徽章与正文各有一处，两个正则都覆盖。
     // 徽章不带 `passing` 字样：本仓有 2 条按平台 skip 的用例，写 `passing` 会把

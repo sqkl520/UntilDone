@@ -49,7 +49,7 @@
 | 给某个角色补材料，同时拦住不该给它的东西 | `node scripts/compose-agent-prompt.mjs compose --run <run-id> --task ST1 --role review --context-from <context.json>` | 给锐评喂执行者自评、给验收喂锐评分数等一律拒绝派发；JSON 解析不了时 exit 2，不回落成「没给」 |
 | 收活时确认子 agent 收到的是不是台账里那一份 | `node scripts/compose-agent-prompt.mjs verify --run <run-id> --session <会话目录>` | 逐任务 `match: true/false/null`；`null` 是「看不到」，不是「通过」 |
 | **收活时给「这份交付能不能发」一个唯一裁决**（验收 × 红队 × 强证据） | `node scripts/delivery-verdict.mjs --acceptor tasks/runs/<run-id>/acceptor.md --redteam tasks/runs/<run-id>/redteam.md --key-paths tasks/runs/<run-id>/keypaths.json` | 退出码就是裁决：`0 PASS / 1 FAILED / 2 BLOCKED / 3 用法错误`。**「验收 PASS 但红队 BLOCK」判 `BLOCKED`** —— 两者都成立，不是矛盾。报告文件读不到时 exit 3，**不回落成「没有阻断项」** |
-| 全量回归测试 | `node --test scripts/` | 全绿；条数以命令输出为准 |
+| 全量回归测试 | `node --test scripts/` | 退出码 0；条数以命令输出为准（**pass/fail 现场看，文档不代它断言**） |
 | 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败。范围是 `git ls-files '*.md'`（实测 170 份，含根级与 `templates/`），判据在 `scripts/link-check.mjs`：文件在不在、锚点在不在、目标会不会被 gitignore 掉 |
 | 生成仓库社交预览图（1280×640） | `node scripts/make-social-preview.mjs --out docs/assets/social-preview.png` | 一张 PNG；GitHub 的 social preview 没有 API，要人工上传 |
 | 清单机制在真实使用中覆盖多少 | `node scripts/measure-checklist-coverage.mjs --days 7` | 派发率 / 清单率两个口径（含沙箱、不含沙箱）。**数字低不是缺陷，是「加闸值不值得」的依据** |

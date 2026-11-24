@@ -1536,9 +1536,10 @@ export class App {
     if (!this.scanStartedAt) this.scanStartedAt = this.now();
     this.render();
 
-    // 宿主侧的两个便宜读取（~12ms）：收件箱与监视健康度。
+    // 宿主侧的两个便宜读取：收件箱与监视健康度。
     // **它们和 scan 并行**，不占扫描的 26 秒。
-    this.readHostFacts();
+    // 必须 await：`healthCheck` 自 DF-092 起是异步的（判活端点有应答超时）。
+    await this.readHostFacts();
 
     const job = this.scan({ days: this.days });
     this._cancelScan = job.cancel ?? null;
@@ -1574,12 +1575,17 @@ export class App {
    *   - 收件箱读不到 → 不补任何行，但检查表的「等你回应」仍由 scan 的宿主事实态兜底；
    *   - 健康度读不到 → 检查表「后台监视」打 `?`，不写 ✓。
    * 这正是 §2.6 第三种状态（扫完但监视没跑）与第一种（扫完确实没事）的分界。
-   */
-  readHostFacts(env = process.env) {
+   *
+   * **2026-11-24（DF-092）：改成 async。** `healthCheck` 现在要异步采证（判活端点
+   * 是有应答超时的，同步读会在「进程冻结」时永久阻塞）。收件箱那一半仍是同步的。
+   * 调用点 `refresh()` 本来就是 async，直接 await；不 await 的话会拿到一个
+   * Promise，`this.health` 就变成 `{}` 形状的东西 —— 检查表会把它当成「读到了」，
+   * 那正是这个方法开头那段注释要防的假话。 */
+  async readHostFacts(env = process.env) {
     try {
       const dir = defaultStateDir(env);
       const { state } = loadState(dir, { nowMs: this.now() });
-      this.health = healthCheck(state, { nowMs: this.now() });
+      this.health = await healthCheck(state, { nowMs: this.now() });
       this.inbox = buildInbox(state, {
         nowMs: this.now(),
         live: this.data?.live ?? [],
@@ -2199,7 +2205,7 @@ export async function main({
     try {
       const dir = defaultStateDir(env && env);
       const { state } = loadState(dir, { nowMs: plainOpts.nowMs });
-      plainOpts.health = healthCheck(state, { nowMs: plainOpts.nowMs });
+      plainOpts.health = await healthCheck(state, { nowMs: plainOpts.nowMs });
       plainOpts.inbox = buildInbox(state, { nowMs: plainOpts.nowMs, live: data.live || [] });
     } catch {
       plainOpts.health = null;

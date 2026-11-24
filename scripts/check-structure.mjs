@@ -581,6 +581,34 @@ function checkCapabilityDisclosure() {
 
 // ── 检查 6.5：文档里的测试数必须与实测一致 ────────────────────────────
 
+/** 本仓规定的**自证位置**：文档里「N 条回归测试」这句话出现在哪、取哪个捕获组。
+ *
+ *  只查**声明基线**的那一处，不查历史条目（CHANGELOG 与 research 里的旧数字是
+ *  事实记录，不该被改）。
+ *
+ *  第三列 `required`：**声明了就必须对**，但没声明不报违规。
+ *  这个区分来自 DF-046（「6 个常量把本仓库的形状当成了判据」）：别人项目里没有徽章，
+ *  强制它「必须有一个」会在那个项目里造一条与本门目的无关的红。
+ *  前四处仍是必需的 —— 它们是本仓规定的自证位置，缺了等于没人再核这个数。
+ *
+ *  **这份清单只有一份。** `checkTestCount()` 与 `checkNoExecutionClaims()`
+ *  读同一份 —— 两处各写一份必然漂，而「同一件事有第二个答案」正是本仓库反复
+ *  吃亏的形态（见 `DF-076`）。 */
+const TALLY_SITES = [
+  ['README.md', /（(\d+)\s*条回归测试/, true],
+  // README 的徽章是**第五处**，原先完全不在核对范围内 —— 只能靠人记得手改，
+  // 而它恰恰是访客最先看到的那个数。加进来之后它与其余四处同源（漂了会红），
+  // 但对没有徽章的项目不作要求。
+  ['README.md', /regression%20tests-(\d+)/, false],
+  ['CLAUDE.md', /全量回归测试（(\d+)\s*条/, true],
+  // 这一处（GUIDE）**改过口径**：原先取的是 `(\d+)\s*项全绿`，那个正则本身就在
+  // 逼文档写「全绿」（DF-090：正则的形状决定了文档必须说什么）。
+  // 现在取「N 条已注册」—— 与其余四处同一个命题（有多少条测试存在），
+  // 而不是一个本门核不了的命题（它们此刻是否通过）。
+  ['docs/GUIDE.md', /(\d+)\s*条已注册/, true],
+  ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/, true],
+];
+
 /** 回归测试数曾同时存在四个值：README 508 / CLAUDE 192 / GUIDE·CI 81 / 设计稿 588，
  *  实测 793。四份文件四个值，而 CI 里那个 81 停在一年前的量级。
  *
@@ -659,16 +687,10 @@ function checkTestCount() {
   // 这个区分来自 DF-046（「6 个常量把本仓库的形状当成了判据」）：别人项目里没有徽章，
   // 强制它「必须有一个」会在那个项目里造一条与本门目的无关的红。
   // 前四处仍是必需的 —— 它们是本仓规定的自证位置，缺了等于没人再核这个数。
-  const sites = [
-    ['README.md', /（(\d+)\s*条回归测试/, true],
-    // README 的徽章是**第五处**，原先完全不在核对范围内 —— 只能靠人记得手改，
-    // 而它恰恰是访客最先看到的那个数。加进来之后它与其余四处同源（漂了会红），
-    // 但对没有徽章的项目不作要求。
-    ['README.md', /regression%20tests-(\d+)/, false],
-    ['CLAUDE.md', /全量回归测试（(\d+)\s*条/, true],
-    ['docs/GUIDE.md', /(\d+)\s*项全绿/, true],
-    ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/, true],
-  ];
+  //
+  // **这份清单是 TALLY_SITES（DF-090）的同一份数据。** 两处各写一份必然漂 ——
+  // 而「同一件事有第二个答案」正是本仓库反复吃亏的形态。
+  const sites = TALLY_SITES;
 
   // **平台无关性**：这道门必须在任何 runner 上数出同一个数，否则「文档写一个数」
   // 这件事就没法成立。2026-11-21 修 CI 红时的一度误判是「这个数平台相关」，理由是
@@ -714,6 +736,128 @@ function checkTestCount() {
       fail(file, `回归测试数写的是 ${claimed}，实跑注册 ${actual} 条（${measured.files} 个文件）`
         + `${crossPlatformNote()}。改成 ${actual}，或先确认新加的测试真的被注册了`);
     }
+  }
+}
+
+// ── 检查 6.6：文档不许声称「测试全绿 / N 条 pass」—— 硬门核不了执行结果 ──
+
+/** **这道门修的是「门在认证一句假话」这个缺陷本身**（DF-090）。
+ *
+ *  ## 现场
+ *
+ *  `docs/GUIDE.md:512` 曾写着「56 个测试文件，2080 项全绿（2078 条 pass、2 条按平台 skip）」，
+ *  而 2026-11-24 实测 `node --test scripts/` 是 2071 pass / 7 fail / 2 skip。
+ *  这句话是假的，而 `checkTestCount()` 给盖了绿章 —— 因为它**只核总条数**。
+ *
+ *  2080 这个总数是真的（注册数），所以「对账通过」也真的成立。缺陷在于：
+ *  **注册数相等与「执行结果全绿」是两件事**，而文档把后者当成前者的推论写了。
+ *  一句需要跑完全量测试才能验证的话，被一句只 import、不执行的检查认证了。
+ *
+ *  更糟的是**正则的形状在逼文档撒谎**：那处取数正则原本是 `(\d+)\s*项全绿`，
+ *  于是「想通过硬门」这件事本身就要求文档里出现「全绿」二字。门不只在盖章，
+ *  它是这句话的作者。（这就是 `TALLY_SITES` 里那一行被改口径的原因。）
+ *
+ *  ## 为什么不在硬门里真跑全量测试（评估过的三条路）
+ *
+ *  1. **硬门跑 `node --test scripts/`**：实测 258 秒（本机，2026-11-24）。
+ *     本门会被 `dispatch-coverage.test.mjs` 在副本里跑很多次，每次多 4 分钟 ——
+ *     那会让「改一行就跑一次门」变得不可行，而**门被跳过比门弱更坏**。
+ *     而且那 7 条本就 flaky 的用例会让门随机变红，红警被驯化成噪音（DF-026）。
+ *
+ *  2. **硬门只跑一个「粗筛子集」**：仍要几十秒，且**粗筛通过不代表全量通过** ——
+ *     它会造出一个新的、更隐蔽的假话：「粗筛全绿，所以全量全绿」。
+ *
+ *  3. **CI 负责跑，硬门核「文档与最近一次 CI 结果一致」**：需要把 CI 结果写回仓库
+ *     （一个结果文件），而那份文件在本地永远是旧的 —— 于是「本地门绿」的意思变成
+ *     「上次 CI 时是对的」。这是一条**我看不见它坏**的判据，比没有更坏。
+ *
+ *  ## 所以选第四条：让文档**不再声称**它核不了的事
+ *
+ *  这不是「降低标准」，而是**把断言的强度收回到证据能支撑的位置**：
+ *  - 「2082 条已注册」是可核的（import 数一遍即可，本门就在做），保留；
+ *  - 「2078 条 pass」核不了（要真跑 258 秒，且结果随环境漂），**删掉**；
+ *  - 「全绿」是前一句的推论，随之删掉。
+ *
+ *  于是文档说的是「有多少条测试存在」，而不是「它们此刻是否通过」。
+ *  后者只有 `node --test scripts/` 的当场输出能说；它正确的归属地是
+ *  **跑它的那个人 / CI 的那次 job**，而不是一份会被反复引用的静态文档。
+ *
+ *  ## 判据
+ *
+ *  扫**自证位置所在的四份文档**（README / CLAUDE / GUIDE / CAPABILITIES），
+ *  行内同时出现「测试语汇」与「执行结果断言」即违规。
+ *
+ *  **判据只管「数值化的执行结果」，不管「通过 / 失败」这两个词本身**：
+ *  讨论「这条测试为什么失败」是正常内容，声称「2078 条 pass」才是断言。
+ *  所以被禁的是 `全绿` / `全部通过` / `N 条 pass` / `N pass` / `N passed` /
+ *  `pass: N` / `fail: N` 这些**带数或带绝对判断**的形态。
+ *
+ *  **跳过围栏代码块**：`README.md` 里那段「AI 说 BUILD SUCCESS — 1341 例全绿」
+ *  是**被批判的假话示例**，它引用的正是本门要禁的形态。把它当违规会逼人删掉
+ *  这段反例 —— 而那段反例是本产品最核心的一张图。围栏内的内容不是对仓库的断言。
+ *
+ *  **允许条件式与定义式**：`全绿才能提交`（提交门槛）`绿的标准`（定义）说的是
+ *  规矩，不是当前状态。中文没有形态标记，这个区分认不全，所以只放行 `ALLOW`
+ *  里那几种本仓确实在用的措辞；其余一律红 —— 宁可让人改写一句话，
+ *  不可放过一句假的「已经绿了」。
+ *
+ *  **不扫 CHANGELOG 与 research/**：那两处是**历史记录**。「当时 1908 条全绿」
+ *  在当时是真的，改它等于篡改历史。这也正是把范围限定在四份自证文档的原因 ——
+ *  用「扫所有活文档」会连历史一起判红（实测 7 处误报，见 DF-090）。 */
+
+/** 自证位置文档：本产品对外的「测试有多少、状态如何」的声明只该出现在这里。 */
+const EXEC_CLAIM_DOCS = ['README.md', 'CLAUDE.md', 'docs/GUIDE.md', 'docs/CAPABILITIES.md'];
+
+/** 条件式 / 定义式的标记。命中的行说的是「规矩」，不是「当前状态」。 */
+const STATUS_CLAIM_ALLOW = [
+  /才能提交/,      // 「两者都绿才能提交」—— 提交门槛
+  /绿的标准/,      // 「绿的标准」—— 定义
+  /不算绿|不算通过/,  // 「跑过不算绿」—— 否定式，不是断言
+];
+
+/** 执行结果断言（带数或绝对判断）的形态。 */
+const EXEC_CLAIM_RE = new RegExp([
+  '全绿',
+  '全部通过',
+  '\\d+\\s*条\\s*pass',       // 「2078 条 pass」
+  '\\d+\\s*(?:passing|passed)',
+  '(?<![A-Za-z])pass\\s*[:=]?\\s*\\d+',   // 「pass 2071」
+  '(?<![A-Za-z])fail\\s*[:=]?\\s*\\d+',   // 「fail 7」
+].join('|'));
+
+/** 一行是不是在执行结果上做了断言。返回理由或 null。
+ *
+ *  **不导出**：本文件是 CLI（`CLI_SCRIPTS` 成员），一 import 就跑完全部门禁并 exit，
+ *  没法单测。判据由 `regression-count.test.mjs` 与 `check-config.test.mjs` 那种
+ *  「改坏副本 + 跑门真身」的方式验 —— 复制判据的测试只能证明自己那份对。 */
+function execClaimOf(line) {
+  if (!/(测试|回归|用例|\btests?\b)/i.test(line)) return null;
+  const m = line.match(EXEC_CLAIM_RE);
+  if (!m) return null;
+  if (STATUS_CLAIM_ALLOW.some((re) => re.test(line))) return null;
+  return `出现「${m[0]}」—— 这是对**执行结果**的断言，而硬门只 import 不执行，核不了它`;
+}
+
+function checkNoExecutionClaims() {
+  for (const relPath of EXEC_CLAIM_DOCS) {
+    const p = join(ROOT, relPath);
+    // 四份都是本产品自身的产物。别人的项目里 CREDITS/README 长什么样不该由我们规定，
+    // 所以用 requireProduct()（DF-051）；**存在就照查** —— 判据本身对任何项目成立。
+    if (!requireProduct(p, relPath)) continue;
+    let text = '';
+    try { text = readFileSync(p, 'utf8'); } catch { continue; }
+    let inFence = false;
+    text.split('\n').forEach((line, i) => {
+      // 围栏翻转：``` 或 ~~~ 开头的行（允许缩进）。围栏内的内容是**示例 / 引用**，
+      // 不是对仓库的断言 —— 见头注释里 README 那段被批判的反例。
+      if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; return; }
+      if (inFence) return;
+      const why = execClaimOf(line);
+      if (why) {
+        fail(relPath, `第 ${i + 1} 行 ${why}。改成只声明**条数**（那由 testCount 对账；`
+          + 'pass/fail 交给每次真跑的输出），或写成条件式（「全绿才能提交」）如果那才是你的意思');
+      }
+    });
   }
 }
 
@@ -1290,11 +1434,26 @@ const SANDBOX_ARGS = {
   createLogger: '[_sandbox]', defaultStateDir: '{}', defaultNotifyDir: '{}',
   readLogHealth: '[_sandbox]', logHealthPath: '["/nonexistent"]',
   // DF-028：`procWitnessPath` 是纯路径拼接；`readProcWitness` 读不存在的目录 → null。
-  // `judgeProcess(null)` 走 unverified 分支，**刻意不 spawn powershell**：
-  // 结构门要一秒内跑完，不该为一条冷路径付 360ms，更不该对真实 PID 发信号。
+  // `judgeProcess(null)` 走 unverified 分支，**不发任何探针**（DF-092 之后探针是
+  // 「连一次命名管道」，那条冷路径不该由结构门承担，更不该对真实 PID 发信号）。
   // `writeProcWitness` 写到沙箱（`_sandbox` 由探针注入），不碰真实数据目录。
   procWitnessPath: '["/nonexistent"]', readProcWitness: '["/nonexistent"]',
   processStartedAt: '[]', judgeProcess: '[null]',
+  // DF-092 的两个新判据（纯函数，喂最小可构造输入即可）：
+  //   · `pidIsAlive(0)` → false（pid 必须为正整数；Windows 上 kill(0,0) 会成功，
+  //     那是「当前进程组」不是「进程存在」，所以判据里先挡掉它）；
+  //   · `probeFailureReason('timeout', {pid: 1})` → 一句说「超时」的理由（DF-091）。
+  pidIsAlive: '[0]', probeFailureReason: '["timeout", { pid: 1 }]',
+  // proc-liveness.mjs（DF-092）的三个纯函数。`livenessEndpoint` 走 POSIX 分支要
+  // 一个 stateDir —— 传 `/nonexistent` 正好把「纯拼接、不碰盘」验一遍。
+  // `parseBeatFrame` 喂一段不是帧的文本：返回 null 是它的正常分支（读不懂 = 判不了）。
+  // `makeNonce` 不注入随机源就真取一次随机字节 —— 它不碰盘、不需要沙箱。
+  makeNonce: '[]',
+  livenessEndpoint: '[{ nonce: "probe", stateDir: "/nonexistent-ow-probe", platform: "linux" }]',
+  parseBeatFrame: '["not a frame"]',
+  // 错误码 → probe 状态。喂一个未知码必须落回 `error`（不是 `not-found`）——
+  // 「不认识的原因」不能当成「进程没了」，那会把判不了说成死了。
+  stateOfErrorCode: '["EZOMBIE"]',
   writeProcWitness: '[_sandbox]',
   createObservationLog: '[_sandbox]', observationStats: '[_sandbox]',
   classifyCandidate: '[{}]', readTranscriptTail: '["/nonexistent"]',
@@ -1526,11 +1685,24 @@ function checkUnregisteredExports() {
   // LOG_HEALTH_FILE 是数据（文件名常量），不是函数。
   'readLogHealth', 'logHealthPath', 'LOG_HEALTH_FILE',
   // watch.mjs 的进程见证（DF-028，2026-11-18）：「进程死了」与「进程卡住了」可区分。
-  // `judgeProcess` 进 PROBE_ARGS 但不传见证 → 走 unverified 分支，**不 spawn powershell**
-  // （否则每跑一次结构门多 360ms，且这条冷路径的代价不该由硬门承担）。
-  // `PROC_TOLERANCE_MS` 是数字，不是函数 —— checkArgs 调不动它。
+  // `judgeProcess` 进 PROBE_ARGS 但不传见证 → 走 unverified 分支，**不发探针**
+  // （否则每跑一次结构门要真连一次命名管道，且这条冷路径的代价不该由硬门承担）。
+  // `PROC_TOLERANCE_MS` 与 `BEAT_TIMEOUT_MS` 是数字，不是函数 —— checkArgs 调不动它们。
   'procWitnessPath', 'writeProcWitness', 'readProcWitness', 'processStartedAt',
   'judgeProcess', 'PROC_TOLERANCE_MS',
+  // DF-092 / DF-091（2026-11-24）：判活从 spawn 换成命名管道之后新增的三个导出。
+  // `pidIsAlive` 与 `probeFailureReason` 已进 PROBE_ARGS 实际调用；
+  // `BEAT_TIMEOUT_MS` 是数字（转发自 proc-liveness.mjs），判据是数据不是函数。
+  'pidIsAlive', 'probeFailureReason', 'BEAT_TIMEOUT_MS',
+  // proc-liveness.mjs（DF-092）：判活端点这一层。三个纯函数进 PROBE_ARGS：
+  //   · `makeNonce` 产出 24 个十六进制字符（长度就是它的判据）；
+  //   · `livenessEndpoint` 是纯路径拼接（Windows 前缀 / POSIX 文件路径）；
+  //   · `parseBeatFrame` 喂一段不是帧的文本 → null（那是它的「读不懂」正常分支）。
+  // 两个有副作用的不进强制调用（见 INTENTIONALLY_PROBED_FREE）：
+  // `startLivenessServer` 会**真的占一个端点**，`probeLiveness` 会**真的连一次**。
+  // 常量与安全表是数据。
+  'makeNonce', 'livenessEndpoint', 'parseBeatFrame',
+  'LIVENESS_PROTOCOL', 'PROBE_STATES', 'PROBE_OUTCOME', 'beatFrame',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath', 'askedCandidates',
     'requestIdTime', 'lastTimelineStateTime', 'resolveJobEventTime', 'BLOCKED_MAX_AGE',
@@ -1731,6 +1903,18 @@ function checkUnregisteredExports() {
     'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
     'runScan', 'dispatchCandidates', 'sendNotification', 'isNotificationAvailable',
     'NOTIFY_STATES', '__internals',
+    // proc-liveness.mjs（DF-092）：这两个**有真副作用**，不能进结构门的强制调用。
+    //   · `startLivenessServer` 会真的 listen 一个端点名 —— 结构门跑一次就会在
+    //     系统里留下一个管道，且它的名字来自 nonce，无法预先指定；
+    //   · `probeLiveness` 会真的 connect（甚至在端点不存在时花掉一段连接超时）。
+    // 两者的正确性由 `watch.test.mjs` 的 DF-028 / DF-092 组用**真端点**覆盖
+    // （起监听、探、关掉、再探），那比「调用不炸」强得多。
+    'startLivenessServer', 'probeLiveness',
+    // watch.mjs 的 asked 子进程扫描（DF-097）。它**会真的 spawn 一个 node 去读 1.3 GB
+    // 语料**（实测 70 秒）—— 结构门绝不能调它一次，那会把整道门变成 70 秒以上。
+    // 正确性由 `watch.test.mjs` 的 DF-097 组用**小目录**覆盖（喂一个不存在的根，
+    // 子进程约 2.5 秒返回空结果，那正是它的「什么都没有」正常分支）。
+    'runAskedScanInChild',
     // 这两个要读真实 transcript 目录（1GB），不能塞进结构门；由 CLI 自测覆盖。
     'parseTranscript', 'listTranscripts', 'loadCorpus',
     // measure-interventions.mjs：run 会全量扫 1.7GB transcript（实测 24s），不能进结构门；
@@ -2110,6 +2294,24 @@ function checkUnregisteredExports() {
   // 而它此刻**正在本门里被真调用**（见 `checkTestCount()`），那才是真实覆盖。
   // 正确性由 `regression-count.test.mjs` 的红→绿用例守（含「循环注册要多算几条」）。
   REGISTERED.add('countRegisteredTests');
+
+  // proc-liveness.mjs + watch.mjs 的判活层（DF-092 / DF-091，2026-11-24）。
+  //
+  // `REGISTERED` 与 `PROBE_ARGS`/`SANDBOX_ARGS` 是**两份**表：前者只影响「要不要
+  // 提示未登记」，后者决定「会不会真被调用一次」。所以新导出必须在两处都登记 ——
+  // 只登记 PROBE_ARGS 的话它会**真被调用**却仍然被提示「未登记」，
+  // 而只登记这里则是「登记了但不探」。实测就是这样发现漏了一处的。
+  //
+  // 六个函数（makeNonce / livenessEndpoint / parseBeatFrame / stateOfErrorCode /
+  // pidIsAlive / probeFailureReason）与两个常量（LIVENESS_PROTOCOL / BEAT_TIMEOUT_MS）
+  // 与三张冻结表（PROBE_STATES / PROBE_OUTCOME / beatFrame）全部登记；
+  // `startLivenessServer` / `probeLiveness` 有真副作用，进 INTENTIONALLY_PROBED_FREE。
+  for (const k of [
+    'makeNonce', 'livenessEndpoint', 'parseBeatFrame', 'stateOfErrorCode',
+    'pidIsAlive', 'probeFailureReason',
+    'LIVENESS_PROTOCOL', 'BEAT_TIMEOUT_MS', 'PROBE_STATES', 'PROBE_OUTCOME', 'beatFrame',
+    'startLivenessServer', 'probeLiveness',
+  ]) REGISTERED.add(k);
   // 两个文件发现判据是**纯函数**（只读目录、不执行任何东西），可以安全进 PROBE_ARGS：
   // 给一个不存在的目录，它们必须返回 false / []，不抛。
   // 它们必须真被调用一次：`isNodeTestFile` 写窄了的表现是「数不到」，而数不到不报错。
@@ -3364,6 +3566,7 @@ const CHECKS = [
   ['emptyDirs', () => checkEmptyDirs()],
   ['capabilityDisclosure', checkCapabilityDisclosure],
   ['testCount', checkTestCount],
+  ['executionClaims', checkNoExecutionClaims],
   ['syntax', checkSyntax],
   ['importable', checkImportable],
   ['unregisteredExports', checkUnregisteredExports],

@@ -21,6 +21,245 @@
 
 ---
 
+## [Unreleased] - 2026-11-24 判活不再 spawn：命名管道 + nonce 替掉必超时的 powershell 探针（DF-091 / DF-092）
+
+`DF-028` 的进程判活在生产路径上**从未工作过**。这一轮把它的实现换掉，并修掉它
+把原因说错的那句话。上游背景（为什么必须换）见 `tasks/dev-findings.md` 的 `DF-092`。
+
+### 1. 根因：不是 powershell 慢，是这台机器上任何 spawn 都慢
+
+`probeStartTimeOf()` 用 `spawnSync('powershell', …Get-Process…StartTime, timeout: 5000)`。
+本机实测：
+
+```
+探针耗时                        5–24 秒（注释里 355–390ms 是另一个环境下的旧数）
+结果                            每次都撞满 5000ms → stdout 空 → NaN → null → 判 unknown
+附带                           22 个 powershell 进程 / 9 小时 / 约 1.7GB，每个 CPU 8–9 秒
+where /q node（什么都不干）      2957ms
+os.getPriority()                 10 = BelowNormal（Process Lasso 压的）
+A/B：BelowNormal 13759ms → NORMAL 2804ms（NORMAL 仍 2.8–6.3 秒，仍超时）
+```
+
+所以「缩短超时」「换更轻的命令」都不是修法：**判活这条路必须不 spawn**。
+
+### 2. 新实现：`scripts/proc-liveness.mjs`（命名管道 + nonce）
+
+- 守护进程启动时生成随机 `nonce`（12 字节 → 24 hex），建判活端点：
+  Windows `\\.\pipe\untildone-<nonce>`；POSIX `<stateDir>/liveness-<nonce>.sock`。
+  nonce / endpoint / pid / startedAt 一起写进 `proc.json`（**version 2**）。
+- **判活 = 连上端点 且读到一个 beat**。只判「连上」不够：实测主线程冻结时 OS 仍
+  接受连接（管道对象由内核持有），那会把 DF-023 那类「进程在、实际没在跑」判成健康。
+- 读 beat 的超时是新参数 `BEAT_TIMEOUT_MS = 800`（**毫秒级**，不是秒级）。
+- 实测：活着 首帧 13–35ms / 后续 1–4ms；已关闭 1–7ms；连得上但不应答 按注入超时返回。
+- **PID 复用免疫**：判据从「时间容差」升级为「**端点归属**」——PID 被复用则新进程用
+  它自己的 nonce，旧端点名不存在，连不上，**与时间无关，没有 2 秒窗口可钻**。
+  时间容差降级为第二道交叉核对（帧里回带 pid / startedAt / nonce，任何一道不符 → `reused`）。
+- **三态保留**：`alive: true / false / null` 一条没少；新增 `unresponsive`
+  （端点连得上但读不到 beat）与 `reused`、`gone`、`unknown`、`unverified` 各自独立。
+
+### 3. 为什么判活必须异步（这条是被实测否掉的设计）
+
+第一版想用同步 `fs.openSync` + `fs.readSync` 读管道（`judgeProcess` 原本是同步的）。
+实测：服务器会回 beat 时 3–7ms；**服务器不回时 `readSync` 永久阻塞**（20 秒未返回，
+加 `O_NONBLOCK` 无效 —— Node 在 Windows 管道路径上不支持它）。那比原来的 5 秒超时
+**更坏**，它会把 `--health` 整个挂死。所以 `probeLiveness` / `judgeProcess` /
+`healthCheck` 全部改成 Promise，三处调用方（`--health` / `--inbox` / TUI 的
+`readHostFacts` 与纯文本路径）已同步改。
+
+### 4. DF-091：失败原因诚实化（旧文案把人送到错方向）
+
+改前所有探针失败都说「无权限 / 命令不可用」，而真实原因 **100% 是超时**。
+现在 `PROBE_STATES` 把四种原因分开（`not-found` / `refused` / `timeout` / `eperm` /
+`parse-failed` / `closed` / `error`），每个有自己的文案（`probeFailureReason()`）：
+超时 → `unresponsive`（进程可能在，主循环没响应）；端点不存在 → `gone`；
+权限 → `unknown`（判不了，**不许说成死了**）。
+
+### 5. 负向证据（全部真跑）
+
+- 把 `probeLiveness` 改成永远返回 `{state:'timeout'}`：
+  `proc-liveness.test.mjs` **5 条红**；而 `watch.test.mjs` 的 DF-028 组 **12 条仍全绿**
+  （AC-4：逻辑与环境解耦 —— 那 12 条注入假 `probe`，只验分支）。
+- 端点关掉但 PID 在、nonce 不匹配但时间完全一致：两条负向用例都会红 ——
+  它们钉住「**没有任何一条分支仅凭 PID 存在就返回 `alive: true`**」。
+- 生产实测（真守护进程 + 心跳写旧 4 天）：`--health` 输出
+  `✗ proc   进程还在（PID 17860，…，判活端点应答了第 1 次 beat），但心跳已停 —— 它卡住了`，
+  退出码 1，墙钟落回秒级（此前该路径必 `unknown` 且累计 5 秒以上探针开销）。
+
+### 6. 一个必须报的自我否定：第一版超时（800ms）会造出假告警（DF-094）
+
+第一版把 beat 超时定成 800ms，注释理由是「一次 tick 的同步段在 300ms 以内，三倍余量」。
+**那个 300ms 是估的，我没量过。** 实测 91 次真实 tick 的同步段：
+
+```
+p50     约   15ms
+次大   1059 / 1128ms
+最大   2001ms       （probe=1992ms，一次 L-mid 扫了两个项目）
+```
+
+用真守护进程连探 60 次，**1 次**落在 `unresponsive`（报「进程卡住了」），而它一切正常。
+改成 **3000ms**（下界 = 实测最大值 × 1.5，仍远在 10 秒上限内）。
+详见 `tasks/dev-findings.md` DF-094 —— 它是「用一个没量过的数当判据」的实例，
+而且发生在我同一次改动里。
+
+### 7. `--health` 有界（AC-3 / 任务 C）：doctor 不再为一句 2ms 的问题 spawn 一整个 node
+
+`doctor` 的 `watcher` 那一项实测 **3451ms**，而它问的问题（`healthCheck`）只要 **2ms**。
+1000ms 的硬预算里永远超支，所以 spec 那句「1000ms 是硬约束」一直是假话。
+
+根因是**一条入口守卫写错**（DF-095）：`watch.mjs` 的「我是不是被直接执行」判据是
+`/watch\.mjs$/`，而 `overwatch.mjs` 以 `watch.mjs` 结尾 → import 会当场启动守护进程。
+当年的处置是「那就 spawn 吧」，还写进了 spec §5.1 当架构约束
+（「**不能不 spawn**」）。那是把**一个实现细节的副作用写成了架构要求**。
+
+修法：守卫换成与 `render-plan.mjs` / `launch.mjs` 同一份 realpath 比较；
+`doctor` 改成进程内 `import('./watch.mjs')` 调 `healthCheck()`。
+
+| | 改前 | 改后 |
+|---|---|---|
+| doctor 的 watcher 项 | 3451ms | **34ms** |
+| doctor 的 workMs | 4345ms | **762ms** |
+| `WATCHER_COST_MS` | 420 | **120** |
+
+**顺带抓出一条假绿（DF-096）**：那条标着 `★` 的 `doctor 不会变成 watch` 测试
+**从来没有牙齿**。把守卫改坏之后它仍然 pass —— 两个前置条件都没满足：
+① 默认预算 1000ms 下 `watcher` 项被整个跳过；② `checkWatcherLive` 在「没有 state.json」
+时提前 return，而 import 在它之后（临时目录里当然没有 state.json）。
+现在夹具补上 `state.json`、预算给 30000，并加一条前置断言（watcher 那一行必须出现且
+不是「预算内没时间跑」）。改坏守卫 → 该条红，原话
+`Error: 入口超时或被信号终止（signal=SIGTERM error=spawnSync … ETIMEDOUT）`。
+
+`docs/spec/2026-11-14-entry-point.md` §5.1 / §5.2 同步改写：原来的「必须 spawn」
+改成「曾经必须，2026-11-24 修掉了根因」。
+
+### 8. 判活修好后，同一种假告警从另一个原因冒回来（DF-097）
+
+修好探针之后做验收（对真守护进程连探 90 秒），`--health` 报
+`3000ms 内没有读出 beat — 进程可能还在，但它的主循环没有响应`。
+**这次它是对的。** 实测：
+
+```
+scanAll() 单次           72306ms / 70039ms     （本机 1.3 GB transcript，同步读）
+守护进程 tick 间隔 top2  103000ms / 97000ms    （正常 15000ms）
+```
+
+`asked` 层每 5 分钟把事件循环占住 70–100 秒 —— 这段时间里 L-fast（15 秒一次）的
+job 探测被整段跳过，即 DF-023 那类「进程在、没在跑」每 5 分钟复发一次。
+**旧探针从未报过它**：旧探针自己就超时、永远是 `unknown`，把这件事掩盖了。
+判活换成管道之后，它第一次有能力看见这个既有缺陷。
+
+修法：`scanAll()` 挪进**子进程**（`runAskedScanInChild()` 跑 `asked.mjs --json`），
+判据一字未动；给 `asked.mjs` 的 CLI 加三个注入点（`--projects-root` / `--sessions-root` /
+`--now`），让子进程扫同一个语料、用同一个时钟；`--no-save` 避免与守护进程竞争写历史。
+
+实测（改后）：tick 间隔 top5 = **17 / 16 / 16 / 16 / 16 秒**；150 秒内连探 **630 次，
+0 次非 beat，最大延迟 995ms**。子进程失败时返回 `{__failed}` 而不是空数组
+（空数组会把「读不到」说成「没有人在问」，还会推进 `lastAskedScanAt`）。
+
+### 9. 锐评抓到的退化（DF-099）：我把「判不了」编码成了「证伪」
+
+`judgeProcess()` 的 beat 分支原本写 `startDiff = … : Infinity`，而
+`Infinity > toleranceMs` 恒为 true —— **只要见证里的 `startedAt` 不可解析，
+一个正在应答 beat 的活进程就被判 `alive:false / reused`**，处置从「先看日志」
+变成「直接重启」。更刺眼的是**消息生成处**特意加了 `startDiff !== Infinity`
+来避免打印 Infinity，却在**判决**上漏了同一个判断：守住了消息，没守住结论。
+
+修法：时间判不了 → 这一道核对**弃权**，交给 nonce / pid 两道
+（nonce 是每个进程现生成的随机串，本就足够强）。两条测试一起钉住
+「弃权 ≠ 放行」：缺 `startedAt` 不判 reused；时间可判且差太多时**仍然**判 reused。
+
+这是我在同一轮里犯的第二种同型错误：DF-094 是拿没量过的数当判据，
+这条是把「判不了」编码成「证伪」。两条都是被别人量出来 / 看出来，不是我自己发现的。
+
+### 10. 测试与文档
+
+- 新增 `scripts/proc-liveness.test.mjs`（14 条，全部用真端点）：帧协议、nonce 唯一性、
+  `not-found` 必须比超时快、**「接受连接但永不写出」必须按注入超时返回**（同步读做不到那条）、
+  close 之后端点必须真的不可连、两张枚举表必须一一对应。
+- `watch.test.mjs` 的 DF-028 组：`healthCheck` 调用加 `await`，**断言一条未改**；
+  新增 DF-091 / DF-092 负向 5 条；新增跨进程哨兵一条（真起守护进程 + 另一目录跑 `--health`）。
+- 硬门 `check-structure.mjs`：登记 `proc-liveness.mjs` 的 11 个导出（6 个进 `PROBE_ARGS`
+  真调用、2 个有副作用进 `INTENTIONALLY_PROBED_FREE`、常量与冻结表按数据登记）。
+- 测试数 2093 → **2111**（四份文档同步；57 个测试文件）。
+
+---
+
+## [Unreleased] - 2026-11-24 门在认证一句假话（DF-090）：测试不再吃真探针、文档不再断言执行结果
+
+三个互相独立的目标，共同点都是「判据在证明一件它其实证明不了的事」。
+
+### 1. `DF-028` 组 12 条测试：真探针 → 注入假探针（AC-4）
+
+**改前实测**（`node --test --test-name-pattern="DF-028" scripts/watch.test.mjs`）：
+12 条里 5 条红，单条 5.6–6.9 秒，整组 50+ 秒。红的原因是探针超时，不是被测逻辑。
+**改后**：12 条全绿，整组 2.2–4.3 秒（三次实测 2155 / 2864 / 4321ms，
+其中测试**自身**耗时合计 218–331ms），断言一条未改。
+
+- 5 条改为注入 `probe`（DF-092 之后「判活证据」的唯一来源），不注入判据本体：
+  分支逻辑、nonce / pid / started 三道核对、文案全部照测，只替换「怎么连上端点」。
+- 负向证据（AC-4 的否决条件）：把 `probeLiveness` 改成永远返回 `{state:'timeout'}`，
+  **12 条仍然全绿**（实测 `ℹ pass 12`）。这条证明它们测的是逻辑，不是环境。
+- 没有把「起真端点、真连」写在这 5 条里 —— 那样更快也更真，但它**测的是探针**：
+  同样的负向（改坏 `probeLiveness`）会让 5 条变红，违反 AC-4。真端点覆盖搬去哨兵。
+
+### 2. 新增真探针哨兵（AC-5）：探针坏了必须显式红，不许 skip
+
+上面那 12 条注入假探针之后，**探针实现在测试里零覆盖**。补两条：
+
+- `DF-090 哨兵：真探针连真端点必须读到 beat` —— 起真监听端点，用真 `probeLiveness`
+  连、读帧；失败时显式 fail 并写「这就是探针超时/不可用」。
+- `DF-090 哨兵：端点关掉之后真探针必须报 not-found` —— 阻断「连上就算活着」的退路。
+- 跨进程端到端（`DF-092 哨兵`）由并发 Agent 提供：真起一个守护进程 + 在另一个目录跑
+  `--health`，验 AC-1 的「10 秒内、结论不是判不了」。
+
+**负向证据**：把 `probeLiveness` 改坏 → 两条哨兵**都变红**，报错原话
+「真探针没能从真端点读到 beat（state=timeout，0ms）。这就是「探针超时/不可用」」。
+**无 `skip`**：探针坏了与「这条今天没用」在报告里必须不同形。
+
+### 3. 硬门不再认证「执行结果」（AC-7）：删掉断言，而不是加一条跑不动全量测试的检查
+
+**现场**：`docs/GUIDE.md:512` 写「56 个测试文件，2080 项全绿（2078 条 pass、2 条按平台 skip）」，
+而 2026-11-24 实测 `node --test scripts/` = **2071 pass / 7 fail / 2 skip**。
+这句话是假的，而 `checkTestCount()` 给它盖了绿章 —— 它**只核总条数，从不跑一条用例**。
+更糟的是那处取数正则原本是 `(\d+)\s*项全绿`：**想通过硬门，文档里就必须出现「全绿」二字**。
+门不只在盖章，它是这句话的作者。
+
+**评估过的三条路**（都写进 `checkNoExecutionClaims()` 的头注释）：
+1. 硬门跑全量测试 —— 实测 258 秒，且本门会被 `dispatch-coverage.test.mjs` 在副本里跑多次；
+   并发下那 7 条 flaky 用例会让门随机变红（DF-026）。
+2. 硬门跑一个粗筛子集 —— 仍要几十秒，且会造出新的假话「粗筛全绿所以全量全绿」。
+3. CI 跑、硬门核「与最近一次 CI 结果一致」 —— 需要把结果写回仓库，那份文件在本地永远旧；
+   「本地门绿」变成「上次 CI 时是对的」，是一条**看不见它坏**的判据。
+
+**选的第四条**：让文档不再声称它核不了的事。这不是降低标准，是把断言强度收回到
+证据能支撑的位置 ——「2082 条已注册」可核（import 数一遍），保留；「2078 条 pass」核不了，
+删掉；「全绿」是前一句的推论，随之删掉。
+
+- `TALLY_SITES` 里 GUIDE 那行的取数正则改成 `(\d+)\s*条已注册`，与其余四处同一个命题。
+- 新增硬门检查 `executionClaims`（`checkNoExecutionClaims()`）：扫四份自证文档，
+  行内同时出现「测试语汇」与「执行结果断言」即红；**跳过围栏代码块**
+  （README 那段「AI 说 BUILD SUCCESS — 1341 例全绿」是被批判的反例，不是断言），
+  放行条件式与定义式（「才能提交」/「绿的标准」/「不算绿」）。
+- 负向证据（5 条，在 `regression-count.test.mjs`）：
+  - 文档写「1 项全绿」→ 硬门红；
+  - 写「2078 条 pass」→ 硬门红；
+  - 写「全绿才能提交」→ **不误报**（提交门槛，不是当前状态）；
+  - 围栏里的反例 → **不误报**；
+  - 「这条测试失败时先判断哪边对」→ **不误报**（讨论失败原因不是执行结果断言）。
+- 顺带修掉两处漂移：`README.md` 两次写「29 项检查」而实际 30 条（新增一条检查后暴露，
+  由既有的「N 项检查」对账抓出）；四处测试数 2080 → 2107（并发 Agent 的 proc-liveness.test.mjs 同时进来，最终计数以硬门为准）。
+
+### 4. 文档同步
+
+- `README.md`：徽章 / 代码量表 / 命令清单 / 贡献段四处测试数 2080 → 2107（并发 Agent 的 proc-liveness.test.mjs 同时进来，最终计数以硬门为准）；
+  「29 项检查」→「30 项检查」两处。
+- `CLAUDE.md`：测试数 2080 → 2107；提交前第 2 条从「全绿」（断言，核不了）改成
+  「`ℹ fail` 为 0（这一条只有当场跑的人能证明）」。
+- `docs/GUIDE.md`：那句假话改成只声明条数，并把「为什么不声称执行结果」写进正文。
+- `docs/CAPABILITIES.md`：全量测试那行从「全绿」改成「退出码 0；条数以命令输出为准」。
+- `.github/workflows/validate.yml`：注释里的测试数 2080 → 2107。
+
+---
+
 ## [Unreleased] - 2026-11-23 走量指标：五个指标第一次在真实数据上跑出数（DF-083）
 
 `docs/spec/success-metrics.md` 定义了五个指标，**一个都没在算**。

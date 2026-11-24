@@ -43,7 +43,7 @@ node scripts/scan-sessions.mjs --days 3        # 扫描会话，判定状态（�
 node scripts/scan-sessions.mjs --json          # 机器可读
 node scripts/verify-claims.mjs --days 3        # 「AI 说它做完了」有没有证据
 node scripts/check-structure.mjs               # 结构硬门
-node --test scripts/                 # 全量回归测试（2080 条，硬门会对账这个数字）
+node --test scripts/                 # 全量回归测试（2113 条，硬门会对账这个数字）
 ```
 
 **任何改动后必须跑 `check-structure.mjs` 和全量测试。** 两者都绿才能提交。
@@ -77,6 +77,6 @@ node --test scripts/                 # 全量回归测试（2080 条，硬门会
 ## 提交前
 
 1. `node scripts/check-structure.mjs` 通过（含 CHANGELOG 硬规则：改了源码/规格却没记条目会**直接 fail**）
-2. `node --test scripts/` 全绿
+2. `node --test scripts/` 的 `ℹ fail` 为 0（**这一条只有当场跑的人能证明**：硬门只核条数，它跑一次要 4 分钟，不能塞进每次改动的检查里）
 3. 若改了规格，同步更新 ADR 或台账
 4. 不用 `git add -A` —— 先 `git status` 看清楚
