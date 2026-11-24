@@ -2257,6 +2257,71 @@ test('formatHealth：不健康时明确区分「进程死了」与「进程卡�
   assert.ok(out.includes('不代表进程死了'), '必须说清这不是进程崩溃，而是卡住');
 });
 
+// ── DF-102：一轮 tick 跑 200 秒时，`--health` 不许说「卡住了」 ───────────
+//
+// 现场（2026-11-25 实测）：守护进程 20:55:42 启动，第一个 tick 扫全量语料到
+// 20:59:02 才结束 —— **200 秒**。而 jobs 层上限是 45 秒（15s × 3）。
+// 这 200 秒里 `--health` 报「进程还在…但心跳已停 —— 它卡住了，重启前先看日志」。
+// 判据采到了真事实（心跳确实旧），结论那一步没有重新想一遍：
+// 它手上还有一条更强的证据 —— **判活端点正在应答 beat** —— 而它没用上。
+//
+// 锐评 2026-11-24 把这条列为「最该重做的一条」。
+// 三条一起钉：进行中会说进行中、真卡死仍然说卡死、残留标记不许被认。
+
+test('DF-102：tick 正在进行中时，不许把「心跳旧」说成「卡住了」', async () => {
+  const now = Date.now();
+  const r = await healthCheck({
+    lastJobsScanAt: new Date(now - 200_000).toISOString(),   // 200 秒前，远超 45 秒上限
+    lastProbeAt: new Date(now - 40 * 60_000).toISOString(),  // 40 分钟，也超 probe 的 15 分钟上限
+    tickStartedAt: new Date(now - 198_000).toISOString(),    // 但这一轮 198 秒前就开始了
+  }, { nowMs: now });
+  assert.deepEqual(r.reasons, [], '正在跑的一轮不该产出任何「没在工作」的理由');
+  assert.equal(r.healthy, true, 'tick 在推进 = 在工作，健康');
+  // jobs 上限 45 秒、probe 上限 15 分钟 —— 两条都过期，两条都应标成进行中。
+  assert.equal(r.inTick.length, 2, `jobs 与 probe 都应标成进行中，实际 ${JSON.stringify(r.inTick)}`);
+});
+
+test('DF-102：真卡死时仍然要说卡死 —— 标记不能变成免责符', async () => {
+  const now = Date.now();
+  // 标记停在 6 小时前，而心跳也是 6 小时前：那一轮**早就死了**，不是「正在跑」。
+  const oldIso = new Date(now - 6 * 3600e3).toISOString();
+  const r = await healthCheck({
+    lastJobsScanAt: oldIso, lastProbeAt: oldIso, tickStartedAt: oldIso,
+  }, { nowMs: now });
+  assert.equal(r.healthy, false, 'tick 标记与心跳同龄 = 那一轮没跑完就死了，必须报不健康');
+  assert.ok(r.reasons.some((x) => x.includes('jobs')), `理由要指出 jobs，实际 ${JSON.stringify(r.reasons)}`);
+});
+
+test('DF-102：残留标记（tick 开始时刻早于该层上次推进）不许被认成「进行中」', async () => {
+  const now = Date.now();
+  const r = await healthCheck({
+    // 心跳 100 秒前推进过 —— 说明**那一轮已经跑完了**。
+    lastJobsScanAt: new Date(now - 100_000).toISOString(),
+    lastProbeAt: new Date(now - 100_000).toISOString(),
+    // 而标记停在 300 秒前：比心跳还早。若认它，就会把一个跑了 5 分钟的
+    // 死循环说成「正在进行」—— 判据必须是时间先后，不是「有没有这个字段」。
+    tickStartedAt: new Date(now - 300_000).toISOString(),
+  }, { nowMs: now });
+  assert.equal(r.healthy, false, '标记早于心跳 = 残留，不许当成正在跑');
+  assert.deepEqual(r.inTick, [], '不该有任何层被标成进行中');
+});
+
+test('DF-102：formatHealth 在「进行中」时给出「什么都别做」，与「先看日志」明确不同', async () => {
+  const now = Date.now();
+  const out = formatHealth(await healthCheck({
+    lastJobsScanAt: new Date(now - 200_000).toISOString(),
+    lastProbeAt: new Date(now - 40 * 60_000).toISOString(),
+    tickStartedAt: new Date(now - 198_000).toISOString(),
+  }, { nowMs: now }));
+  assert.ok(out.includes('正在跑一轮'), `要点明正在进行，实际输出：\n${out}`);
+  assert.ok(out.includes('什么都别做'), `处置必须是「等」，实际：\n${out}`);
+  // 不能断言「整段不含『卡住了』」——处置说明里有一句「若超时仍未推进，再按卡住了处理」，
+  // 那是**条件句**，是正确内容。要钉的是「没有把它当结论」：
+  // 结论行必须是「正在跑一轮」，而不是「没有在工作」。
+  assert.ok(!out.includes('判定：**没有在工作**'), `不许把进行中判成没在工作：\n${out}`);
+  assert.ok(!out.includes('先看日志再重启'), '进行中的处置不是「先看日志」，是「等」');
+});
+
 // ── 2026-11-12 日志轮转失败 ────────────────────────────────────────────
 //
 // 这组用例是**先复现、后修**的顺序写的。原始实现（`catch { /* ignore */ }` 三连）

@@ -2552,6 +2552,26 @@ export async function runTick({
   const { state, corrupt } = loadState(stateDir, { logger: log, nowMs });
   const summary = { ran: [], sent: [], suppressed: [], failed: [], already: 0, corrupt, timings: {} };
 
+  // 「这一轮**正在跑**」的显式标记（DF-102）。
+  //
+  // 为什么需要它：`lastJobsScanAt` 只在这轮**结束时**才推进，而一轮可能要
+  // 200 秒（本机实测：首轮扫全量语料 20:55:42 → 20:59:02）。这段时间里
+  // `--health` 看到的是「心跳 2 分钟没动，上限 45 秒」→ 报 `stuck`，
+  // 而进程其实正好好地在干活。锐评 2026-11-24 把这列为「最该重做的一条」：
+  // 判据采到了真事实（心跳确实旧），结论那一步没有重新想一遍。
+  //
+  // 用**显式的「跑起来了」**而不是「把上限调大」：
+  // 后者会把真的卡死一起放过（一个卡死 3 小时的进程同样满足「没超过大上限」）。
+  //
+  // 写在 tick **开头**，而不是每层开始时：它要回答的是「这个进程现在有没有在
+  // 推进一轮」，粒度到轮就够。`doneAt` 不写在这里 —— 写在这里就成了心跳，
+  // 而心跳的语义已经由 `lastJobsScanAt` 承担，两处写同一件事必然漂移。
+  if (!dryRun) {
+    try {
+      saveState(stateDir, { ...state, tickStartedAt: new Date(nowMs).toISOString() });
+    } catch { /* 标记写不了不该打死一轮真正的工作 */ }
+  }
+
   const notify = notifier || (async () => { throw new Error('未注入 notifier'); });
   const due = (iso, interval) => {
     if (!iso) return true;
@@ -2759,6 +2779,7 @@ export async function runTick({
   for (const layer of summary.ran) parts.push(layer);
   if (summary.timings.jobsMs != null) parts.push(`jobs=${summary.timings.jobsMs}ms`);
   if (summary.timings.probeMs != null) parts.push(`probe=${summary.timings.probeMs}ms`);
+  if (summary.timings.askedMs != null) parts.push(`asked=${summary.timings.askedMs}ms`);
   if (summary.timings.fullMs != null) parts.push(`full=${summary.timings.fullMs}ms`);
   parts.push(`candidates=${eligible.length}`);
   parts.push(`sent=${summary.sent.length}`);
@@ -3097,6 +3118,12 @@ export const HEALTH_PERIODS = Object.freeze({
 export async function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIODS, logHealth = undefined, procWitness = undefined, judge = judgeProcess } = {}) {
   const layers = [];
   const reasons = [];
+  // 「这一轮正在进行中」的产物：tick 开头写的标记（DF-102）。
+  // 它**不**用来掩盖过期心跳，只用来把那句结论从「卡住了」改成
+  // 「正在跑一轮，已经 X」——两件事的处置完全不同（前者要日志，后者只要等）。
+  const inTick = [];
+  const tickAt = Date.parse((state && state.tickStartedAt) || '');
+  const hasTickMark = Number.isFinite(tickAt);
 
   for (const [name, interval] of Object.entries(periods)) {
     const key = name === 'jobs' ? 'lastJobsScanAt' : 'lastProbeAt';
@@ -3110,9 +3137,16 @@ export async function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_
     const ageMs = nowMs - t;
     const limit = interval * 3;
     const stale = ageMs > limit;
-    layers.push({ name, interval, lastAt: iso, ageMs, stale, limit });
-    if (stale) {
+    // 「这层过期了，但一轮 tick 在它之后开始过、且还没写出新的心跳」→ 正在进行中。
+    // 判据是**时间先后**：`tickStartedAt` 晚于这层的最后一次推进，说明这一轮
+    // 就是在补它。若 `tickStartedAt` 反而更早，那说明上一轮早就结束了，
+    // 这一轮的标记是残留 —— 不认。
+    const running = stale && hasTickMark && tickAt > t;
+    layers.push({ name, interval, lastAt: iso, ageMs, stale, limit, running, tickStartedAt: hasTickMark ? new Date(tickAt).toISOString() : null });
+    if (stale && !running) {
       reasons.push(`${name}：已 ${fmtAge(ageMs)} 未运行（上限 ${fmtAge(limit)}）`);
+    } else if (running) {
+      inTick.push(`${name}：这一轮已跑 ${fmtAge(nowMs - tickAt)}（该层上次 ${fmtAge(ageMs)}前，上限 ${fmtAge(limit)}）`);
     }
   }
 
@@ -3182,10 +3216,12 @@ export async function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_
     layers.push({ name: 'proc', verdict: processVerdict.verdict, alive: processVerdict.alive, reason: processVerdict.reason });
   }
 
-  return { healthy: reasons.length === 0, reasons, layers, process: processVerdict };
+  return { healthy: reasons.length === 0, reasons, layers, process: processVerdict, inTick, tickAgeMs: hasTickMark ? nowMs - tickAt : null };
 }
 
 function fmtAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '0 秒';
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))} 秒`;
   const m = Math.round(ms / 60000);
   if (m < 60) return `${m} 分钟`;
   const h = (m / 60).toFixed(1);
@@ -3215,8 +3251,12 @@ export function formatHealth(result) {
       continue;
     }
     const age = l.ageMs == null ? '从未' : fmtAge(l.ageMs);
-    const mark = l.stale ? '✗' : '✓';
-    lines.push(`  ${mark} ${l.name.padEnd(6)} 上次 ${age}前   周期 ${fmtAge(l.interval)}（上限 ${fmtAge(l.interval * 3)}）`);
+    // 进行中用 `…` 而不是 `✗`：`✗` 的含义是「出问题了，要看」，而这一条
+    // 要用户做的事恰恰是**什么都不做，等它跑完**。同一个符号承担两种相反的
+    // 处置，就是本仓反复记的那类「看起来精确的错话」。
+    const mark = l.running ? '…' : (l.stale ? '✗' : '✓');
+    const tail = l.running ? `   ★ 这一轮正在进行（已跑 ${fmtAge(result.tickAgeMs)}）` : '';
+    lines.push(`  ${mark} ${l.name.padEnd(6)} 上次 ${age}前   周期 ${fmtAge(l.interval)}（上限 ${fmtAge(l.interval * 3)}）${tail}`);
   }
   // 进程层单独渲染，因为它回答的不是「多久没动静」而是「该不该重启」（DF-028）。
   // 它没有 interval / ageMs —— 走上面那个循环会被印成「上限 NaN 天」，
@@ -3229,7 +3269,20 @@ export function formatHealth(result) {
     lines.push(`  ${bad ? '✗' : '？'} proc   ${l.reason}`);
   }
   lines.push('');
-  if (result.healthy) {
+  // 「正在进行中」优先于一切处置建议（DF-102）。
+  // 它和「卡住了」的区别不是程度，是**该不该动手**：这里动手才是错的。
+  if (result.inTick && result.inTick.length) {
+    lines.push(`判定：**正在跑一轮，已经 ${fmtAge(result.tickAgeMs)}**。`);
+    for (const r of result.inTick) lines.push(`  - ${r}`);
+    lines.push('');
+    lines.push('处置：**什么都别做，等它跑完**。');
+    lines.push('  一轮 tick 结束时会推进心跳；若它超过一轮的正常耗时仍未推进，再按「卡住了」处理。');
+    if (result.reasons.length) {
+      lines.push('');
+      lines.push(`（另有 ${result.reasons.length} 项与这一轮无关的问题仍未解决：）`);
+      for (const r of result.reasons) lines.push(`  - ${r}`);
+    }
+  } else if (result.healthy) {
     lines.push('判定：运行中。所有层都在周期内。');
   } else {
     lines.push('判定：**没有在工作**。');
