@@ -497,7 +497,28 @@ function checkAgents() {
       const tools = parsed.tools.split(',').map((t) => t.trim());
       const bad = tools.filter((t) => WRITE_TOOLS.includes(t));
       if (bad.length) {
-        const declaresReportOnly = /只允许写|只能写|只写报告|报告路径|不得修改/.test(text);
+        // ── 2026-11-25（DF-098）：判据从「正文有没有一句套话」改成「有没有点名一个路径」。
+        //
+        // 旧判据是 `/只允许写|只能写|只写报告|报告路径|不得修改/` —— 这把两件不同的事
+        // 混成了一个正则：
+        //   · **授权**：「你的 Write 只许写 tasks/runs/<run-id>/critique.md」
+        //   · **禁令**：「不得修改被批判的对象」
+        // 只有前者能支撑「持有 Write」；后者是一句禁令，拿它当豁免等于**用限制换权限**。
+        //
+        // 实测后果（2026-11-25）：`oversight-acceptor` 只写了「不得修改被验收的文件」，
+        // 于是它靠一句**禁令**拿到了 `Write` —— 而它从来没说过自己该写哪里。
+        // 它和 probe（无 Write）在权限上是两回事，在文件外观上却同形。
+        //
+        // 旧正则还有第二个洞：`报告路径` 单独出现就够 —— 一句「报告路径见下」也能过。
+        //
+        // 现在的判据：正文必须**点名一个具体的 .md 路径**（`xxx.md`），且那句话要含授权动词。
+        // 这不是变严了，是**把原本无人核对的那条边界变成可核对的**：
+        // 宿主把 `tools:` 当精确白名单，所以 `Write` 是一个真权限，真权限要有真边界。
+        const reportPathDecl = text.split('\n').some((line) => {
+          if (!/\.md\b/.test(line)) return false;
+          return /只允许写|只能写|只写|写权限|仅限/.test(line);
+        });
+        const declaresReportOnly = reportPathDecl;
         // `bashScope`（2026-11-23，`oversight-verifier`）：只读角色跑只读命令的唯一合法出口。
         //
         // 规则本身**没有放松**：修前「readonly + Bash」一律违规；修后要求
@@ -515,9 +536,16 @@ function checkAgents() {
               + '「只读」与「不受限的 Bash」在文件外观上同形');
           }
         } else if (!declaresReportOnly) {
-          fail(rel(p), `只读角色 "${name}" 拥有写工具：${bad.join(', ')}，但正文未声明只能写报告`);
+          fail(rel(p), `只读角色 "${name}" 拥有写工具：${bad.join(', ')}，但正文没有点名它**只许写哪个文件**`
+            + '。旧判据接受一句「不得修改…」就放行 —— 那是**禁令**，不是授权：'
+            + '拿禁令换权限，等于这个角色可以写任何地方，只要别写被验的那个。'
+            + '现在要求在正文里写出具体路径（例如「你的 Write 只允许写 `tasks/runs/<run-id>/x.md`」）');
         } else if (bad.includes('Edit')) {
-          fail(rel(p), `只读角色 "${name}" 不得拥有 Edit（Write 仅限写报告，且须靠外壳检查兜住）：${bad.join(', ')}`);
+          // 删掉了旧文案里「且须靠外壳检查兜住」那半句 —— **那个外壳检查不存在**。
+          // 实测（2026-11-25）：`pre-write-gate.mjs` 管的是「第一次写之前读过项目没有」，
+          // 与「这个角色能不能写这个文件」无关；它连角色这个概念都不知道。
+          // 一句不存在的担保比没有担保更坏：它会让下一个人以为这里已经有人管了。
+          fail(rel(p), `只读角色 "${name}" 不得拥有 Edit（Write 可写报告，但要靠正文点名路径；Edit 没有任何合法形态）：${bad.join(', ')}`);
         } else if (bad.includes('Bash') && !bashScoped) {
           fail(rel(p), `只读角色 "${name}" 拥有 Bash，但没有在 frontmatter 声明 "bashScope: read-only" —— `
             + '只读角色跑命令的唯一合法形态是「显式声明只读范围 + 正文给命令清单」，'
@@ -526,9 +554,9 @@ function checkAgents() {
         // Bash 以外的写工具（Write / NotebookEdit）仍然按原来的路径判：它们不在
         // `bashScope` 的覆盖范围内，声明了范围也不该获得它们。
         const nonBash = bad.filter((t) => t !== 'Bash');
-        if (bashScoped && nonBash.length && !/只允许写|只能写|只写报告|报告路径|不得修改/.test(text)) {
+        if (bashScoped && nonBash.length && !declaresReportOnly) {
           fail(rel(p), `只读角色 "${name}" 拥有除 Bash 之外的写工具：${nonBash.join(', ')}`
-            + '—— bashScope 只覆盖 Bash，不覆盖它们');
+            + '—— bashScope 只覆盖 Bash，不覆盖它们；且正文没有点名它们只许写哪个文件');
         }
       }
     }
@@ -607,6 +635,11 @@ const TALLY_SITES = [
   // 而不是一个本门核不了的命题（它们此刻是否通过）。
   ['docs/GUIDE.md', /(\d+)\s*条已注册/, true],
   ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/, true],
+  // README-EN 是**同一份 README 的英译**，而它长期不在核对范围内（DF-103）：
+  // 中文 README 写着 2117 时它停在 1792，两处相差 300+ 条，没人发现。
+  // 徽章与正文两处都要盯 —— 徽章是访客最先看到的那个数。
+  ['README-EN.md', /regression%20tests-(\d+)/, false],
+  ['README-EN.md', /\((\d+)\s*regression tests;/, false],
 ];
 
 /** 回归测试数曾同时存在四个值：README 508 / CLAUDE 192 / GUIDE·CI 81 / 设计稿 588，

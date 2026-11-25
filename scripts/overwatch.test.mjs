@@ -294,6 +294,35 @@ test('有根且有 transcript：数得清、且按 --now 报「最新一份多�
   });
 });
 
+test('DF-104：预算在枚举前就耗尽时，必须仍数出「有多少份」，不许报 0 份', () => {
+  // 这条是**上面那条测试长期偶发变红的根因**，不是新增的洁癖。
+  //
+  // 现场：CI / 并发负载下上面那条报
+  //   `1 个（未完）项目 · 0 份 .jsonl（下限） · 没有可读的时间戳`
+  // 根因是 `checkTranscripts` 里那句检查的位置：
+  //   `sliceEnd = Date.now() + ENUM_SLICE_MS`（200ms），而机器被压满时走到那里
+  //   `Date.now()` 已经超过 sliceEnd → **首个目录都没读**就 break。
+  // 于是「没时间数」被编码成了「0 份」—— 两件完全不同的事：
+  //   0 份    → 这台机器没有会话记录（该去装 Claude Code）
+  //   没数完  → 我不知道有几份（不该下任何结论）
+  //
+  // 用 `--budget 1` 把 deadline 压到必然已经过去：这是**确定性复现**，
+  // 不靠机器负载碰运气 —— 那种「偶尔红」的测试没人会去修，只会被 skip 掉。
+  withTmp((dir) => {
+    const root = join(dir, 'projects');
+    const proj = join(root, 'slug');
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, 'a.jsonl'), '{"type":"user"}\n');
+    writeFileSync(join(proj, 'b.jsonl'), '{"type":"user"}\n');
+    const r = run(['doctor', '--budget', '1'], { env: { CLAUDE_PROJECTS_DIR: root } });
+    // 预算 1ms 必然不够 —— 那一项会标成「没查」，这是正确行为；但**数出来的不能是 0**。
+    assert.match(r.out, /2 份 \.jsonl/,
+      `预算耗尽时也必须数出真实的份数（2），不许把「没时间数」说成「0 份」。实际输出：\n${r.out}`);
+    assert.doesNotMatch(r.out, /0 份 \.jsonl/,
+      `「0 份」是一个断言（这台机器没有会话记录），预算不够时没有资格说它：\n${r.out}`);
+  });
+});
+
 // ── 4. 未实现子命令必须给出原生命令 ──────────────────────────────────
 
 for (const [cmd, native] of [

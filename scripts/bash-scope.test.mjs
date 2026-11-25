@@ -72,7 +72,15 @@ function runGateWith(agentMd, { name = 'oversight-probe-x' } = {}) {
 }
 
 /** 一份只读角色定义。`extraFrontmatter` 插在收尾 `---` 之前；`body` 是正文。 */
-function roleMd({ tools = 'Read, Grep, Bash', readonly = true, extraFrontmatter = '', body = '正文。只允许写报告。' } = {}) {
+// 夹具的默认正文必须**点名一个路径**（2026-11-25，DF-098）：
+// 判据从「有没有一句套话」改成了「有没有点名只许写哪个文件」。
+// 旧默认是 `只允许写报告` —— 那句话在旧判据下够了，在新判据下不够，
+// 于是两条本该因为**别的原因**变红的测试，改成因为「没点名路径」变红。
+// 那不是测试坏了，是**夹具仍停在旧语义**：这两条测的是 bashScope，
+// 所以夹具必须先把 Write 那条边界写对，否则它们测的就不是自己想测的东西。
+const REPORT_DECL = '你的 Write 只允许写 `tasks/runs/<run-id>/report.md`。';
+
+function roleMd({ tools = 'Read, Grep, Bash', readonly = true, extraFrontmatter = '', body = `正文。${REPORT_DECL}` } = {}) {
   return [
     '---',
     'name: oversight-probe-x',
@@ -130,7 +138,7 @@ test('硬门：bashScope + 命令清单都齐 → 放行（否则修法等于「
   // 而那会让 `oversight-verifier` 无法存在。
   const { out } = runGateWith(roleMd({
     extraFrontmatter: 'bashScope: read-only',
-    body: `正文。只允许写报告。\n${CMD_SECTION}`,
+    body: `正文。${REPORT_DECL}\n${CMD_SECTION}`,
   }));
   assert.doesNotMatch(out, /bashScope/, `两条都齐了却仍报 bashScope：\n${out}`);
 });
@@ -140,7 +148,7 @@ test('硬门：只读 + Edit（无 Bash）→ 仍然红，bashScope 不覆盖 Ed
   const { status, out } = runGateWith(roleMd({
     tools: 'Read, Grep, Edit',
     extraFrontmatter: 'bashScope: read-only',
-    body: `正文。只允许写报告。\n${CMD_SECTION}`,
+    body: `正文。${REPORT_DECL}\n${CMD_SECTION}`,
   }));
   assert.notEqual(status, 0, `只读 + Edit 被 bashScope 放行了：\n${out}`);
   assert.match(out, /不得拥有 Edit|拥有写工具/, `报错不看 Edit：\n${out}`);

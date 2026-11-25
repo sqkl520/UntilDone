@@ -382,7 +382,18 @@ function checkTranscripts(root, nowMs, deadline) {
   for (const ent of entries) {
     if (!ent.isDirectory()) continue;
     projects++;
-    if (Date.now() > sliceEnd) { complete = false; break; }
+    // **一个目录都不数就直接 break 是错的**（DF-104，2026-11-25）。
+    //
+    // 现场：CI / 并发负载下 `overwatch.test.mjs` 的「有根且有 transcript」偶发变红，
+    // 输出是「1 个（未完）项目 · **0 份 .jsonl**（下限）」。根因不是枚举慢，是这个
+    // 检查的位置：`sliceEnd = Date.now() + ENUM_SLICE_MS`，而机器被压满时，
+    // 走到这里 `Date.now()` 已经超过 sliceEnd → **首个目录都没读**就 break。
+    // 于是「预算耗尽」被编码成了「0 份」——两件完全不同的事：
+    //   · 0 份        → 这台机器没有会话记录（去装 Claude Code）
+    //   · 没数完      → 我不知道有几份（别下任何结论）
+    // 判据必须是「已经数到过东西了吗」，不是「还有时间吗」。
+    // 有文件时提前停仍然允许（那是切片的本来目的：别为了数全而超预算）。
+    if (files > 0 && Date.now() > sliceEnd) { complete = false; break; }
     const dir = join(root, ent.name);
     let names;
     try { names = readdirSync(dir); } catch { continue; }
