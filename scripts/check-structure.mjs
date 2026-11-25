@@ -15,11 +15,13 @@ import { join, relative, extname, dirname, resolve } from 'node:path';
 
 import { publishedPathViolations, findKnownIdentifiers } from './published-paths.mjs';
 import { scanLinks, KIND_TEXT } from './link-check.mjs';
-import { discoverRoles, parseFrontmatter, readonlyOf } from './roles.mjs';
+import { discoverRoles, parseFrontmatter, readonlyOf, bashScopeOf, rolesFor, rolesDirFor } from './roles.mjs';
 import {
-  loadChecks, livingDocsGap, CONFIG_REL, CHECK_NAMES, DEFAULTS as CHECKS_DEFAULTS,
+  loadChecks, livingDocsGap, CONFIG_REL, CHECK_NAMES, CHECK_DOMAINS, domainOf,
+  DEFAULTS as CHECKS_DEFAULTS,
 } from './check-config.mjs';
 import { countRegisteredTests } from './regression-count.mjs';
+import { quartetGaps, QUARTET_FIELDS } from './dispatch-quartet.mjs';
 
 const ROOT = process.cwd();
 const violations = [];
@@ -36,7 +38,7 @@ const warn = (file, msg) => warnings.push({ file, msg });
 /** 报「某条检查没跑」。这条记录会出现在输出末尾单独一节，**不会**被 `✓` 掩盖。 */
 const notRun = (check, why) => skipped.push({ check, why });
 
-/** 「这个产物是仓库的规定产物，缺了说明仓库坏了」。
+/** 「这个产物是**本产品自身**的规定产物，缺了说明仓库坏了」。
  *
  *  ## 为什么需要这个函数（DF-047）
  *
@@ -47,16 +49,44 @@ const notRun = (check, why) => skipped.push({ check, why });
  *  **没有任何机制发现这两条检查被删了**。
  *
  *  修法不是把 `return` 一把改成 `fail`：那会让「用户还没有 docs/design/」这类
- *  合法场景变红。语义被拆成两个名字，**调用方必须显式选一个**：
+ *  合法场景变红。语义被拆成三个名字，**调用方必须显式选一个**：
  *
- *    · `requirePath()` —— 这是本仓库的规定产物，缺了 `fail`；
+ *    · `requireProduct()` —— 这是**本产品自身**的规定产物，缺了 `fail`。
+ *      仅在 `productRepo: true` 时如此（DF-051）；别人的项目里它是 `optional`。
  *    · `optionalPath()` —— 缺了合法，但**必须在输出里留下「本轮没跑」**。
  *
- *  两个名字都是返回 boolean，调用方照旧写 `if (!requirePath(...)) return;`。
- *  名字本身就是「缺了会怎样」的文档，读代码的人不用去猜。 */
+ *  两个名字都是返回 boolean，调用方照旧写 `if (!requireProduct(...)) return;`。
+ *  名字本身就是「缺了会怎样」的文档，读代码的人不用去猜。
+ *
+ *  ## 为什么原来的名字 `requirePath` 被改名（DF-051 的一半）
+ *
+ *  它的报错文案是「它是本仓库的规定产物」。在别人的项目里，那 54 条违规字面上
+ *  就是**要求对方复制我们整套文档**。名字与文案都带着「本仓库」这个假设，
+ *  于是调用点看不出自己把「我们自己的规矩」当成了「任何项目的合格线」。
+ *  改名 + 拆域之后，**每个调用点必须回答「这是通用命题还是我们的规矩」**。 */
+function requireProduct(abs, label) {
+  if (existsSync(abs)) return true;
+  // 别人的项目里，我们的产物没有对象 —— 但不能静默：登记「本轮没跑」。
+  //
+  // **按检查聚合，不逐份报**：`livingDocs` 一份清单就是 16 个文件，逐条打印会让
+  // 「3 条违规」后面跟 40 行「未跑」，读者只会去关掉这道门。聚合成一条的意思是
+  // 「这条检查的覆盖面比它的名字窄」，那才是要传达的事实。
+  if (!PRODUCT_REPO) {
+    productMissing.set(CURRENT_CHECK, (productMissing.get(CURRENT_CHECK) || 0) + 1);
+    return false;
+  }
+  fail(label, '不存在 —— 它是本产品自身的规定产物，缺了说明仓库结构已损坏（这条检查因此没跑）');
+  return false;
+}
+
+/** 「这个产物是**任何项目**都该有的（脚本目录 / README / .gitignore）」。
+ *
+ *  与 `requireProduct()` 的区别是适用范围，不是严重程度：脚本目录缺失在任何项目里
+ *  都是真问题（那里的检查无从谈起）。`PRODUCT_REPO` **不改变**这一条 —— 这正是
+ *  「分三档」里第一档「真问题」的落点。 */
 function requirePath(abs, label) {
   if (existsSync(abs)) return true;
-  fail(label, '不存在 —— 它是本仓库的规定产物，缺了说明仓库结构已损坏（这条检查因此没跑）');
+  fail(label, '不存在 —— 缺了它，这条检查没有可查的对象（这不是「可跳过」）');
   return false;
 }
 
@@ -99,6 +129,25 @@ if (CHECKS_LOAD.source === 'file' && cfgChanged) {
   console.log(`配置：${CHECKS_LOAD.path}（形状与默认值不同，以下检查按它执行）\n`);
 }
 
+/** **本仓是不是本产品自身的仓库**。整个「分域」的开关（DF-051）。
+ *
+ *  `false`（默认）时，`product` 域的检查不执行、也不报「规定产物不存在」——
+ *  别人的项目不欠我们一份 CHANGELOG、一份 `docs/design/`、一句「不能自动接力」。
+ *  `true` 时按产品自身的全部规矩自检（本仓库那份配置写着 `true`）。
+ *
+ *  **不可静默**：`false` 时输出末尾会列一行「哪一族规矩本轮不适用 + 怎么打开」——
+ *  否则「本产品规矩全部通过」与「本产品规矩一条都没跑」在屏幕上同形（DF-047 的老病）。 */
+const PRODUCT_REPO = CFG.productRepo === true;
+
+/** 当前正在执行的检查名。`requireProduct()` 要用它登记「本轮没跑」。
+ *  运行循环每进一条就赋一次 —— 这样每个调用点不必自己传名字（传错的话
+ *  「未跑」会记到别人头上，而那种错没有任何机制发现）。 */
+let CURRENT_CHECK = '(init)';
+
+/** 检查名 → 因「本产品自身的产物不存在」而没跑的次数（`productRepo=false` 时）。
+ *  按检查聚合成一行输出，理由见 `requireProduct()`。 */
+const productMissing = new Map();
+
 // ── 规则定义 ──────────────────────────────────────────────────────────
 
 /** 可发布区：出现本机盘符即为违规（ADR-0001 §发布区零盘符） */
@@ -125,13 +174,29 @@ const PATH_EXEMPT = new RegExp(`^(${CFG.scriptsDir.replace(/[.*+?^${}()|[\]\\]/g
 
 /** 角色目录与脚本目录。**所有用到它们的地方都从这里取** —— 写死一处就等于没参数化：
  *  `%TEMP%` 里那个项目把脚本放在 `src/`，写死 `join(ROOT,'scripts')` 的 6 处检查会
- *  对着一个不存在的目录静默 `return`，门报绿而一个字都没查。 */
-const AGENTS_DIR = join(ROOT, CFG.agentsDir);
+ *  对着一个不存在的目录静默 `return`，门报绿而一个字都没查。
+ *
+ *  ## 角色目录**不再是一个配置键**（DF-064）
+ *
+ *  修前这里有三个答案：`checks.json` 的 `agentsDir`（硬门用）、
+ *  `roles.mjs` 的 `agentsDirCandidates()` 探测（运行期用）、以及宿主自己加载的
+ *  `项目根/.claude/agents/`。三者可以各不相同，而**没有一个机制发现它们分叉了**。
+ *
+ *  现在角色目录只有一个来源：`roles.mjs` 的 `rolesDirFor(root)`（= `<root>/.claude/agents`）。
+ *  硬门、`validate-run`、`compose`、`render-plan` 全部读它；宿主读的也是同一个路径 ——
+ *  那是 Claude Code 的项目布局约定，不是我们能换的东西。于是「角色在哪」不可能再有两个答案。 */
 const SCRIPTS_DIR = join(ROOT, CFG.scriptsDir);
 /** 报告里用的相对路径（`scripts/x.mjs` 这种），**所有报错文案都从这里取** ——
  *  文案里写死的 `scripts/` 在别人的项目里是一条指向错地方的指示。 */
 const SCRIPTS_REL = CFG.scriptsDir;
-const AGENTS_REL = CFG.agentsDir;
+
+/** 角色目录：**来自 `roles.mjs`，不是本文件的一个常量**（DF-064）。
+ *
+ *  `rolesDirFor(ROOT)` 就是 `<root>/.claude/agents` —— 与宿主加载项目角色用的是
+ *  同一个路径。硬门不再有自己的 `agentsDir` 答案，所以「门说角色在 A、派发器去 B 找」
+ *  这种分叉在结构上不可能发生。相对路径由 `relative()` 算，不手写，免得换布局时漂。 */
+const AGENTS_DIR = rolesDirFor(ROOT);
+const AGENTS_REL = relative(ROOT, AGENTS_DIR).replace(/\\/g, '/');
 
 const AGENT_REQUIRED_FIELDS = ['name', 'description'];
 const WRITE_TOOLS = ['Edit', 'Write', 'NotebookEdit', 'Bash'];
@@ -291,9 +356,11 @@ function checkAbsolutePaths() {
   // 搬到另一份。这一条由 `DF-039` 第二轮的实事故钉住。
   for (const f of ['tasks/dev-findings.md', 'tasks/accepted-deviations.md']) {
     const p = join(ROOT, f);
-    // 两本台账是**本仓库的规定产物**（CLAUDE.md 目录归属表把它们列为可发布区）。
-    // 缺了不是「可跳过」，是「台账没了，纪律的载体也没了」—— 报违规。
-    if (!requirePath(p, f)) continue;
+    // 两本台账是**本产品自身**的规定产物（CLAUDE.md 目录归属表把它们列为可发布区）。
+    // 缺了不是「可跳过」，是「台账没了，纪律的载体也没了」—— 本产品自己的仓库里报违规。
+    // 别人的项目里不要求它们存在（DF-051）—— 但**存在就照查**：
+    // 如果有人在自己的项目里也建了同名台账，泄漏判据照样适用。
+    if (!requireProduct(p, f)) continue;
     let text;
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     for (const v of findKnownIdentifiers(text)) {
@@ -322,28 +389,54 @@ function checkPrivatePaths() {
 
 function checkGitignoreSanity() {
   const gi = join(ROOT, '.gitignore');
-  // `.gitignore` 缺失 = 仓库坏了（`git add -A` 会把本机私有物全提交）。
-  // 这一处**原本就是 fail**，保留其语义，只是改用统一的名字，让「缺了会红」
-  // 在调用点一眼可见，而不需要读函数体。
-  if (!requirePath(gi, '.gitignore')) return;
+  // `.gitignore` **不是**「本产品规定产物」，但它也不是任何项目的必需品：
+  // 一个还没有任何私有路径、也没排除过产品本体的项目，没有它是**安全**的 ——
+  // 没有规则 = 什么都不会被误排除。要求它存在等于要求对方长成我们的样子（DF-051）。
+  //
+  // 判据改成正向的：**需要它的那些条件不成立时，缺了才红**。三条，都来自盘上的事实：
+  //   1. 有私有路径在盘上 → 它们必须被忽略（否则 `git add -A` 会把它们提交）；
+  //   2. 有运行台账目录在盘上 → 同上（台账含会话 ID，比「私有」更硬）；
+  //   3. 有 `gitignoreFatal` 里的目录在盘上 → 必须显式确认没被排除。
+  // 只有 1、2 是通用命题（私有物必须被忽略）；3 是**本产品自身的**规矩
+  // （「别让 `git add -A` 静默什么都不加」的教训来自那个参考项目），
+  // 所以在别人的项目里它不参与「缺了就红」的判断。
+  if (!existsSync(gi)) {
+    const present = PRIVATE_PATHS.filter((p) => existsSync(join(ROOT, p)));
+    const runsHere = existsSync(join(ROOT, CFG.runsDir));
+    if (present.length || runsHere) {
+      fail('.gitignore', `不存在，而盘上有 ${present.length} 条私有路径`
+        + `${runsHere ? `、运行台账目录 ${CFG.runsDir}/` : ''} —— 它们会被误提交`);
+    } else {
+      notRun('gitignoreSanity', '没有 .gitignore，盘上也没有需要它保护的私有路径或运行台账');
+    }
+    return;
+  }
   const text = readFileSync(gi, 'utf8');
   const lines = text.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
 
-  // 参考项目的 .gitignore 忽略 .claude/ rules/ tasks/ —— 对本仓库是致命的
-  const fatal = CFG.gitignoreFatal;
-  for (const dir of fatal) {
-    const offending = lines.find((l) => {
-      const r = l.replace(/^\//, '').replace(/\/$/, '');
-      return r === dir || r === dir + '/**' || r === dir + '/*';
-    });
-    if (offending) {
-      fail('.gitignore', `排除了产品本体目录 "${dir}"（规则：${offending}）——git add -A 会静默什么都不加`);
+  // 参考项目的 .gitignore 忽略 .claude/ rules/ tasks/ —— 对本仓库是致命的。
+  // 这一条**只在本产品的仓库里判**：`gitignoreFatal` 是我们在那个项目上付的学费，
+  // 别人的项目忽略 `docs/` 完全可能是对的（他们根本没有需要发布的 docs）。
+  if (PRODUCT_REPO) {
+    const fatal = CFG.gitignoreFatal;
+    for (const dir of fatal) {
+      const offending = lines.find((l) => {
+        const r = l.replace(/^\//, '').replace(/\/$/, '');
+        return r === dir || r === dir + '/**' || r === dir + '/*';
+      });
+      if (offending) {
+        fail('.gitignore', `排除了产品本体目录 "${dir}"（规则：${offending}）——git add -A 会静默什么都不加`);
+      }
     }
   }
 
-  // 「台账必须被 gitignore 排除」这条同样要跟着配置走：写死 `tasks/runs` 时，
-  // 别人的项目会为**本仓库的台账目录**报红，而它自己真正的台账目录没人看。
-  if (!lines.some((l) => l.includes(CFG.runsDir))) {
+  // 「台账必须被 gitignore 排除」是**通用**命题：台账含会话 ID，任何项目里
+  // 误提交都是泄漏。落点跟着配置走（写死 `tasks/runs` 时别人的项目会为
+  // **本仓库的**台账目录报红，而它自己真正的台账目录没人看）。
+  //
+  // 但只在台账目录**在盘上**时才要求：别人的项目可能根本不用运行台账，
+  // 那时「必须排除一个不存在的目录」是一条没有对象的红（DF-051）。
+  if (existsSync(join(ROOT, CFG.runsDir)) && !lines.some((l) => l.includes(CFG.runsDir))) {
     fail('.gitignore', `未排除 ${CFG.runsDir}/（运行台账可能含会话 ID）`);
   }
 }
@@ -352,12 +445,18 @@ function checkGitignoreSanity() {
 
 function checkAgents() {
   const dir = AGENTS_DIR;
-  // 角色目录是**本仓库的规定产物**（12 份定义是被 git 跟踪的交付物）。
+  // 角色目录在**任何**项目里都是可判的：有 `.md` 就得有合法的 frontmatter
+  // （`name` / `description` / `readonly`），只读角色不许拿写工具。
+  //
+  // 但「**必须存在**」是本产品自身的规矩（12 份定义是被 git 跟踪的交付物）——
+  // 别人的项目不配 agent 是正常的，不是仓库坏了。所以缺了用 `requireProduct()`：
+  // 本仓里红，别人的项目里记一条「本轮没跑」（DF-051）。
+  //
   // 旧版的 `warn(...)` + `return` 是本文件里最典型的一次「静默短路」：
   // 提示不阻塞，而提示出现在末尾那一节，读者扫一眼 `✓` 就走了。
   // 更糟的是它写着「本轮允许」—— 那句话是历史遗留（Phase B 之前的临时状态），
   // 现在它只会让「角色定义全部消失了」看起来像一条无害的提示。
-  if (!requirePath(dir, AGENTS_REL)) return;
+  if (!requireProduct(dir, AGENTS_REL)) return;
 
   const files = readdirSync(dir).filter((f) => f.endsWith('.md'));
   if (!files.length) fail(AGENTS_REL, '目录存在但没有任何 agent 定义');
@@ -398,11 +497,66 @@ function checkAgents() {
       const tools = parsed.tools.split(',').map((t) => t.trim());
       const bad = tools.filter((t) => WRITE_TOOLS.includes(t));
       if (bad.length) {
-        const declaresReportOnly = /只允许写|只能写|只写报告|报告路径|不得修改/.test(text);
-        if (!declaresReportOnly) {
-          fail(rel(p), `只读角色 "${name}" 拥有写工具：${bad.join(', ')}，但正文未声明只能写报告`);
-        } else if (bad.includes('Edit') || bad.includes('Bash')) {
-          fail(rel(p), `只读角色 "${name}" 不得拥有 Edit/Bash（Write 仅限写报告，且须靠外壳检查兜住）：${bad.join(', ')}`);
+        // ── 2026-11-25（DF-098）：判据从「正文有没有一句套话」改成「有没有点名一个路径」。
+        //
+        // 旧判据是 `/只允许写|只能写|只写报告|报告路径|不得修改/` —— 这把两件不同的事
+        // 混成了一个正则：
+        //   · **授权**：「你的 Write 只许写 tasks/runs/<run-id>/critique.md」
+        //   · **禁令**：「不得修改被批判的对象」
+        // 只有前者能支撑「持有 Write」；后者是一句禁令，拿它当豁免等于**用限制换权限**。
+        //
+        // 实测后果（2026-11-25）：`oversight-acceptor` 只写了「不得修改被验收的文件」，
+        // 于是它靠一句**禁令**拿到了 `Write` —— 而它从来没说过自己该写哪里。
+        // 它和 probe（无 Write）在权限上是两回事，在文件外观上却同形。
+        //
+        // 旧正则还有第二个洞：`报告路径` 单独出现就够 —— 一句「报告路径见下」也能过。
+        //
+        // 现在的判据：正文必须**点名一个具体的 .md 路径**（`xxx.md`），且那句话要含授权动词。
+        // 这不是变严了，是**把原本无人核对的那条边界变成可核对的**：
+        // 宿主把 `tools:` 当精确白名单，所以 `Write` 是一个真权限，真权限要有真边界。
+        const reportPathDecl = text.split('\n').some((line) => {
+          if (!/\.md\b/.test(line)) return false;
+          return /只允许写|只能写|只写|写权限|仅限/.test(line);
+        });
+        const declaresReportOnly = reportPathDecl;
+        // `bashScope`（2026-11-23，`oversight-verifier`）：只读角色跑只读命令的唯一合法出口。
+        //
+        // 规则本身**没有放松**：修前「readonly + Bash」一律违规；修后要求
+        //   ① frontmatter 写 `bashScope: read-only`，**且**
+        //   ② 正文有一节「允许的命令」列出具体命令。
+        // 两条缺一条照样红。判据挂在 `bad.includes('Bash')` 上而不是先把它从 `bad` 里
+        // 摘掉：先摘掉的话，「没写 bashScope」时的报错会变成「拥有写工具 Edit」——
+        // 而真正的原因是 Bash，报错指错了地方。
+        const bashScoped = bashScopeOf(parsed) === 'read-only';
+        const scopedOnlyBash = bad.every((t) => t === 'Bash');
+        if (bashScoped && scopedOnlyBash && declaresReportOnly) {
+          if (!/##\s*允许的命令/.test(text)) {
+            fail(rel(p), `只读角色 "${name}" 声明了 bashScope: read-only，但正文没有「## 允许的命令」一节 —— `
+              + '`bashScope` 是一句自我声明，命令清单才是可核对的边界。缺了它，'
+              + '「只读」与「不受限的 Bash」在文件外观上同形');
+          }
+        } else if (!declaresReportOnly) {
+          fail(rel(p), `只读角色 "${name}" 拥有写工具：${bad.join(', ')}，但正文没有点名它**只许写哪个文件**`
+            + '。旧判据接受一句「不得修改…」就放行 —— 那是**禁令**，不是授权：'
+            + '拿禁令换权限，等于这个角色可以写任何地方，只要别写被验的那个。'
+            + '现在要求在正文里写出具体路径（例如「你的 Write 只允许写 `tasks/runs/<run-id>/x.md`」）');
+        } else if (bad.includes('Edit')) {
+          // 删掉了旧文案里「且须靠外壳检查兜住」那半句 —— **那个外壳检查不存在**。
+          // 实测（2026-11-25）：`pre-write-gate.mjs` 管的是「第一次写之前读过项目没有」，
+          // 与「这个角色能不能写这个文件」无关；它连角色这个概念都不知道。
+          // 一句不存在的担保比没有担保更坏：它会让下一个人以为这里已经有人管了。
+          fail(rel(p), `只读角色 "${name}" 不得拥有 Edit（Write 可写报告，但要靠正文点名路径；Edit 没有任何合法形态）：${bad.join(', ')}`);
+        } else if (bad.includes('Bash') && !bashScoped) {
+          fail(rel(p), `只读角色 "${name}" 拥有 Bash，但没有在 frontmatter 声明 "bashScope: read-only" —— `
+            + '只读角色跑命令的唯一合法形态是「显式声明只读范围 + 正文给命令清单」，'
+            + '不写就与「不受限的 Bash」同形。要么删掉 Bash，要么补上这两处');
+        }
+        // Bash 以外的写工具（Write / NotebookEdit）仍然按原来的路径判：它们不在
+        // `bashScope` 的覆盖范围内，声明了范围也不该获得它们。
+        const nonBash = bad.filter((t) => t !== 'Bash');
+        if (bashScoped && nonBash.length && !declaresReportOnly) {
+          fail(rel(p), `只读角色 "${name}" 拥有除 Bash 之外的写工具：${nonBash.join(', ')}`
+            + '—— bashScope 只覆盖 Bash，不覆盖它们；且正文没有点名它们只许写哪个文件');
         }
       }
     }
@@ -454,6 +608,39 @@ function checkCapabilityDisclosure() {
 }
 
 // ── 检查 6.5：文档里的测试数必须与实测一致 ────────────────────────────
+
+/** 本仓规定的**自证位置**：文档里「N 条回归测试」这句话出现在哪、取哪个捕获组。
+ *
+ *  只查**声明基线**的那一处，不查历史条目（CHANGELOG 与 research 里的旧数字是
+ *  事实记录，不该被改）。
+ *
+ *  第三列 `required`：**声明了就必须对**，但没声明不报违规。
+ *  这个区分来自 DF-046（「6 个常量把本仓库的形状当成了判据」）：别人项目里没有徽章，
+ *  强制它「必须有一个」会在那个项目里造一条与本门目的无关的红。
+ *  前四处仍是必需的 —— 它们是本仓规定的自证位置，缺了等于没人再核这个数。
+ *
+ *  **这份清单只有一份。** `checkTestCount()` 与 `checkNoExecutionClaims()`
+ *  读同一份 —— 两处各写一份必然漂，而「同一件事有第二个答案」正是本仓库反复
+ *  吃亏的形态（见 `DF-076`）。 */
+const TALLY_SITES = [
+  ['README.md', /（(\d+)\s*条回归测试/, true],
+  // README 的徽章是**第五处**，原先完全不在核对范围内 —— 只能靠人记得手改，
+  // 而它恰恰是访客最先看到的那个数。加进来之后它与其余四处同源（漂了会红），
+  // 但对没有徽章的项目不作要求。
+  ['README.md', /regression%20tests-(\d+)/, false],
+  ['CLAUDE.md', /全量回归测试（(\d+)\s*条/, true],
+  // 这一处（GUIDE）**改过口径**：原先取的是 `(\d+)\s*项全绿`，那个正则本身就在
+  // 逼文档写「全绿」（DF-090：正则的形状决定了文档必须说什么）。
+  // 现在取「N 条已注册」—— 与其余四处同一个命题（有多少条测试存在），
+  // 而不是一个本门核不了的命题（它们此刻是否通过）。
+  ['docs/GUIDE.md', /(\d+)\s*条已注册/, true],
+  ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/, true],
+  // README-EN 是**同一份 README 的英译**，而它长期不在核对范围内（DF-103）：
+  // 中文 README 写着 2117 时它停在 1792，两处相差 300+ 条，没人发现。
+  // 徽章与正文两处都要盯 —— 徽章是访客最先看到的那个数。
+  ['README-EN.md', /regression%20tests-(\d+)/, false],
+  ['README-EN.md', /\((\d+)\s*regression tests;/, false],
+];
 
 /** 回归测试数曾同时存在四个值：README 508 / CLAUDE 192 / GUIDE·CI 81 / 设计稿 588，
  *  实测 793。四份文件四个值，而 CI 里那个 81 停在一年前的量级。
@@ -533,16 +720,10 @@ function checkTestCount() {
   // 这个区分来自 DF-046（「6 个常量把本仓库的形状当成了判据」）：别人项目里没有徽章，
   // 强制它「必须有一个」会在那个项目里造一条与本门目的无关的红。
   // 前四处仍是必需的 —— 它们是本仓规定的自证位置，缺了等于没人再核这个数。
-  const sites = [
-    ['README.md', /（(\d+)\s*条回归测试/, true],
-    // README 的徽章是**第五处**，原先完全不在核对范围内 —— 只能靠人记得手改，
-    // 而它恰恰是访客最先看到的那个数。加进来之后它与其余四处同源（漂了会红），
-    // 但对没有徽章的项目不作要求。
-    ['README.md', /regression%20tests-(\d+)/, false],
-    ['CLAUDE.md', /全量回归测试（(\d+)\s*条/, true],
-    ['docs/GUIDE.md', /(\d+)\s*项全绿/, true],
-    ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/, true],
-  ];
+  //
+  // **这份清单是 TALLY_SITES（DF-090）的同一份数据。** 两处各写一份必然漂 ——
+  // 而「同一件事有第二个答案」正是本仓库反复吃亏的形态。
+  const sites = TALLY_SITES;
 
   // **平台无关性**：这道门必须在任何 runner 上数出同一个数，否则「文档写一个数」
   // 这件事就没法成立。2026-11-21 修 CI 红时的一度误判是「这个数平台相关」，理由是
@@ -567,16 +748,20 @@ function checkTestCount() {
 
   for (const [file, re, required] of sites) {
     const p = join(ROOT, file);
-    // 前四处是**规定了要声明测试数**的文件（sites 是手写清单）。
-    // 缺了不是「它不声明」而是「它不该缺」—— 报违规，否则「四份都对上了」可以是
-    // 「三份不见了、一份对了」的同形表述。第三列为 false 的那处（徽章）例外：
-    // 它在别的项目里不存在是正常的，只在「写了」的时候核对。
-    if (!requirePath(p, file)) continue;
+    // 「必须**声明**测试数」是本产品自身的规矩（四个自证位置）。别人的项目里
+    // 可以是「没有测试数声明」—— 那不是缺陷。所以 `required` 只在 productRepo 时生效；
+    // 「写了就必须对」永远生效（写了假数字是任何项目的问题）。
+    //
+    // 文件存在性同理：`CLAUDE.md` / `docs/GUIDE.md` / `.github/workflows/validate.yml`
+    // 是本产品自身的产物，别人的项目里不存在是正常的（DF-051）。
+    if (!requireProduct(p, file)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     const m = text.match(re);
     if (!m) {
-      if (required) fail(file, `找不到回归测试数声明（应形如「${actual} 条」）—— 删掉声明等于没人再核它`);
+      if (required && PRODUCT_REPO) {
+        fail(file, `找不到回归测试数声明（应形如「${actual} 条」）—— 删掉声明等于没人再核它`);
+      }
       continue;
     }
     const claimed = Number(m[1]);
@@ -584,6 +769,128 @@ function checkTestCount() {
       fail(file, `回归测试数写的是 ${claimed}，实跑注册 ${actual} 条（${measured.files} 个文件）`
         + `${crossPlatformNote()}。改成 ${actual}，或先确认新加的测试真的被注册了`);
     }
+  }
+}
+
+// ── 检查 6.6：文档不许声称「测试全绿 / N 条 pass」—— 硬门核不了执行结果 ──
+
+/** **这道门修的是「门在认证一句假话」这个缺陷本身**（DF-090）。
+ *
+ *  ## 现场
+ *
+ *  `docs/GUIDE.md:512` 曾写着「56 个测试文件，2080 项全绿（2078 条 pass、2 条按平台 skip）」，
+ *  而 2026-11-24 实测 `node --test scripts/` 是 2071 pass / 7 fail / 2 skip。
+ *  这句话是假的，而 `checkTestCount()` 给盖了绿章 —— 因为它**只核总条数**。
+ *
+ *  2080 这个总数是真的（注册数），所以「对账通过」也真的成立。缺陷在于：
+ *  **注册数相等与「执行结果全绿」是两件事**，而文档把后者当成前者的推论写了。
+ *  一句需要跑完全量测试才能验证的话，被一句只 import、不执行的检查认证了。
+ *
+ *  更糟的是**正则的形状在逼文档撒谎**：那处取数正则原本是 `(\d+)\s*项全绿`，
+ *  于是「想通过硬门」这件事本身就要求文档里出现「全绿」二字。门不只在盖章，
+ *  它是这句话的作者。（这就是 `TALLY_SITES` 里那一行被改口径的原因。）
+ *
+ *  ## 为什么不在硬门里真跑全量测试（评估过的三条路）
+ *
+ *  1. **硬门跑 `node --test scripts/`**：实测 258 秒（本机，2026-11-24）。
+ *     本门会被 `dispatch-coverage.test.mjs` 在副本里跑很多次，每次多 4 分钟 ——
+ *     那会让「改一行就跑一次门」变得不可行，而**门被跳过比门弱更坏**。
+ *     而且那 7 条本就 flaky 的用例会让门随机变红，红警被驯化成噪音（DF-026）。
+ *
+ *  2. **硬门只跑一个「粗筛子集」**：仍要几十秒，且**粗筛通过不代表全量通过** ——
+ *     它会造出一个新的、更隐蔽的假话：「粗筛全绿，所以全量全绿」。
+ *
+ *  3. **CI 负责跑，硬门核「文档与最近一次 CI 结果一致」**：需要把 CI 结果写回仓库
+ *     （一个结果文件），而那份文件在本地永远是旧的 —— 于是「本地门绿」的意思变成
+ *     「上次 CI 时是对的」。这是一条**我看不见它坏**的判据，比没有更坏。
+ *
+ *  ## 所以选第四条：让文档**不再声称**它核不了的事
+ *
+ *  这不是「降低标准」，而是**把断言的强度收回到证据能支撑的位置**：
+ *  - 「2082 条已注册」是可核的（import 数一遍即可，本门就在做），保留；
+ *  - 「2078 条 pass」核不了（要真跑 258 秒，且结果随环境漂），**删掉**；
+ *  - 「全绿」是前一句的推论，随之删掉。
+ *
+ *  于是文档说的是「有多少条测试存在」，而不是「它们此刻是否通过」。
+ *  后者只有 `node --test scripts/` 的当场输出能说；它正确的归属地是
+ *  **跑它的那个人 / CI 的那次 job**，而不是一份会被反复引用的静态文档。
+ *
+ *  ## 判据
+ *
+ *  扫**自证位置所在的四份文档**（README / CLAUDE / GUIDE / CAPABILITIES），
+ *  行内同时出现「测试语汇」与「执行结果断言」即违规。
+ *
+ *  **判据只管「数值化的执行结果」，不管「通过 / 失败」这两个词本身**：
+ *  讨论「这条测试为什么失败」是正常内容，声称「2078 条 pass」才是断言。
+ *  所以被禁的是 `全绿` / `全部通过` / `N 条 pass` / `N pass` / `N passed` /
+ *  `pass: N` / `fail: N` 这些**带数或带绝对判断**的形态。
+ *
+ *  **跳过围栏代码块**：`README.md` 里那段「AI 说 BUILD SUCCESS — 1341 例全绿」
+ *  是**被批判的假话示例**，它引用的正是本门要禁的形态。把它当违规会逼人删掉
+ *  这段反例 —— 而那段反例是本产品最核心的一张图。围栏内的内容不是对仓库的断言。
+ *
+ *  **允许条件式与定义式**：`全绿才能提交`（提交门槛）`绿的标准`（定义）说的是
+ *  规矩，不是当前状态。中文没有形态标记，这个区分认不全，所以只放行 `ALLOW`
+ *  里那几种本仓确实在用的措辞；其余一律红 —— 宁可让人改写一句话，
+ *  不可放过一句假的「已经绿了」。
+ *
+ *  **不扫 CHANGELOG 与 research/**：那两处是**历史记录**。「当时 1908 条全绿」
+ *  在当时是真的，改它等于篡改历史。这也正是把范围限定在四份自证文档的原因 ——
+ *  用「扫所有活文档」会连历史一起判红（实测 7 处误报，见 DF-090）。 */
+
+/** 自证位置文档：本产品对外的「测试有多少、状态如何」的声明只该出现在这里。 */
+const EXEC_CLAIM_DOCS = ['README.md', 'CLAUDE.md', 'docs/GUIDE.md', 'docs/CAPABILITIES.md'];
+
+/** 条件式 / 定义式的标记。命中的行说的是「规矩」，不是「当前状态」。 */
+const STATUS_CLAIM_ALLOW = [
+  /才能提交/,      // 「两者都绿才能提交」—— 提交门槛
+  /绿的标准/,      // 「绿的标准」—— 定义
+  /不算绿|不算通过/,  // 「跑过不算绿」—— 否定式，不是断言
+];
+
+/** 执行结果断言（带数或绝对判断）的形态。 */
+const EXEC_CLAIM_RE = new RegExp([
+  '全绿',
+  '全部通过',
+  '\\d+\\s*条\\s*pass',       // 「2078 条 pass」
+  '\\d+\\s*(?:passing|passed)',
+  '(?<![A-Za-z])pass\\s*[:=]?\\s*\\d+',   // 「pass 2071」
+  '(?<![A-Za-z])fail\\s*[:=]?\\s*\\d+',   // 「fail 7」
+].join('|'));
+
+/** 一行是不是在执行结果上做了断言。返回理由或 null。
+ *
+ *  **不导出**：本文件是 CLI（`CLI_SCRIPTS` 成员），一 import 就跑完全部门禁并 exit，
+ *  没法单测。判据由 `regression-count.test.mjs` 与 `check-config.test.mjs` 那种
+ *  「改坏副本 + 跑门真身」的方式验 —— 复制判据的测试只能证明自己那份对。 */
+function execClaimOf(line) {
+  if (!/(测试|回归|用例|\btests?\b)/i.test(line)) return null;
+  const m = line.match(EXEC_CLAIM_RE);
+  if (!m) return null;
+  if (STATUS_CLAIM_ALLOW.some((re) => re.test(line))) return null;
+  return `出现「${m[0]}」—— 这是对**执行结果**的断言，而硬门只 import 不执行，核不了它`;
+}
+
+function checkNoExecutionClaims() {
+  for (const relPath of EXEC_CLAIM_DOCS) {
+    const p = join(ROOT, relPath);
+    // 四份都是本产品自身的产物。别人的项目里 CREDITS/README 长什么样不该由我们规定，
+    // 所以用 requireProduct()（DF-051）；**存在就照查** —— 判据本身对任何项目成立。
+    if (!requireProduct(p, relPath)) continue;
+    let text = '';
+    try { text = readFileSync(p, 'utf8'); } catch { continue; }
+    let inFence = false;
+    text.split('\n').forEach((line, i) => {
+      // 围栏翻转：``` 或 ~~~ 开头的行（允许缩进）。围栏内的内容是**示例 / 引用**，
+      // 不是对仓库的断言 —— 见头注释里 README 那段被批判的反例。
+      if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; return; }
+      if (inFence) return;
+      const why = execClaimOf(line);
+      if (why) {
+        fail(relPath, `第 ${i + 1} 行 ${why}。改成只声明**条数**（那由 testCount 对账；`
+          + 'pass/fail 交给每次真跑的输出），或写成条件式（「全绿才能提交」）如果那才是你的意思');
+      }
+    });
   }
 }
 
@@ -650,6 +957,16 @@ const PROBE_ARGS = {
   askedUser: '[{}]', isAskAnswer: '[{}]', classifyHumanMessage: '"继续"',
   avoidabilityOf: '[{ type: "nudge", text: "继续", afterStop: "end_turn" }]',
   percentile: '[[1, 2, 3], 0.5]',
+  // compute-metrics.mjs（2026-11-23 走量指标）：判据层全是纯函数，探针取最小可构造输入。
+  // 目的是让「导出但调用即炸」在结构门就暴露，而不是等到对 730 MB 语料跑完才发现。
+  // `foldUsage` / `findVerdicts` / `parseAnchor` / `checkC2` / `verdictChains` /
+  // `attemptsToPass` / `census` / `buildReport` / `formatReport` 全登记在这里。
+  foldUsage: '[[]]', parseAnchor: '[""]', checkC2: '[{}]',
+  checkAnchorResolvable: '[{}, { root: "/nonexistent-ow-probe", readFile: () => "" }]',
+  findVerdicts: '[[]]', declaredOrdinal: '""', claimsPriorFail: '""', acSetOf: '""',
+  verdictChains: '[[]]', attemptsToPass: '[[]]', census: '[[]]',
+  countAcceptanceWork: '[[]]', pairAgentCalls: '[[], []]',
+  buildReport: '[{}]', formatReport: '[{ metrics: [], dedupeKeys: { tokens: "m", calls: "t" }, minNForRate: 30 }]',
   eachLine: '["/nonexistent-ow-probe", (l) => l]',
   analyzeTranscript: '["/nonexistent-ow-probe"]',
   formatReport: '[{ days: 1, root: "/x", summary: { totals: { sessions: 0, humanTurns: 0, assistantStops: 0, interventions: 0, byType: {}, byAvoidability: {} }, distribution: { all: {}, active: {} }, rates: {}, sessionsWithIntervention: 0, perSession: [] } }]',
@@ -782,6 +1099,11 @@ const PROBE_ARGS = {
   // 「笼统完成声明」的验证判据（2026-11-13）。和 isTestCommand / isBuildCommand 同一层：
   // 给一条命令，答「它算不算做过一次检查」。冒烟输入取一条只读命令，必须返回 false。
   isVerificationCommand: '"ls -la"',
+  // DF-058（2026-11-24）：空输出与只读否决。三个纯函数，各喂一个**最小且能区分**的输入。
+  // `isSilentOutput` 喂空串 → true；`isSilentByDesign` 喂 `node --check` → true；
+  // `isReadOnlyCommand` 喂 `grep foo check.mjs` → true。喂能命中的输入是有意的：
+  // 探针要证明「函数被真的调起来且走得到 true 分支」，全喂 false 形态两个实现都能过。
+  isSilentOutput: '""', isSilentByDesign: '"node --check a.mjs"', isReadOnlyCommand: '"grep -n foo check-x.mjs"',
   // compose-agent-prompt.mjs（2026-11-14 提示词分层拼装）：判定层全部纯函数，
   // 参数取最小可构造输入。读盘的几个用不存在的路径 / 空数组——「什么都没有」
   // 是它们的正常分支，正好顺带验一遍空而不炸。main 以外的副作用只有 appendFileSync，
@@ -807,10 +1129,14 @@ const PROBE_ARGS = {
   //     根下（`./x`）、根外（`<abs>/x`）、空串（`(无)`）。
   probeAgentsDir: '["/nonexistent-ow-pkg"]',
   displayPath: '["/nonexistent-ow-probe/.claude/agents", "/nonexistent-ow-root"]',
-  idFromName: '"x"', truthyFlag: '""', readonlyOf: '[{}]',
+  idFromName: '"x"', truthyFlag: '""', readonlyOf: '[{}]', bashScopeOf: '[{}]',
   resolveRole: '[[]]', roleIndex: '[[]]', labelOf: '[[]]', nameOf: '[[]]',
   extractCommands: '""', classifyRequirement: '""', requiredTools: '[[]]',
   stopConditionProblem: '""',
+  // 契约 §8.2 的失败通知判据（2026-11-23）：渲染函数喂合法类别、判据函数喂空串。
+  // 两个都是纯函数，空输入必须安全返回（`failureNoticeProblem("")` 返回 null =
+  // 「首轮没有通知」，那是正常分支）。
+  failureNoticeText: '"acceptance"', failureNoticeProblem: '""',
   checkPromptSpec: '[{}]',
   fillDispatchTemplate: '["", {}]', composePrompt: '[{}]',
   deriveInjected: '[{ root: "/nonexistent-ow-probe" }]',
@@ -1051,6 +1377,29 @@ const PROBE_ARGS = {
   // / isContinuation / CONTINUATION_RE / ATTRIBUTION_CLASSES / attribute）不重复登记 ——
   // PROBE_ARGS 按名字命中所有模块，上面那份探针会同样调用它们。
   gateReadsFixedOf: '["Bash", { command: "head -n 20 a.mjs" }]',
+  // delivery-verdict.mjs（2026-11-22，证据分层与交付裁决）：判定层**全是纯函数**，
+  // 逐个进 PROBE_ARGS 实际调用。参数取最小可构造输入 —— 空对象 / 空串 / 空数组，
+  // 它们都必须安全返回、不抛。正确性由 delivery-verdict.test.mjs 的 39 条逐支钉
+  // （含「验收 PASS 但红队 BLOCK → BLOCKED」这条两件事都成立的主用例）。
+  // 五个枚举是数据，不是函数。
+  deliverVerdict: '[{}]',
+  parseAcceptorVerdict: '""',
+  classifyEvidence: '[{}]',
+  redteamItemProblems: '[{}]',
+  coverageProblems: '""',
+  isAnchored: '""',
+  // 2026-11-23（DF-080）：收活读报告的两个入口。空串 / 空报告是它们的正常分支
+  // —— 「读不到一张表」必须返回空清单 + problems，而不是抛。
+  parseRedteamReport: '""',
+  deviationRefsFrom: '""',
+
+  // dispatch-quartet.mjs（2026-11-23，P0-1 第二项）：返回格式的解析判据，全是纯函数。
+  // 参数取最小可构造输入 —— 空串 / 空数组 —— 都必须安全返回、不抛。
+  // 正确性由 dispatch-quartet.test.mjs 的边界用例逐条钉（跳过围栏内伪标题 /
+  // 三种坏输入各报各的错 / CRLF 与 LF 同结果）。`QUARTET_FIELDS` 是数据，登记在下面。
+  outputFenceLines: '""',
+  quartetGaps: '["", []]',
+
   // question-audit.mjs（2026-11-14 提问形态审计）：判定层全是纯函数，逐个实际调用。
   // 参数取最小可构造输入：空对象 / 空数组 / 空串 —— 都要安全返回，不抛。
   questionsOfAsk: '[{}]', normalizeText: '""', judgeReadFirst: '[{}]',
@@ -1103,6 +1452,9 @@ const PROBE_ARGS = {
   // `normRel` / `validateChecks` / `DEFAULTS` / `CHECK_NAMES` 见参数表与数据登记。
   loadChecks: '["/nonexistent-ow-probe", { env: {} }]',
   validateChecks: '[{}]', normRel: '"a/b"',
+  // `domainOf` 喂一个**未登记**的名字：这正是元检查要判的形态（必须返回 null
+  // 而不是抛，也不是静默当成 universal —— 后者会让 DF-051 以「新加的一条规矩」复发）。
+  domainOf: '"this-name-is-not-a-check"',
   livingDocsGap: '["/nonexistent-ow-probe", { include: [], exclude: [] }, []]',
   listMarkdown: '["/nonexistent-ow-probe"]',
   scopedMarkdown: '["/nonexistent-ow-probe", { include: [], exclude: [] }]',
@@ -1115,11 +1467,30 @@ const SANDBOX_ARGS = {
   createLogger: '[_sandbox]', defaultStateDir: '{}', defaultNotifyDir: '{}',
   readLogHealth: '[_sandbox]', logHealthPath: '["/nonexistent"]',
   // DF-028：`procWitnessPath` 是纯路径拼接；`readProcWitness` 读不存在的目录 → null。
-  // `judgeProcess(null)` 走 unverified 分支，**刻意不 spawn powershell**：
-  // 结构门要一秒内跑完，不该为一条冷路径付 360ms，更不该对真实 PID 发信号。
+  // `judgeProcess(null)` 走 unverified 分支，**不发任何探针**（DF-092 之后探针是
+  // 「连一次命名管道」，那条冷路径不该由结构门承担，更不该对真实 PID 发信号）。
   // `writeProcWitness` 写到沙箱（`_sandbox` 由探针注入），不碰真实数据目录。
   procWitnessPath: '["/nonexistent"]', readProcWitness: '["/nonexistent"]',
   processStartedAt: '[]', judgeProcess: '[null]',
+  // DF-101：`checkSingleton` 读见证 + 可能探一次端点。传不存在的目录 → 没有见证 →
+  // 走「首次运行」分支，**不发探针、不读真实数据目录**。
+  // 探针与 isAlive 都注入成不产生副作用的常量，避免结构门真的去连管道或发信号。
+  checkSingleton: '["/nonexistent", { probe: async () => ({ state: "not-found" }), isAlive: () => false }]',
+  // DF-092 的两个新判据（纯函数，喂最小可构造输入即可）：
+  //   · `pidIsAlive(0)` → false（pid 必须为正整数；Windows 上 kill(0,0) 会成功，
+  //     那是「当前进程组」不是「进程存在」，所以判据里先挡掉它）；
+  //   · `probeFailureReason('timeout', {pid: 1})` → 一句说「超时」的理由（DF-091）。
+  pidIsAlive: '[0]', probeFailureReason: '["timeout", { pid: 1 }]',
+  // proc-liveness.mjs（DF-092）的三个纯函数。`livenessEndpoint` 走 POSIX 分支要
+  // 一个 stateDir —— 传 `/nonexistent` 正好把「纯拼接、不碰盘」验一遍。
+  // `parseBeatFrame` 喂一段不是帧的文本：返回 null 是它的正常分支（读不懂 = 判不了）。
+  // `makeNonce` 不注入随机源就真取一次随机字节 —— 它不碰盘、不需要沙箱。
+  makeNonce: '[]',
+  livenessEndpoint: '[{ nonce: "probe", stateDir: "/nonexistent-ow-probe", platform: "linux" }]',
+  parseBeatFrame: '["not a frame"]',
+  // 错误码 → probe 状态。喂一个未知码必须落回 `error`（不是 `not-found`）——
+  // 「不认识的原因」不能当成「进程没了」，那会把判不了说成死了。
+  stateOfErrorCode: '["EZOMBIE"]',
   writeProcWitness: '[_sandbox]',
   createObservationLog: '[_sandbox]', observationStats: '[_sandbox]',
   classifyCandidate: '[{}]', readTranscriptTail: '["/nonexistent"]',
@@ -1351,13 +1722,29 @@ function checkUnregisteredExports() {
   // LOG_HEALTH_FILE 是数据（文件名常量），不是函数。
   'readLogHealth', 'logHealthPath', 'LOG_HEALTH_FILE',
   // watch.mjs 的进程见证（DF-028，2026-11-18）：「进程死了」与「进程卡住了」可区分。
-  // `judgeProcess` 进 PROBE_ARGS 但不传见证 → 走 unverified 分支，**不 spawn powershell**
-  // （否则每跑一次结构门多 360ms，且这条冷路径的代价不该由硬门承担）。
-  // `PROC_TOLERANCE_MS` 是数字，不是函数 —— checkArgs 调不动它。
+  // `judgeProcess` 进 PROBE_ARGS 但不传见证 → 走 unverified 分支，**不发探针**
+  // （否则每跑一次结构门要真连一次命名管道，且这条冷路径的代价不该由硬门承担）。
+  // `PROC_TOLERANCE_MS` 与 `BEAT_TIMEOUT_MS` 是数字，不是函数 —— checkArgs 调不动它们。
   'procWitnessPath', 'writeProcWitness', 'readProcWitness', 'processStartedAt',
   'judgeProcess', 'PROC_TOLERANCE_MS',
+  // DF-092 / DF-091（2026-11-24）：判活从 spawn 换成命名管道之后新增的三个导出。
+  // `pidIsAlive` 与 `probeFailureReason` 已进 PROBE_ARGS 实际调用；
+  // `BEAT_TIMEOUT_MS` 是数字（转发自 proc-liveness.mjs），判据是数据不是函数。
+  'pidIsAlive', 'probeFailureReason', 'BEAT_TIMEOUT_MS',
+  // proc-liveness.mjs（DF-092）：判活端点这一层。三个纯函数进 PROBE_ARGS：
+  //   · `makeNonce` 产出 24 个十六进制字符（长度就是它的判据）；
+  //   · `livenessEndpoint` 是纯路径拼接（Windows 前缀 / POSIX 文件路径）；
+  //   · `parseBeatFrame` 喂一段不是帧的文本 → null（那是它的「读不懂」正常分支）。
+  // 两个有副作用的不进强制调用（见 INTENTIONALLY_PROBED_FREE）：
+  // `startLivenessServer` 会**真的占一个端点**，`probeLiveness` 会**真的连一次**。
+  // 常量与安全表是数据。
+  'makeNonce', 'livenessEndpoint', 'parseBeatFrame',
+  'LIVENESS_PROTOCOL', 'PROBE_STATES', 'PROBE_OUTCOME', 'beatFrame',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath', 'askedCandidates',
+    // DF-101（2026-11-25）：单例守卫。进 PROBE_ARGS 实际调用一次
+    // （不存在的目录 → 没有见证 → 「首次运行」分支，不发探针、不读真实数据目录）。
+    'checkSingleton',
     'requestIdTime', 'lastTimelineStateTime', 'resolveJobEventTime', 'BLOCKED_MAX_AGE',
   // job-event-time.mjs（2026-11-10 抽出）：跨层去重的地基。
   // 三个函数已进 PROBE_ARGS 实际调用；常量是数据，不是函数。
@@ -1511,6 +1898,11 @@ function checkUnregisteredExports() {
     'defaultSamplesPath', 'parseSampleLines', 'loadSamples', 'statLine',
     // verify-claims.mjs 的「做过检查没有」判据（2026-11-13），已进 PROBE_ARGS。
     'isVerificationCommand',
+    // verify-claims.mjs（2026-11-24，DF-058）：空输出判据 + 只读否决。
+    // 四个都是纯函数 / 正则常量，参数取最小可构造输入（空串 / 空对象），
+    // 正确性由 `verify-claims.test.mjs` 的 10 条 DF-058 用例守。
+    'isSilentOutput', 'isSilentByDesign', 'isReadOnlyCommand',
+    'EMPTY_OUTPUT_RE', 'SILENT_OK_RE',
     // claim-ledger.mjs（2026-11-13）：产出对账。判定层全是纯函数，参数取最小可构造输入；
     // 读盘的三个（readLedger / probeDisk / sha256File）用不存在的路径——那正是它们
     // 的「什么都没有」正常路径，正好把空分支也验一遍。appendRows 传空 rows，
@@ -1551,6 +1943,18 @@ function checkUnregisteredExports() {
     'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
     'runScan', 'dispatchCandidates', 'sendNotification', 'isNotificationAvailable',
     'NOTIFY_STATES', '__internals',
+    // proc-liveness.mjs（DF-092）：这两个**有真副作用**，不能进结构门的强制调用。
+    //   · `startLivenessServer` 会真的 listen 一个端点名 —— 结构门跑一次就会在
+    //     系统里留下一个管道，且它的名字来自 nonce，无法预先指定；
+    //   · `probeLiveness` 会真的 connect（甚至在端点不存在时花掉一段连接超时）。
+    // 两者的正确性由 `watch.test.mjs` 的 DF-028 / DF-092 组用**真端点**覆盖
+    // （起监听、探、关掉、再探），那比「调用不炸」强得多。
+    'startLivenessServer', 'probeLiveness',
+    // watch.mjs 的 asked 子进程扫描（DF-097）。它**会真的 spawn 一个 node 去读 1.3 GB
+    // 语料**（实测 70 秒）—— 结构门绝不能调它一次，那会把整道门变成 70 秒以上。
+    // 正确性由 `watch.test.mjs` 的 DF-097 组用**小目录**覆盖（喂一个不存在的根，
+    // 子进程约 2.5 秒返回空结果，那正是它的「什么都没有」正常分支）。
+    'runAskedScanInChild',
     // 这两个要读真实 transcript 目录（1GB），不能塞进结构门；由 CLI 自测覆盖。
     'parseTranscript', 'listTranscripts', 'loadCorpus',
     // measure-interventions.mjs：run 会全量扫 1.7GB transcript（实测 24s），不能进结构门；
@@ -1586,6 +1990,11 @@ function checkUnregisteredExports() {
     // `check-config.test.mjs` 的「本仓自检」直接对账，那比「调用不炸」强得多。
     'loadChecks', 'validateChecks', 'normRel', 'livingDocsGap', 'listMarkdown',
     'scopedMarkdown', 'CONFIG_REL', 'CONFIG_ENV', 'CHECK_NAMES', 'DEFAULTS',
+    // 2026-11-23（DF-051）：检查的**适用域**表与查询。
+    //   · `CHECK_DOMAINS` 是数据（名字 → 域），不是函数；
+    //   · `domainOf` 是纯函数，已进 PROBE_ARGS 实际调用（喂一个未登记的名字，
+    //     必须返回 null 而不是抛 —— 那正是元检查要判的形态）。
+    'CHECK_DOMAINS', 'domainOf',
   ]);
   // measure-execution-phase.mjs 的纯函数：全部已进 PROBE_ARGS 实际调用，
   // 这里显式登记，免得被上面的「未登记导出」提示刷屏。
@@ -1754,6 +2163,29 @@ function checkUnregisteredExports() {
   ];
   for (const k of OBSERVE_REALITY_FNS) REGISTERED.add(k);
 
+  // compute-metrics.mjs（2026-11-23 走量指标）。判据层全进了 PROBE_ARGS 实际调用；
+  // `run` / `main` / `listTranscripts` / `readRecords` / `metric1` / `metricVerdicts`
+  // 要读全量 730 MB 语料（实测 16.8s 仅解析，全流程更久），与 measure-* 系列同处置 ——
+  // 由 compute-metrics.test.mjs 在临时目录上的端到端用例覆盖（含 `--root` 空目录
+  // 必须 exit 0、不存在的根必须 exit 2 两条）。
+  //
+  // 注意：PN 上那张 `PROBE_ARGS` 与这张 `REGISTERED` 是**两张表**，
+  // 进前者只保证「被真调一次」，进后者才让「未登记」提示消失。两处都要加 ——
+  // 本仓已有先例（DF-031/DF-044/DF-047），这里显式记一笔免得下一个人只加一张。
+  const COMPUTE_METRICS_FNS = [
+    // 常量与判据（PROBE_ARGS 里已真调；这里登记以免刷屏）
+    'MIN_N_FOR_RATE', 'DEDUPE_KEYS', 'SANDBOX_RE', 'ACCEPT_VERDICT_RE', 'REDTEAM_BLOCK_RE',
+    // 纯函数 —— 全部在 PROBE_ARGS 里被真调用过
+    'foldUsage', 'parseAnchor', 'checkC2', 'checkAnchorResolvable',
+    'findVerdicts', 'declaredOrdinal', 'claimsPriorFail', 'acSetOf',
+    'verdictChains', 'attemptsToPass', 'census', 'countAcceptanceWork', 'pairAgentCalls',
+    'buildReport', 'formatReport',
+    // 读全量语料的入口：不进探针，由 compute-metrics.test.mjs 的端到端用例守
+    'run', 'main', 'listTranscripts', 'readRecords', 'roleOf',
+    'metric1', 'metricVerdicts', 'defaultRoot',
+  ];
+  for (const k of COMPUTE_METRICS_FNS) REGISTERED.add(k);
+
   // published-paths.mjs（`DF-039`：「可发布区零盘符」判据的唯一实现）。
   // 四个函数已进 PROBE_ARGS 实际调用（探针取一个不含任何路径的短串：必须安全返回
   // 空数组 / 原样字符串，不抛）。三个正则/表常量是**数据**，不是函数。
@@ -1780,6 +2212,24 @@ function checkUnregisteredExports() {
   ];
   for (const k of LINK_CHECK_FNS) REGISTERED.add(k);
 
+  // delivery-verdict.mjs（2026-11-22）：六条判定层函数已进 PROBE_ARGS 实际调用，
+  // 这里显式登记免得被「未登记导出」刷屏。五个枚举与两张冻结表是**数据**，不是函数。
+  const DELIVERY_FNS = [
+    'RT_DISPATCH', 'RT_SEVERITY', 'VERDICTS', 'EVIDENCE_KINDS', 'COVERAGE_SECTIONS',
+    'redteamItemProblems', 'isAnchored', 'coverageProblems', 'classifyEvidence',
+    'parseAcceptorVerdict', 'deliverVerdict',
+    // 2026-11-23（DF-080）：红队报告的读取入口与台账编号抽取。前两个进 PROBE_ARGS 真调；
+    //  是 CLI 入口（读写盘），由 delivery-verdict.test.mjs 的子进程用例覆盖。
+    'parseRedteamReport', 'deviationRefsFrom', 'main',
+  ];
+  for (const k of DELIVERY_FNS) REGISTERED.add(k);
+
+  // dispatch-quartet.mjs（2026-11-23）：`outputFenceLines` / `quartetGaps` 已进 PROBE_ARGS
+  // 实际调用（在 `dispatch-quartet.test.mjs` 里还有一组边界用例）。
+  // `QUARTET_FIELDS` 是**字段名清单**（数据），不是函数，checkArgs 调不动它。
+  const QUARTET_EXPORTS = ['QUARTET_FIELDS', 'outputFenceLines', 'quartetGaps'];
+  for (const k of QUARTET_EXPORTS) REGISTERED.add(k);
+
   // roles.mjs（2026-11-21，DF-044）：角色注册表 —— 「有哪些角色」的唯一实现。
   // 纯函数与读盘函数都进了 PROBE_ARGS 实际调用；这里显式登记以免被「未登记导出」刷屏。
   // `defaultRoles` 不参加探针：它按模块顶层标志缓存，探一次之后结构门再 import
@@ -1797,6 +2247,7 @@ function checkUnregisteredExports() {
     'DEFAULT_AGENT_PREFIX', 'REPO_ROOT', 'agentsDirCandidates', 'agentsDir',
     'probeAgentsDir', 'displayPath',
     'defaultRoles', 'discoverRoles', 'parseFrontmatter', 'truthyFlag', 'readonlyOf',
+    'bashScopeOf', 'BASH_SCOPES',
     'idFromName', 'resolveRole', 'roleIndex', 'labelOf', 'nameOf', 'agentPrefixFrom', 'FORBIDDEN_CONTEXT',
     // 2026-11-21（D2 验证）：按根求值的四个。`rolesFor` / `capabilitiesFor` 各进
     // PROBE_ARGS 真调一次（`rolesFor` 喂 null = 「只认框架」，`capabilitiesFor` 同）；
@@ -1816,6 +2267,9 @@ function checkUnregisteredExports() {
     'composePrompt', 'normalizeForHash', 'promptHash', 'makePromptRow', 'readPromptLedger',
     'firstUserText', 'readHeadRecords', 'subagentFiles', 'verifyPrompts', 'main',
     'LAYERS', 'OBLIGATION_KINDS', 'REQUIRED_ELEMENTS', 'REQUIRED_PLACEHOLDERS', 'FORBIDDEN_CONTEXT',
+    // 契约 §8.2 的失败通知判据（2026-11-23）：判定层两条纯函数已进 PROBE_ARGS 实际调用；
+    // 渲染函数已进 PROBE_ARGS（传一个合法类别）；枚举是数据。
+    'FAILURE_CATEGORIES', 'failureNoticeText', 'failureNoticeProblem',
   ];
   for (const k of COMPOSE_PROMPT_FNS) REGISTERED.add(k);
 
@@ -1880,6 +2334,24 @@ function checkUnregisteredExports() {
   // 而它此刻**正在本门里被真调用**（见 `checkTestCount()`），那才是真实覆盖。
   // 正确性由 `regression-count.test.mjs` 的红→绿用例守（含「循环注册要多算几条」）。
   REGISTERED.add('countRegisteredTests');
+
+  // proc-liveness.mjs + watch.mjs 的判活层（DF-092 / DF-091，2026-11-24）。
+  //
+  // `REGISTERED` 与 `PROBE_ARGS`/`SANDBOX_ARGS` 是**两份**表：前者只影响「要不要
+  // 提示未登记」，后者决定「会不会真被调用一次」。所以新导出必须在两处都登记 ——
+  // 只登记 PROBE_ARGS 的话它会**真被调用**却仍然被提示「未登记」，
+  // 而只登记这里则是「登记了但不探」。实测就是这样发现漏了一处的。
+  //
+  // 六个函数（makeNonce / livenessEndpoint / parseBeatFrame / stateOfErrorCode /
+  // pidIsAlive / probeFailureReason）与两个常量（LIVENESS_PROTOCOL / BEAT_TIMEOUT_MS）
+  // 与三张冻结表（PROBE_STATES / PROBE_OUTCOME / beatFrame）全部登记；
+  // `startLivenessServer` / `probeLiveness` 有真副作用，进 INTENTIONALLY_PROBED_FREE。
+  for (const k of [
+    'makeNonce', 'livenessEndpoint', 'parseBeatFrame', 'stateOfErrorCode',
+    'pidIsAlive', 'probeFailureReason',
+    'LIVENESS_PROTOCOL', 'BEAT_TIMEOUT_MS', 'PROBE_STATES', 'PROBE_OUTCOME', 'beatFrame',
+    'startLivenessServer', 'probeLiveness',
+  ]) REGISTERED.add(k);
   // 两个文件发现判据是**纯函数**（只读目录、不执行任何东西），可以安全进 PROBE_ARGS：
   // 给一个不存在的目录，它们必须返回 false / []，不抛。
   // 它们必须真被调用一次：`isNodeTestFile` 写窄了的表现是「数不到」，而数不到不报错。
@@ -1942,11 +2414,11 @@ function checkUnregisteredExports() {
  *  豁免：纯 CHANGELOG 自身的提交、以及 docs/runs 下的运行台账。 */
 function checkChangelog() {
   const f = join(ROOT, 'docs', 'CHANGELOG.md');
-  // CHANGELOG 是本仓库的规定产物（它是「哪些改动没记账」的唯一判据来源）。
+  // CHANGELOG 是本产品自身的产物（它是「哪些改动没记账」的唯一判据来源）。
   // 这条曾是**决定性实验的直接对象**：把 `checkChangelog()` 从运行块里删掉，
   // 门照样 `✓`。文件缺失时同理 —— 旧版这里是 `return`，于是「CHANGELOG 被删」
   // 与「每个提交都记了账」在输出上完全同形。
-  if (!requirePath(f, 'docs/CHANGELOG.md')) return;
+  if (!requireProduct(f, 'docs/CHANGELOG.md')) return;
   let text;
   try { text = readFileSync(f, 'utf8'); } catch { return; }
 
@@ -2178,8 +2650,8 @@ function checkLauncherPlacement() {
   const tpl = join(installDir, 'start-watch.vbs.template');
   const out = join(installDir, 'start-watch.vbs');
   const TPL_REL = `${SCRIPTS_REL}/install/start-watch.vbs.template`;
-  // 这一处本来就是 fail，改名字让语义在调用点可见。
-  if (!requirePath(tpl, TPL_REL)) return;
+  // 启动器模板是本产品自身的产物（VBScript 启动器是我们的交付物）。
+  if (!requireProduct(tpl, TPL_REL)) return;
   let raw;
   try { raw = readFileSync(tpl, 'utf8'); } catch (e) {
     fail(TPL_REL, `读不了模板：${e.message}`);
@@ -2308,6 +2780,86 @@ function checkPromptWiring() {
   }
 }
 
+/** 证据分层与红队三档：**规范里的枚举必须与代码逐字一致**（2026-11-22）。
+ *
+ *  ## 为什么需要这条
+ *
+ *  这是 `checkPromptWiring()` 的同一个模式。`docs/spec/evidence-discipline.md` §9
+ *  写下了红队三档 `block` / `accept` / `advisory` 与两个强 `kind` 集合，
+ *  而那是**散文** —— 散文里的枚举与 `delivery-verdict.mjs` 里的数组没有任何机制
+ *  保证一致。改代码不改文档（或反过来）时，屏幕上是绿的，
+ *  而读到规范的人会按一个不存在的档位去判 —— 正是 DF-042 的形态。
+ *
+ *  ## 判据（三条，都可机械判定）
+ *
+ *    1. `RT_DISPATCH` 的值必须**逐个**出现在规范 §9 的表格里
+ *    2. 强证据的 `kind` 必须全部出现在规范 §1.5 里（弱证据同理）
+ *    3. 规范里必须出现「缺省不是 `advisory`」这一条 —— 它是三档设计里唯一
+ *       不看代码就看不出来的约定（少了它，读者会把缺省当成 advisory）
+ *
+ *  **不检查措辞**：规范怎么说这些档位是给人读的，门只管「枚举值一个不缺」。
+ *  「写得够不够清楚」不可机械判定，硬要检查会退化成「请务必包含」。 */
+function checkEvidenceTaxonomy() {
+  const doc = join(ROOT, 'docs', 'spec', 'evidence-discipline.md');
+  if (!requireProduct(doc, 'docs/spec/evidence-discipline.md')) return;
+  let text = '';
+  try { text = readFileSync(doc, 'utf8'); } catch { return; }
+  const mod = join(SCRIPTS_DIR, 'delivery-verdict.mjs');
+  if (!requirePath(mod, `${SCRIPTS_REL}/delivery-verdict.mjs`)) return;
+  let src = '';
+  try { src = readFileSync(mod, 'utf8'); } catch { return; }
+
+  // 从源码里读枚举的**值**（不是从 import 读：门要能在模块坏掉时报出原因，
+  // 而 import 失败会让这条检查变成「没跑」，与「通过」同形）。
+  const arrayOf = (name) => {
+    const m = new RegExp(`${name}\\s*=\\s*Object\\.freeze\\(\\[([^\\]]*)\\]`).exec(src);
+    return m ? [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]) : null;
+  };
+  const dispatch = arrayOf('RT_DISPATCH');
+  if (!dispatch) {
+    fail(`${SCRIPTS_REL}/delivery-verdict.mjs`, '读不出 RT_DISPATCH 的三档枚举 —— '
+      + '这条规范与代码的一致性检查因此没有对象（门不许静默放行）');
+    return;
+  }
+  for (const d of dispatch) {
+    // 判据必须锚在**表格行**上，不能只判「全文里出现过这个词」。
+    // 实测踩过：`block` 在正文别处也会出现（`redteam_block`、`dispatch=block` 的说明文字），
+    // 于是「把三档表格里那一行删掉」不会红 —— 一条永远绿的检查比没有更坏。
+    //
+    // 现在要求：存在一行以 `| \`<档位>\` |` 开头的表格行。这是三档表格的固定形状。
+    const rowRe = new RegExp(`^\\|\\s*\`${d}\`\\s*\\|`, 'm');
+    if (!rowRe.test(text)) {
+      fail('docs/spec/evidence-discipline.md', `三档表格里没有 \`${d}\` 这一行 —— `
+        + '代码里有这一档，规范里没有：读到规范的人会按一个不存在的档位判');
+    }
+  }
+  // 强 / 弱 evidence kind：从 EVIDENCE_KINDS 的对象字面量里取键名。
+  const kinds = [...src.matchAll(/^\s{2}(\w+):\s*\{\s*strong:\s*(true|false)/gm)]
+    .map((m) => ({ kind: m[1], strong: m[2] === 'true' }));
+  if (!kinds.length) {
+    fail(`${SCRIPTS_REL}/delivery-verdict.mjs`, '读不出 EVIDENCE_KINDS —— 证据分层的一致性检查没有对象');
+    return;
+  }
+  for (const { kind, strong } of kinds) {
+    if (!new RegExp(`\\b${kind}\\b`).test(text)) {
+      fail('docs/spec/evidence-discipline.md',
+        `代码里的证据类型 "${kind}"（${strong ? '强' : '弱'}）在规范里没有出现`);
+    }
+  }
+  // 三档设计里唯一「不看代码看不出来」的那条约定。
+  //
+  // 判据刻意宽松到「缺省」与「advisory」在同一行出现即可：这一条的意思可以用
+  // 好几种写法表达（「缺省不是 advisory」/「不许缺省成它」/「为什么缺省不能是」），
+  // 而收紧到某一种具体句式，会让规范作者换一个更准确的措辞时**门反而红** ——
+  // 那会逼人为了过门去写一句更差的话。
+  const defaultClause = text.split('\n').some((l) => /缺省/.test(l) && /advisory/.test(l));
+  if (!defaultClause) {
+    fail('docs/spec/evidence-discipline.md',
+      '没有写明「dispatch 缺省不是 advisory」—— 少了这一句，读者会把「没写」当成「不阻断」，'
+      + '而那正是静默放行');
+  }
+}
+
 /** DF-016：设计文档必须标明「未实现」，且索引必须覆盖每一份。
  *
  *  970 行设计文档描述的能力一行代码都没有，而在此之前**没有任何入口指向它们**——
@@ -2320,13 +2872,16 @@ function checkPromptWiring() {
  */
 function checkDesignIndex() {
   const dir = join(ROOT, 'docs', 'design');
-  // design/ 是本仓库的规定产物（15 份设计稿被跟踪且发布）。缺了 = 仓库坏了。
-  // 旧版 `return` 的后果：整个 docs/design 被删掉时，门仍然 `✓` ——
+  // `docs/design/` 是本产品自身的产物（15 份设计稿被跟踪且发布）。缺了 = 本仓坏了。
+  // 别人的项目没有设计推演目录是**正常的** —— 所以用 `requireProduct()`（DF-051）。
+  //
+  // 旧版 `return` 的后果：整个 docs/design 被删掉时门仍然 `✓` ——
   // 而这条检查的全部意义就是「别让读者以为设计稿描述的是已实现能力」。
-  if (!requirePath(dir, 'docs/design')) return;
+  // 现在本仓里缺了照样红；只是别人的项目里不再无中生有。
+  if (!requireProduct(dir, 'docs/design')) return;
   const index = join(dir, 'README.md');
-  // 索引是规定产物，缺了必须红（本来就是 fail，改名字让语义在调用点可见）。
-  if (!requirePath(index, 'docs/design/README.md')) return;
+  // 索引存在就必须合法 —— 缺了本仓红、别人记「没跑」。
+  if (!requireProduct(index, 'docs/design/README.md')) return;
   let idx = '';
   try { idx = readFileSync(index, 'utf8'); } catch { /* ignore */ }
   if (!/未实现/.test(idx)) {
@@ -2338,11 +2893,12 @@ function checkDesignIndex() {
       fail('docs/design/README.md', `${f} 没有被索引提到——新增设计文档必须登记状态`);
     }
   }
-  // 入口必须指向索引：否则还是没人会点进去
+  // 入口必须指向索引：否则还是没人会点进去。
+  // 「入口必须指向设计索引」是本产品自身的规矩（我们的 README 有这一节）。
+  // 别人的 README 没有 `docs/design/`，要求它指向一个不存在的目录是荒谬的。
   for (const entry of ['README.md', 'CLAUDE.md']) {
     const p = join(ROOT, entry);
-    // 两份入口都是规定产物：缺了要报，而不是跳过「它有没有指向索引」。
-    if (!requirePath(p, entry)) continue;
+    if (!requireProduct(p, entry)) continue;
     let t = '';
     try { t = readFileSync(p, 'utf8'); } catch { /* ignore */ }
     if (!t.includes('docs/design/README.md')) {
@@ -2384,6 +2940,82 @@ function checkAgentReachability() {
   if (orphans.length) {
     fail(CFG.skillPath,
       `这些角色定义了却从不被派发：${orphans.join(', ')} —— 定义里写得再对，没人调用等于不存在`);
+  }
+}
+
+/** 检查：**主线程自述核验角色必须真的被派发**（DF-082，2026-11-23）。
+ *
+ *  ## 它守的是什么
+ *
+ *  `oversight-verifier` 是本仓第一个**核主线程自己**的角色。它的失效方式与
+ *  `oversight-probe` 逐字相同（SKILL.md 曾从不派它，见 §0.5 的注记）：
+ *  角色定义写得再对，SKILL.md 不提它，它就永远不会被调用。
+ *  而**一个从不被派发的核验角色比没有更坏** —— 它会让「主线程的话被核过了」
+ *  成为一个看起来成立的断言。所以这条不是「建议提及」，是硬门。
+ *
+ *  ## 判据（三条，都可机械判定）
+ *
+ *  1. 角色文件 `.claude/agents/oversight-verifier.md` 存在 —— 缺了是仓库坏了；
+ *  2. 它的 `tools:` 里**不得**有派生工具（`Task` / `Agent`）：它必须是叶子，
+ *     否则 §7 的「深度恒 1」当场失效，而那一节有整整一份论证挂在这个事实上；
+ *  3. SKILL.md 必须真的把它派发出去：出现派发动词，而不只是出现名字。
+ *     只判「名字出现过」会被一句「（`oversight-verifier` 存在但本轮不用）」满足，
+ *     而那正是 `oversight-probe` 当年落到的形态 —— 名字在，从没派。
+ *
+ *  ## 为什么把「深度」也放在这条检查里
+ *
+ *  `checkDispatchDepth()` 取的是**全部角色 tools 的并集**（只要有一个能派生，深度就 ≥2）。
+ *  也就是说：给 verifier 加一个 `Agent` 会让**那条**检查去报「文档说深度是 1」——
+ *  红在对的地方，但报错指向文档，而真正要改的是这个角色的工具白名单。
+ *  这里补一条指名道姓的判据，让报错落在角色本身上。 */
+function checkHubVerifier() {
+  const rel = `${AGENTS_REL}/oversight-verifier.md`;
+  const abs = join(AGENTS_DIR, 'oversight-verifier.md');
+  if (!requirePath(abs, rel)) return;
+  let body = '';
+  try { body = readFileSync(abs, 'utf8'); } catch {
+    fail(rel, '读不出来 —— 这条检查因此没有对象');
+    return;
+  }
+  const toolsLine = body.match(/^tools:\s*(.+)$/m);
+  if (!toolsLine) {
+    fail(rel, 'frontmatter 缺 tools 整行 —— 宿主语义是「继承全部工具」，'
+      + '一个核验角色拿到全部工具就不再是核验角色');
+  } else {
+    const tools = toolsLine[1].split(',').map((t) => t.trim());
+    const derive = tools.filter((t) => t === 'Task' || t === 'Agent');
+    if (derive.length) {
+      fail(rel, `tools 里含派生工具 ${derive.join(', ')} —— oversight-verifier 必须是叶子：`
+        + '它一旦能派生，§7 的「深度恒为 1 层」当场失效，而那一节有一整份论证挂在这个事实上');
+    }
+  }
+  // 判据必须是「真的派发」，不是「提过名字」。
+  const skill = join(ROOT, CFG.skillPath);
+  if (!requirePath(skill, CFG.skillPath)) return;
+  let sk = '';
+  try { sk = readFileSync(skill, 'utf8'); } catch { fail(CFG.skillPath, '读不出来'); return; }
+  const NAME = /oversight-verifier/;
+  if (!NAME.test(sk)) {
+    fail(CFG.skillPath,
+      '从不派发 oversight-verifier —— 主线程自己的事实类断言因此不在任何门禁的覆盖范围内。'
+      + ' 定义里写得再对，没人调用等于不存在（DF-015 的原话）');
+    return;
+  }
+  // 派发形态：名字必须与一个动词/命令出现在同一行或相邻两行内。
+  // 判据刻意窄：它要挡的是「附注里提了一句」，不要求写出固定句式 ——
+  // 固定句式会让措辞稍微改一下就红，而红的原因与本检查的目的无关。
+  const lines = sk.split('\n');
+  const idx = lines.map((l, i) => (NAME.test(l) ? i : -1)).filter((i) => i >= 0);
+  const dispatching = idx.some((i) => {
+    const window = [lines[i - 1] || '', lines[i], lines[i + 1] || '', lines[i + 2] || ''].join('\n');
+    // 中文里 `派一个` 与 `派 一个` 都常见，`一 个` 还会被行宽折断 —— 所以判据是
+    // 「派」与角色名之间只允许出现一个可选的「一个」，**不允许中间的空白成为必需**。
+    return /派(?:发)?\s*(?:一个\s*)?`?oversight-verifier|oversight-verifier\s*[（(：:]/m.test(window);
+  });
+  if (!dispatching) {
+    fail(CFG.skillPath,
+      'oversight-verifier 只被提到、没被派发 —— 判据是「派 一个 oversight-verifier」这种可执行的动词形态，'
+      + '不是「名字出现过」。名字在、从没派，正是 oversight-probe 当年落入的形态');
   }
 }
 
@@ -2481,6 +3113,89 @@ function checkDispatchDepth() {
   }
 }
 
+/** 检查：**四元组字段缺失 → 失败**（P0-1 的第二项，`dispatchDepth` 之后）。
+ *
+ *  ## 它守的是什么
+ *
+ *  子 Agent 的最终返回是一个**固定字段的结构**，主线程按字段名读它。字段名少一个，
+ *  下游不是「少读到一条信息」，而是**读到一个不存在的东西**：
+ *
+ *    · 少 `## 我产出的文件` → 产出对账拿不到自述，`UNREPORTED` 变成常态；
+ *    · 少 `## 我认为的薄弱点` → 红队与锐评的「被禁输入」不存在（它们本靠**不看**保证独立，
+ *      现在是**没得看**），独立性约束从设计退化成碰巧；
+ *    · 少 `## 执行日志` → 主线程失去「它在哪停下的」的唯一可读线索。
+ *
+ *  在此之前，四元组只活在 prompt 里：`templates/dispatch.md` 写着，角色定义里抄一遍，
+ *  **没有任何检查核它**。这与 DF-047 / DF-077 是同一种病：约定靠人抄，抄漏了没人发现。
+ *
+ *  ## 解析判据不在本文件里
+ *
+ *  「输出节里第一个代码围栏」的取法在 `scripts/dispatch-quartet.mjs`（`outputFenceLines()` /
+ *  `quartetGaps()`）。搬走的原因：本文件是 `CLI_SCRIPTS` 的第一项，**import 它就执行
+ *  全部门禁并 exit**，所以这里的判据没法被单测。而它有**两种错法不会在当前文档上暴露**
+ *  （切片过早 / 围栏未闭合误判），只在有人改动文档结构时才炸 —— 那时离根因已经很远。
+ *  `dispatch-quartet.test.mjs` 直接钉住那份判据的边界逻辑，本文件只负责接线。
+ *
+ *  ## 为什么按文件列表而不是「所有角色都要四元组」
+ *
+ *  四元组是 `executor` / `repair` 的返回格式，不是全部 12 个角色的：`acceptor` 交判定表、
+ *  `redteam` 交反例表、`probe` 交三选一判定 —— 输出格式各自不同，而且都**不该**
+ *  有「我认为的薄弱点」（那会污染独立性）。
+ *
+ *  **`repair` 的标题与 `executor` 不同，这是既有的、有意的差异，不是本条检查的疏忽**：
+ *  它的输出是「修复后的交付物 / 修复说明 / 我认为仍然存在但本次不修的问题 / 我无法修复的部分 /
+ *  我产出的文件」五节，而文件头写着「输出（四元组）」。本检查按**各文件实际声明的节**核，
+ *  不强行把 `executor` 的字段名套到 `repair` 上 —— 强行统一会让「修复说明」这类字段
+ *  失去它唯一的读者（验收 Agent 要看「改了什么、为什么」）。
+ *  这一处「标注写四元组、内容五节」的不一致，记在 `tasks/dev-findings.md`（DF-081）。
+ *
+ *  ## 四个载体
+ *
+ *  | 文件 | 为什么它必须带回收格式 |
+ *  |---|---|
+ *  | `docs/spec/dispatch-contract.md` §6 | 规格本体。它说「返回是四元组」，就是给全仓下的定义 |
+ *  | `templates/dispatch.md` | 每个子 Agent 都逐字收到它，它是**唯一**每轮都到场的载体 |
+ *  | `.claude/agents/oversight-executor.md` | 执行 Agent 的角色定义（返回格式的权威副本） |
+ *  | `.claude/agents/oversight-repair.md` | 修复 Agent（另有自己的节名，但同样必须有「我产出的文件」） |
+ */
+const QUARTET_CARRIERS = [
+  { rel: 'docs/spec/dispatch-contract.md', sections: QUARTET_FIELDS },
+  { rel: 'templates/dispatch.md', sections: QUARTET_FIELDS },
+  { rel: '.claude/agents/oversight-executor.md', sections: QUARTET_FIELDS },
+  {
+    rel: '.claude/agents/oversight-repair.md',
+    sections: [
+      '## 修复后的交付物', '## 修复说明',
+      '## 我认为仍然存在但本次不修的问题', '## 我无法修复的部分',
+      '## 我产出的文件',
+    ],
+  },
+];
+
+function checkDispatchQuartet() {
+  for (const { rel, sections } of QUARTET_CARRIERS) {
+    const abs = join(ROOT, rel);
+    // 四个载体全是本仓库的规定产物（规格 / 派发模板 / 两份角色定义）。缺文件 = 仓库坏了，
+    // 与「字段缺失」是同一类：这条检查因此没有对象，必须红而不是静默跳过。
+    if (!requirePath(abs, rel)) continue;
+    let text = '';
+    try { text = readFileSync(abs, 'utf8'); } catch (e) {
+      fail(rel, `读不了文件（${e.message}）—— 四元组检查因此没有对象`);
+      continue;
+    }
+    const got = quartetGaps(text, sections);
+    if (!got.ok) {
+      fail(rel, `${got.error}。四元组字段因此无法被核`);
+      continue;
+    }
+    if (got.missing.length) {
+      fail(rel, `输出格式的代码围栏里缺少 ${got.missing.length} 个字段：${got.missing.join(' / ')} —— `
+        + '字段名是主线程读返回时的键，少一个就读到一个不存在的东西。'
+        + '完整清单见 docs/spec/dispatch-contract.md §6');
+    }
+  }
+}
+
 // ── 检查 11：文档引用的路径必须存在 ────────────────────────────────────
 /** 「被文档引用的文件不存在」是同一类缺陷的反复复发：`dispatch-contract.md` 让所有
  *  Agent 去读 `templates/baseline.md`，而那个文件从来没被创建过；设计稿里更是列了
@@ -2542,10 +3257,12 @@ const DOC_PATH_RE = new RegExp(
 function checkDocReferences() {
   for (const relPath of LIVING_DOCS) {
     const p = join(ROOT, relPath);
-    // 活文档清单里每一份都是**规定产物**（README / CLAUDE / spec / adr / 索引）。
-    // 缺了必须报：旧版的 `continue` 让「删掉一份 spec」变成「它里面没有坏引用」——
-    // 这两件事在输出上逐字相同，而它们的含义完全相反。
-    if (!requirePath(p, relPath)) continue;
+    // 活文档清单**默认等于本产品的清单**，别人的项目里那份清单没有对象 ——
+    // 所以缺文件时用 `requireProduct()`：本仓红，别人的项目记一条「本轮没跑」。
+    //
+    // 但**存在就照查**（这是判据真正的适用范围）：文档里引用的路径必须存在，
+    // 这条对任何项目都成立。所以不是「productRepo=false 就不查」。
+    if (!requireProduct(p, relPath)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     text.split('\n').forEach((line, i) => {
@@ -2579,10 +3296,9 @@ function checkDocReferences() {
 function checkDocCommands() {
   for (const relPath of LIVING_DOCS) {
     const p = join(ROOT, relPath);
-    // 活文档清单里每一份都是**规定产物**（README / CLAUDE / spec / adr / 索引）。
-    // 缺了必须报：旧版的 `continue` 让「删掉一份 spec」变成「它里面没有坏引用」——
-    // 这两件事在输出上逐字相同，而它们的含义完全相反。
-    if (!requirePath(p, relPath)) continue;
+    // 活文档清单默认等于**本产品的**清单；别人的项目里那份清单没有对象（DF-051）。
+    // 所以缺文件用 `requireProduct()`，但**存在就照查** —— 判据本身对任何项目都成立。
+    if (!requireProduct(p, relPath)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     text.split('\n').forEach((line, i) => {
@@ -2629,10 +3345,9 @@ function checkDocConstants() {
 
   for (const relPath of LIVING_DOCS) {
     const p = join(ROOT, relPath);
-    // 活文档清单里每一份都是**规定产物**（README / CLAUDE / spec / adr / 索引）。
-    // 缺了必须报：旧版的 `continue` 让「删掉一份 spec」变成「它里面没有坏引用」——
-    // 这两件事在输出上逐字相同，而它们的含义完全相反。
-    if (!requirePath(p, relPath)) continue;
+    // 活文档清单默认等于**本产品的**清单；别人的项目里那份清单没有对象（DF-051）。
+    // 所以缺文件用 `requireProduct()`，但**存在就照查** —— 判据本身对任何项目都成立。
+    if (!requireProduct(p, relPath)) continue;
     let text = '';
     try { text = readFileSync(p, 'utf8'); } catch { continue; }
     text.split('\n').forEach((line, i) => {
@@ -2659,10 +3374,11 @@ function checkDocConstants() {
  *  「已推翻的结论仍被引用」这件事就会重新发生。 */
 function checkResearchIndex() {
   const dir = join(ROOT, 'docs', 'research');
-  // research/ 同上：本仓库的规定产物，缺了报红而不是静默通过。
-  if (!requirePath(dir, 'docs/research')) return;
+  // research/ 是本产品自身的产物（62 份报告 + 索引）。别人的项目里没有它是正常的 ——
+  // 用 requireProduct()（DF-051）。存在就照查：索引与状态标记的判据照样适用。
+  if (!requireProduct(dir, 'docs/research')) return;
   const index = join(dir, 'README.md');
-  if (!requirePath(index, 'docs/research/README.md')) return;
+  if (!requireProduct(index, 'docs/research/README.md')) return;
   let idx = '';
   try { idx = readFileSync(index, 'utf8'); } catch { /* ignore */ }
   for (const marker of ['有效', '已推翻', '未验证']) {
@@ -2697,8 +3413,10 @@ const CAP_CMD_ROW_RE = new RegExp(
   '`(node (' + CFG.scriptsDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/)[A-Za-z0-9_.-]+\\.mjs[^`]*)`');
 function checkCapabilities() {
   const doc = join(ROOT, 'docs', 'CAPABILITIES.md');
-  // 这一处本来就是 fail，改名字是为了让「缺了会红」在调用点可见。
-  if (!requirePath(doc, 'docs/CAPABILITIES.md')) return;
+  // 能力清单是本产品自身的产物：别人的项目没有它是正常的（DF-051）。
+  // 上面那段注释已论证过「不想要就 disabledChecks 关掉」，域位让它**默认就对**，
+  // 不需要用户知道 17 个内部名字中的这一个。
+  if (!requireProduct(doc, 'docs/CAPABILITIES.md')) return;
   let text = '';
   try { text = readFileSync(doc, 'utf8'); } catch { return; }
 
@@ -2786,10 +3504,12 @@ function checkLivingDocsCoverage() {
  *  记账是运行期的观测，不是文本猜测 —— 它无法被注释骗过。
  *
  *  @param {string[]} ran 本轮真实执行过的检查名
+ *  @param {string[]} [notApplicable] 因适用域而跳过的检查名（`productRepo=false` 时的产品规矩）
  *  @returns {void} */
-function checkDispatchCoverage(ran) {
+function checkDispatchCoverage(ran, notApplicable = []) {
   const declared = CHECKS.map(([name]) => name);
   const ranSet = new Set(ran);
+  const naSet = new Set(notApplicable);
 
   // ## 为什么必须锚在 `CHECK_NAMES` 上，而不是只对 `CHECKS` 自己
   //
@@ -2820,11 +3540,23 @@ function checkDispatchCoverage(ran) {
 
   // 关掉的检查是**声明过的跳过**，不算「漏跑」—— 但它已经在别处被 warning 列出。
   const dis = new Set(CFG.disabledChecks || []);
-  const missing = declared.filter((n) => !ranSet.has(n) && !dis.has(n));
+  const missing = declared.filter((n) => !ranSet.has(n) && !dis.has(n) && !naSet.has(n));
   if (missing.length) {
     fail('scripts/check-structure.mjs',
       `CHECKS 表里有 ${missing.length} 条检查本轮从未被调用：${missing.join(', ')} —— `
       + '门会把它当成「通过」。这正是 DF-047 的决定性实验：删掉 dispatch 后门照绿。');
+  }
+
+  // ## 每一条检查都必须声明**适用域**（DF-051 的机制面）
+  //
+  // 域位只在「每条检查都登记了域」时才成立。漏登记一条的表现是：`domainOf()` 返回
+  // null，运行循环保守地把它当 universal 跑 —— 于是它在别人的项目里**照旧报红**，
+  // 而 DF-051 会以「新加的一条规矩」的形式悄悄复发。这条比对把它变成一次当场红。
+  const noDomain = declared.filter((n) => domainOf(n) === null);
+  if (noDomain.length) {
+    fail('scripts/check-structure.mjs',
+      `CHECKS 表里有 ${noDomain.length} 条检查没有声明适用域（CHECK_DOMAINS）：${noDomain.join(', ')} —— `
+      + '未声明 = 被当成「任何项目都该成立」，于是本产品自己的规矩会在别人的项目里报红（DF-051）');
   }
 
   // 反向：跑了但登记表里没有 —— 说明有人加了调用却没登记，它不会被 disabledChecks 关掉，
@@ -2874,6 +3606,7 @@ const CHECKS = [
   ['emptyDirs', () => checkEmptyDirs()],
   ['capabilityDisclosure', checkCapabilityDisclosure],
   ['testCount', checkTestCount],
+  ['executionClaims', checkNoExecutionClaims],
   ['syntax', checkSyntax],
   ['importable', checkImportable],
   ['unregisteredExports', checkUnregisteredExports],
@@ -2884,9 +3617,12 @@ const CHECKS = [
   ['launcherPlacement', checkLauncherPlacement],
   ['inboxWiring', checkInboxWiring],
   ['promptWiring', checkPromptWiring],
+  ['evidenceTaxonomy', checkEvidenceTaxonomy],
   ['designIndex', checkDesignIndex],
   ['agentReachability', checkAgentReachability],
+  ['hubVerifier', checkHubVerifier],
   ['dispatchDepth', checkDispatchDepth],
+  ['dispatchQuartet', checkDispatchQuartet],
   ['docReferences', checkDocReferences],
   ['docCommands', checkDocCommands],
   ['docConstants', checkDocConstants],
@@ -2901,15 +3637,28 @@ const disabled = new Set(CFG.disabledChecks || []);
 /** 本轮**真的调用过**的检查名。元检查拿它与 `CHECKS` 表对账 —— 见
  *  `checkDispatchCoverage()` 的头注释（DF-047）。 */
 const ran = [];
+/** 因为**适用域**（`productRepo=false`）而没跑的产品规矩。与 `disabledChecks`
+ *  分开记：那是用户逐条关掉的，这是整整一族因为「这不是本产品的仓库」而不适用。
+ *  两者都要打印，但说的事情不同 —— 混成一份会让「17 条被关掉」看起来像用户的决定。 */
+const notApplicable = [];
 for (const [name, fn] of CHECKS) {
   if (disabled.has(name)) continue;
+  const domain = domainOf(name);
+  // **未登记的检查名 = 直接红**（在 `checkDispatchCoverage()` 里报），这里保守地
+  // 当成 universal 执行 —— 「不知道属于哪一族」时宁可多查，不可静默不查。
+  if (PRODUCT_REPO === false && domain === 'product') {
+    notApplicable.push(name);
+    continue;
+  }
+  CURRENT_CHECK = name;
   fn();
   // **记账在调用之后**。写在前面的话，「登记了但被 `continue` 掉」也会被记成跑过 ——
   // 那正是这条元检查要抓的形态。顺序本身就是判据的一部分。
   ran.push(name);
 }
+CURRENT_CHECK = '(done)';
 // 元检查必须**最后跑**：它要对着完整的 `ran` 对账。
-checkDispatchCoverage(ran);
+checkDispatchCoverage(ran, notApplicable);
 
 // 关掉的检查必须**每次都出现在屏幕上**：静默关掉等于把「检查通过」偷偷换成「没检查」，
 // 而这句话是这道门唯一的价值。提示不阻塞（这是用户的合法选择），但不可能不被看见。
@@ -2927,15 +3676,18 @@ for (const name of disabled) {
 // 都印在同一行里。`✓ 全部通过` 只在「24 条全跑、且没有一条报未跑」时出现。
 const skippedUniq = [...new Map(skipped.map((s) => [s.check + '\u0000' + s.why, s])).values()];
 const covered = ran.length;
-const notRunChecks = new Set(skippedUniq.map((s) => s.check));
+const notRunChecks = new Set([...skippedUniq.map((s) => s.check), ...productMissing.keys()]);
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);
   for (const v of violations) console.log(`  [${v.file}] ${v.msg}`);
-} else if (skippedUniq.length) {
+} else if (skippedUniq.length || notApplicable.length || productMissing.size) {
   // 有未跑项时**不许**印「全部通过」—— 那正是本缺陷的原始形态。
-  console.log(`✓ 已执行的 ${covered} 条检查全部通过`
-    + `（其中 ${notRunChecks.size} 条只跑了一部分：另有 ${skippedUniq.length} 处因目标不存在而未覆盖）`);
+  const parts = [];
+  if (skippedUniq.length) parts.push(`${notRunChecks.size} 条只跑了一部分：另有 ${skippedUniq.length} 处因目标不存在而未覆盖`);
+  if (productMissing.size) parts.push(`${productMissing.size} 条因本产品的产物不在盘上而未覆盖`);
+  if (notApplicable.length) parts.push(`${notApplicable.length} 条本产品自身的规矩不适用（productRepo=false）`);
+  console.log(`✓ 已执行的 ${covered} 条检查全部通过（${parts.join('；')}）`);
 } else {
   console.log(`✓ 结构检查全部通过（${covered} 条全部执行完毕，无跳过）`);
 }
@@ -2943,6 +3695,28 @@ if (violations.length) {
 if (skippedUniq.length) {
   console.log(`\n— ${skippedUniq.length} 处未跑（不阻塞，但**不计入「通过」**）：`);
   for (const s of skippedUniq) console.log(`  [${s.check}] ${s.why}`);
+}
+
+// 本产品自身的产物不存在：按检查聚合成**一行**。
+//
+// 逐份打印会让 `livingDocs` 一份清单变成 16 行，于是「3 条违规 + 60 行未跑」的屏幕
+// 看起来像这道门在指责对方 —— 那正是 DF-051 要消灭的观感。聚合之后它说的是另一件
+// 事：「这条检查的覆盖面比它的名字窄」，一句就够。
+if (productMissing.size) {
+  const parts = [...productMissing.entries()]
+    .map(([name, n]) => `${name}（${n} 处）`).join('、');
+  console.log(`\n— ${productMissing.size} 条检查的覆盖面比名字窄（本产品自身的产物不在盘上）：`);
+  console.log(`  ${parts}`);
+}
+
+// 适用域必须可见（DF-051）：「本产品的规矩全部通过」与「本产品的规矩一条都没跑」
+// 在屏幕上必须是两句不同的话。`productRepo=false` 是别人的项目的正常形态，
+// 不是错误 —— 但它决定了这一轮**覆盖了什么**，所以不静默。
+if (notApplicable.length) {
+  console.log(`\n· 本产品自身的规矩本轮不适用（${notApplicable.length} 条，productRepo=false）：`);
+  console.log(`  ${notApplicable.join(', ')}`);
+  console.log('  这些是「本仓库怎么管自己」的规矩，别人的项目没有对象。'
+    + `要在本产品自己的仓库里跑它们，在 ${CONFIG_REL} 写 "productRepo": true。`);
 }
 
 if (warnings.length) {

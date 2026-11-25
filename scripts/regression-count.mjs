@@ -134,6 +134,22 @@ function probeScript(dir, platform = null) {
     '  "OVERWATCH_STOP_VERIFY_SAMPLES", "OW_PRE_WRITE_GATE_LOG", "OVERWATCH_HOOK_DEDUPE_DIR"]) {',
     '  process.env[k] = join(sandbox, k.toLowerCase());',
     '}',
+    // **测试文件自己的临时目录也必须关进沙箱**（DF-050）。
+    //
+    // 修前这里漏了这一条，后果是：`entry-symlink.test.mjs` 的 `makeTmp()` 优先在
+    // `<repo>/tasks/runs/` 建目录，而**本探针只为数条数 import 它**（用例体不执行，
+    // 但模块级求值会跑）。实测在 `/tmp` 下一个只有 `README.md` + `git init` 的项目里：
+    //
+    //     ls -d tasks → 不存在
+    //     node scripts/check-structure.mjs   → 创建 tasks/runs/（空）
+    //     再跑一次 → [tasks/runs] 私有路径未在 .gitignore 中排除  ← 自污染闭环
+    //
+    // 两个修法一起用，**缺一不可**：
+    //   · 这里传 `UNTILDONE_TEST_TMP_BASE`，让「数条数」这个动作在任何项目里零写盘；
+    //   · `entry-symlink.test.mjs` 的 `makeTmp()` 改成惰性（只在真的 spawn 时建）。
+    // 只做后者的话，别的测试文件将来也可能在模块级建目录；只做前者的话，
+    // 「不该在 import 阶段建目录」这个原则仍然没被遵守。
+    'process.env.UNTILDONE_TEST_TMP_BASE = sandbox;',
     'process.on("exit", () => { try { rmSync(sandbox, { recursive: true, force: true }); } catch {} });',
     '',
     'const state = { names: [], cleanups: [] };',

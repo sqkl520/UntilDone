@@ -36,7 +36,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
-  DEFAULTS, CHECK_NAMES, CONFIG_REL, loadChecks, validateChecks,
+  DEFAULTS, CHECK_NAMES, CHECK_DOMAINS, domainOf, CONFIG_REL, loadChecks, validateChecks,
   livingDocsGap, scopedMarkdown, listMarkdown, normRel,
 } from './check-config.mjs';
 
@@ -59,10 +59,24 @@ function makeProject() {
   for (const rel of ['scripts', 'docs', 'templates', 'tasks/runs', '.claude/agents']) {
     mkdirSync(join(d, rel), { recursive: true });
   }
-  for (const f of ['check-structure.mjs', 'check-config.mjs', 'roles.mjs',
-    'published-paths.mjs', 'link-check.mjs', 'regression-count.mjs']) {
+  // **这份清单必须跟着 `check-structure.mjs` 的本地 import 走。**
+  //
+  // 2026-11-22 实测：`check-structure.mjs` 新 import 了 `dispatch-quartet.mjs`，
+  // 而这里没跟着拷 —— 于是硬门在临时项目里**在打印任何东西之前**就
+  // `ERR_MODULE_NOT_FOUND` 崩掉。表现是「配置在生效」那行没有输出，
+  // 测试报「改了形状却没打印配置在生效」，而真正的原因是夹具缺文件。
+  //
+  // 这条陷阱的形状值得记住：**夹具的失败看起来像被测代码的失败**。
+  // 所以下面用「列出来 + 断言每个都存在」而不是静默跳过。
+  const NEEDED = [
+    'check-structure.mjs', 'check-config.mjs', 'roles.mjs',
+    'published-paths.mjs', 'link-check.mjs', 'regression-count.mjs',
+    'dispatch-quartet.mjs',
+  ];
+  for (const f of NEEDED) {
     const src = join(REPO, 'scripts', f);
-    if (existsSync(src)) cpSync(src, join(d, 'scripts', f));
+    if (!existsSync(src)) throw new Error(`夹具缺 ${f} —— 它被 check-structure.mjs import，必须一起拷`);
+    cpSync(src, join(d, 'scripts', f));
   }
   writeFileSync(join(d, '.gitignore'), 'tasks/runs/\n');
   writeFileSync(join(d, 'README.md'), '# demo\n\n不能自动接力。\n');
@@ -95,11 +109,20 @@ test('本仓 .untildone/checks.json 与 DEFAULTS 深度相等——参数化了�
   const raw = JSON.parse(text);
   const cfg = validateChecks(raw);
   assert.deepEqual(cfg.errors, [], `本仓配置没通过自己的校验：${JSON.stringify(cfg.errors)}`);
+  // `productRepo` 是**唯一一个刻意与默认值不同**的键，所以对账时把它换成默认值。
+  //
+  // 为什么它必须是例外：`DEFAULTS.productRepo = false` 是「对任何项目安全」的方向
+  // （默认 true 会让每个陌生项目一进来就拿到 54 条「规定产物」违规 —— DF-051）。
+  // 而本仓库**必须**是 `true`，否则本产品自己的规矩会静默不再执行。
+  // 两者的差别是**这一位**，所以先把它抹平再逐字对账，其余键的严格性一分不减。
+  // 它必须真的是 `true` 这件事由上面「productRepo 默认 false…」那条单独守。
+  const normalized = { ...cfg.config, productRepo: DEFAULTS.productRepo };
   assert.deepEqual(
-    cfg.config,
+    normalized,
     DEFAULTS,
     '本仓配置与 DEFAULTS 不一致 —— 两边必须同步。DEFAULTS 是「代码里的现状」，'
-    + '这份文件是「本仓声明的现状」，它们不同意味着本仓库的检查范围被悄悄改过',
+    + '这份文件是「本仓声明的现状」，它们不同意味着本仓库的检查范围被悄悄改过'
+    + '（唯一允许不同的是 productRepo，它在上面已经单独断言）。',
   );
 });
 
@@ -286,12 +309,179 @@ test('本仓活文档清单的缺口不许变大（默认关闭的覆盖检查�
   const unregistered = gap.unregistered.sort();
   const missing = gap.missing.sort();
   assert.deepEqual(missing, [], `清单里有磁盘上没有的文件：${missing.join(', ')}`);
-  // 实测（2026-11-21）：8 份 —— 5 份根级（CONTRIBUTING ×2 / SECURITY ×2 / README-EN）
-  // + 2 份 adr（0003 / 0004）+ 1 份 spec（original-design）。
-  assert.ok(unregistered.length <= 8,
-    `活文档清单的缺口变大了（${unregistered.length} > 8）：${unregistered.join(', ')}
+  // 实测（2026-11-24）：**9 份** —— 5 份根级（CONTRIBUTING ×2 / SECURITY ×2 / README-EN）
+  // + 3 份 adr（0003 / 0004 / 0005）+ 1 份 spec（original-design）。
+  // （2026-11-21 是 8 份；`0005-stop-hook-scope.md` 是后来新增的一份现行 ADR。）
+  //
+  // 这个数**只许变小**：登记进 `livingDocs` 一份，上限就该跟着降一格。变大意味着
+  // 又有一份现行文档没有被任何判据扫到 —— 那正是本条要拦的形态。
+  assert.ok(unregistered.length <= 9,
+    `活文档清单的缺口变大了（${unregistered.length} > 9）：${unregistered.join(', ')}
 `
     + '新增一份现行文档（docs/spec / docs/adr / 根级 .md）必须登记进 '
     + '.untildone/checks.json 的 livingDocs，否则它不会被任何判据扫到。'
     + '登记之后这条断言的上限才该跟着降。');
+});
+
+// ── 6. 适用域（DF-051）：每一条检查都必须声明「对谁成立」 ────────────────
+
+/** 这一组守的是 DF-051 的**机制面**。
+ *
+ *  修前硬门的 29 条检查是一个扁平表，其中一大半是「本产品自身的规矩」（README 必须
+ *  声明不能自动接力、每个提交记 CHANGELOG、设计稿标未实现、能力清单绑命令……）。
+ *  它们在别人的项目里没有对象 —— 实测一个只有 `README.md` + `git init` 的项目跑一遍
+ *  报 **59 条违规，54 条的原话是「它是本仓库的规定产物」**。
+ *
+ *  修法不是「加十几条开关」（那要求用户先知道 17 个内部名字，而且下一次新加一条
+ *  产品规矩又默认是红的）。修法是**给每条检查一个适用域**，域位由
+ *  `.untildone/checks.json` 的 `productRepo` 决定要不要执行 product 那一族。
+ *
+ *  这一组钉住三件事：
+ *    1. 每条检查**都**有域（漏登记 = 它在别人项目里默认报红，DF-051 复发）；
+ *    2. 域只有两个取值（拼错成 `universel` 会让这条检查**永远不跑**）；
+ *    3. `productRepo` 的默认值必须是 `false`（对任何项目安全），而本仓那份配置
+ *       必须**显式**写 `true` —— 否则本仓自己的规矩会静默不再执行。 */
+test('DF-051 每一条检查都声明了适用域，且只有 universal / product 两个取值', () => {
+  for (const name of CHECK_NAMES) {
+    const d = domainOf(name);
+    assert.ok(d === 'universal' || d === 'product',
+      `检查 "${name}" 的域是 ${JSON.stringify(d)} —— 只允许 universal / product。`
+      + '拼错的域值不会报错，它只会让那条检查**永远不跑**（productRepo 判等失败）');
+  }
+  assert.equal(domainOf('this-is-not-a-check'), null,
+    '未登记的名字必须返回 null（调用方据此报红），不能静默当成 universal');
+});
+
+test('DF-051 三个面都是 product 域：文档规矩 / 派发规矩 / 能力清单', () => {
+  // 抽样而不是全列：这三个分别代表「只对本产品的文档成立」「只对本产品的架构成立」
+  // 「只对本产品的交付物成立」。它们任何一条被误标成 universal，外部项目就会重新
+  // 收到「要求你照抄我们的文档」的红。
+  for (const n of ['capabilityDisclosure', 'dispatchQuartet', 'capabilities']) {
+    assert.equal(domainOf(n), 'product',
+      `"${n}" 必须是 product 域 —— 它在别人的项目里没有对象（DF-051 的原话是`
+      + '「那不是检查，那是要求对方复制我们整套文档」）');
+  }
+  // 反向对照：这四条在任何项目里都成立，标成 product 会让它们在本仓之外静默不跑。
+  for (const n of ['syntax', 'importable', 'absolutePaths', 'links']) {
+    assert.equal(domainOf(n), 'universal',
+      `"${n}" 必须是 universal 域 —— 它对任何仓库都成立，标成 product 会让别人的项目少查一条`);
+  }
+});
+
+test('DF-051 productRepo 默认 false（对任何项目安全），本仓那份配置必须显式 true', () => {
+  assert.equal(DEFAULTS.productRepo, false,
+    'productRepo 的默认值必须是 false —— 默认 true 会让每个陌生项目一进来就拿到 54 条「规定产物」违规，'
+    + '那正是 DF-051 要消灭的现象');
+  const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+  assert.equal(raw.productRepo, true,
+    '本仓那份配置必须**显式**写 true —— 少了它，本产品自身的规矩（CHANGELOG / 设计索引 / '
+    + '派发四元组 / 能力清单）会静默不再执行，而门照样绿');
+});
+
+test('DF-051 loadChecks 区分「显式写了这个键」与「没写」（declared）', () => {
+  const d = mkdtempSync(join(tmpdir(), 'ow-checkconf-'));
+  try {
+    mkdirSync(join(d, '.untildone'), { recursive: true });
+    // 只写一个键：其余全走默认值，但 `declared` 只能包含写了的那个。
+    writeFileSync(join(d, CONFIG_REL), JSON.stringify({ scriptsDir: 'scripts' }));
+    const r = loadChecks(d, { env: {} });
+    assert.equal(r.source, 'file');
+    assert.deepEqual([...r.declared], ['scriptsDir'],
+      'declared 必须只含**显式写了的**键。它混进默认值时，「本仓声明了 productRepo=true」'
+      + '与「本仓没写、恰好用了默认值」就分不出来');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+// ── 7. 硬门在陌生项目里：违规 ≤ 5 且都是真问题（DF-050 / DF-051 的完成判据）──
+
+/** 一个**真正陌生**的项目：只有 `README.md` + `git init`。
+ *
+ *  这就是验收判据的原样：「在一个只有 README.md + git init 的项目里跑，违规 ≤ 5
+ *  且都是真问题」。刻意**不**造 `scripts/` 之外任何东西 —— 夹具越像本仓，这条
+ *  测试越证明不了「别人的项目不会被要求照抄」。
+ *
+ *  `scripts/` 里只放硬门 + 它的全部本地 import（跟着源码走，见 `makeProject()` 的注释）。 */
+function makeAlienProject() {
+  const d = mkdtempSync(join(tmpdir(), 'ow-alien-'));
+  mkdirSync(join(d, 'scripts'), { recursive: true });
+  writeFileSync(join(d, 'README.md'), '# 一个跟 UntilDone 无关的小项目\n\n做一件事。\n');
+  const NEEDED = [
+    'check-structure.mjs', 'check-config.mjs', 'roles.mjs',
+    'published-paths.mjs', 'link-check.mjs', 'regression-count.mjs',
+    'dispatch-quartet.mjs',
+  ];
+  for (const f of NEEDED) cpSync(join(REPO, 'scripts', f), join(d, 'scripts', f));
+  // git init：`gitPublishableRootFiles()` 用 git 判「会不会发出去」。
+  spawnSync('git', ['init', '-q', '.'], { cwd: d });
+  return d;
+}
+
+/** 只取输出里**违规**那一节的行（「未跑」与「提示」也以两空格+方括号开头）。 */
+function violationLines(out) {
+  const head = out.indexOf('项违规');
+  if (head < 0) return [];
+  const end = out.indexOf('\n— ');
+  return out.slice(head, end < 0 ? undefined : end)
+    .split('\n').filter((l) => /^ {2}\[/.test(l));
+}
+
+test('DF-051 陌生项目（只有 README.md + git init）里违规 ≤ 5，且没有一条是「要求照抄我们的文档」', () => {
+  const d = makeAlienProject();
+  try {
+    const r = runGate(d);
+    const viol = violationLines(r.out);
+    assert.ok(viol.length <= 5,
+      `陌生项目里报了 ${viol.length} 条违规（判据 ≤ 5）：\n${viol.join('\n')}\n`
+      + '超过 5 条说明又有判据把「本产品自身的规矩」当成「任何项目的合格线」（DF-051）');
+
+    for (const l of viol) {
+      assert.ok(!/本仓库的规定产物|本产品自身的规定产物/.test(l),
+        `违规里出现「规定产物」这句话：${l}\n`
+        + '这句话在别人的项目里字面上就是要求对方复制我们整套文档 —— productRepo 没有接上');
+    }
+
+    // 「产品规矩本轮不适用」这一行必须出现：域位关掉的东西必须看得见（不静默）。
+    assert.match(r.out, /本产品自身的规矩本轮不适用/,
+      'productRepo=false 时没有打印「哪一族规矩不适用」—— 那就成了静默关掉，'
+      + '「本产品规矩全部通过」与「一条都没跑」在屏幕上同形（DF-047 的老病）');
+    assert.match(r.out, /productRepo/,
+      '提示里必须写出开关名字，否则读者不知道该怎么打开这一族');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('DF-051 正向对照：productRepo=true 时同一个陌生项目必须重新报出那些「规定产物」', () => {
+  // 这条是上一条的**负向验证**：`≤ 5` 必须是因为域位关掉了那一族，而不是因为门
+  // 恰好什么都没查。判据用「同一份夹具 + 只翻 `productRepo` 一位」，两个方向都实测。
+  const d = makeAlienProject();
+  try {
+    const off = violationLines(runGate(d).out);
+    mkdirSync(join(d, '.untildone'), { recursive: true });
+    writeFileSync(join(d, '.untildone', 'checks.json'), JSON.stringify({ productRepo: true }, null, 2));
+    const r = runGate(d);
+    const on = violationLines(r.out);
+    assert.ok(on.length > off.length + 10,
+      `productRepo=true 时只报了 ${on.length} 条（关着时 ${off.length} 条）—— 产品规矩没有被执行。`
+      + '这条是正向对照：它证明「≤ 5」不是因为门什么都没查');
+    assert.ok(on.some((l) => /docs\/CHANGELOG\.md/.test(l)),
+      `productRepo=true 时没有报 CHANGELOG 缺失 —— 产品规矩没接上：\n${on.slice(0, 8).join('\n')}`);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+// ── 8. 硬门不在被检查的项目里留垃圾（DF-050 的另一半）──────────────
+
+test('DF-050 跑门前后，陌生项目的 git status 必须干净（不留 tasks/runs 之类的垃圾）', () => {
+  const d = makeAlienProject();
+  try {
+    const status = () => spawnSync('git', ['status', '--porcelain', '--untracked-files=all'],
+      { cwd: d, encoding: 'utf8' }).stdout || '';
+    // 基线里滤掉 `scripts/` —— 那是夹具本身（脚本副本），与门是否写盘无关。
+    const clean = (s) => s.split('\n').filter((l) => l && !l.includes('scripts/')).sort();
+    const before = clean(status());
+    runGate(d);
+    const after = clean(status());
+    assert.deepEqual(after, before,
+      `跑一次硬门在陌生项目里留下了东西：\n  新增：${after.filter((x) => !before.includes(x)).join(', ') || '(无)'}\n`
+      + '最常见的是 tasks/runs/ —— 根因是 regression-count 的探针 import 测试文件时，'
+      + '`entry-symlink.test.mjs` 的 `makeTmp()` 在模块级建了目录（DF-050）');
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });

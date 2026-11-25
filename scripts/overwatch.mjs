@@ -114,15 +114,28 @@ const PRINT_RESERVE_MS = 80;
  *  代价如实说：语料很大时会更早停下，报出的是**下限**（「≥N 份」），
  *  不是准确计数。这个降级本来就在（`（下限）`），这里只是让它更常触发。 */
 const ENUM_SLICE_MS = 200;
-/** `watcher` 那项的实测成本：spawn `install-watcher` 状态 + 它内部再 spawn 一个
- *  `watch.mjs --health`，本机实测 380–430ms。**预算判断必须用它当阈值** ——
+/** `watcher` 那项的实测成本。**预算判断必须用它当阈值** ——
  *  剩得比它少还硬跑，等于明知超支还要垫进去。
  *
- *  `DF-032` 复核（2026-11-18）：空载重测三次是 **153 / 169 / 189ms**，比这里记的低。
- *  两个数不冲突 —— 上面那组是在有并发负载时测的，而**用作预算必须取偏大的那个**：
- *  低估会让人在预算已经不够时还去跑。所以常量保持 420 不动，只把两组数都写下来，
- *  免得下一个人空载测一次以为注释写错了、把它改小。 */
-const WATCHER_COST_MS = 420;
+ *  ## 数字被改过两次，两次都是因为「实现换了」
+ *
+ *  · `DF-032`（2026-11-18）：记的是 spawn 两次（`install-watcher` 状态 →
+ *    它内部再 spawn `watch.mjs --health`）的 380–430ms。空载重测 153–189ms，
+ *    但**用作预算必须取偏大的**，所以留 420。
+ *  · `DF-095`（2026-11-24）：`doctor` 改成**在进程内** import `watch.mjs` 拿
+ *    `healthCheck`（2ms），不再 spawn 整个 node。实测 watcher 那一项 **3451ms → 34ms**。
+ *    420 与 34 差 12 倍 —— AC-8 的判据是「不得差 10 倍以上」，所以必须改。
+ *
+ *  取 **120ms**（34ms 实测 × 约 3.5 倍）。为什么不是 34：这个数决定「剩余预算够不够
+ *  跑它」，低估会让人在预算已经不够时还去跑（DF-032 的原话）。120 给三倍余量，
+ *  与 `healthCheck` 里 `interval * 3` 同一个口径。
+ *
+ *  ## 它现在为什么可以这么小
+ *
+ *  这一项**不再付 Node 启动费**。以前那 3451ms 里绝大部分是「启动一个 node 去问
+ *  一个 2ms 的问题」，不是判断本身贵。这也解释了为什么 CI（Linux、负载低）上
+ *  同一个数字一直比本机小得多 —— 那从来不是判据的差异，是 spawn 的差异。 */
+const WATCHER_COST_MS = 120;
 
 /** Node 下限。**不是 18**，逐版本实测见 portability-audit §1.1：
  *  18.20.4 能跑全部生产脚本；跑测试要 20.16.0（`process.getBuiltinModule`）。
@@ -369,7 +382,18 @@ function checkTranscripts(root, nowMs, deadline) {
   for (const ent of entries) {
     if (!ent.isDirectory()) continue;
     projects++;
-    if (Date.now() > sliceEnd) { complete = false; break; }
+    // **一个目录都不数就直接 break 是错的**（DF-104，2026-11-25）。
+    //
+    // 现场：CI / 并发负载下 `overwatch.test.mjs` 的「有根且有 transcript」偶发变红，
+    // 输出是「1 个（未完）项目 · **0 份 .jsonl**（下限）」。根因不是枚举慢，是这个
+    // 检查的位置：`sliceEnd = Date.now() + ENUM_SLICE_MS`，而机器被压满时，
+    // 走到这里 `Date.now()` 已经超过 sliceEnd → **首个目录都没读**就 break。
+    // 于是「预算耗尽」被编码成了「0 份」——两件完全不同的事：
+    //   · 0 份        → 这台机器没有会话记录（去装 Claude Code）
+    //   · 没数完      → 我不知道有几份（别下任何结论）
+    // 判据必须是「已经数到过东西了吗」，不是「还有时间吗」。
+    // 有文件时提前停仍然允许（那是切片的本来目的：别为了数全而超预算）。
+    if (files > 0 && Date.now() > sliceEnd) { complete = false; break; }
     const dir = join(root, ent.name);
     let names;
     try { names = readdirSync(dir); } catch { continue; }
@@ -526,17 +550,46 @@ async function checkWatcherLive(env, timeoutMs, nowMs) {
     return { ok: true, code: 0, out: '', err: '', timedOut: false, ms: Date.now() - started, facts };
   }
 
-  // **用 `--json`：要的是那个 `healthy` 布尔，不是一行人话。**（DF-076）
+  // **在进程内问健康度，不 spawn 一个 node。**（DF-095）
   //
-  // 之前是 `['--health']` 然后从文本里正则抽 `jobs 上次 45.2` 这类年龄。
-  // 抽出来的东西**不是健康判据**（`0` 表示健康、`45.2` 表示不健康，都是年龄），
-  // 而有人（我）一度拿它当判据，结果健康时也判成不健康。
-  // `--health --json` 直接给 `{healthy, reasons[]}`，不需要任何转译。
-  const r = await runNode('watch.mjs', ['--health', '--json'], timeoutMs);
-  if (r.timedOut) {
-    return { ...r, facts, timedOut: true, ms: Date.now() - started };
+  // 这里是 `doctor` 超预算的根因，实测：spawn 这一项 **3451ms**，而它问的问题
+  // （`healthCheck`）本身实测 **2ms**。1000ms 的硬预算里这一项永远超支，
+  // 于是「1000ms 是硬约束」这句 spec 里的话一直是假的。
+  //
+  // 早先不能 import 的原因很具体：`watch.mjs` 的「我是不是被直接执行」判据是
+  // `/watch\.mjs$/`，而本入口叫 `overwatch.mjs` —— **以 watch.mjs 结尾**，
+  // import 会当场启动守护进程（`overwatch.test.mjs` 那条 `★` 测试就是钉这件事的）。
+  // 现在 `watch.mjs` 换成了与 `render-plan.mjs` 同一份 realpath 判据（DF-095），
+  // 所以这里可以直接 import。**那条 `★` 测试仍然保留，仍然必须绿** ——
+  // 它守的是「行为」，不是「实现方式」，现在它守的是新判据。
+  //
+  // 失败退回 spawn：那是「这个模块的导出形状变了」，此时必须去跑原命令，不许猜。
+  let r;
+  let body = '';
+  try {
+    const w = await import('./watch.mjs');
+    if (typeof w.healthCheck !== 'function' || typeof w.loadState !== 'function') {
+      r = await runNode('watch.mjs', ['--health', '--json'], timeoutMs);
+      body = r.out || r.err || '';
+      if (r.timedOut) return { ...r, facts, timedOut: true, ms: Date.now() - started };
+    } else {
+      // `loadState` 会**改坏文件**（解析失败时改名留证）—— 上面已经自己确认过它能 parse，
+      // 所以这里传 `logger: null` 且状态确定可读，不会触发改名。doctor 只读这条
+      // 由 `doctor 只读：不新建 state.json、不改 state 目录里的文件` 那条测试守着。
+      const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+      const health = await w.healthCheck(state, {
+        nowMs,
+        logHealth: w.readLogHealth(facts.stateDir),
+        // **必须传见证**，否则进程层永远不会说话（`healthCheck` 只在 `procWitness !== undefined`
+        // 时调 judge）。这是 `--health --json` 那条路上的同一个输入。
+        procWitness: w.readProcWitness(facts.stateDir),
+      });
+      body = JSON.stringify({ generatedAt: new Date().toISOString(), ...health });
+      r = { ok: health.healthy === true, code: health.healthy ? 0 : 1, out: body, err: '', timedOut: false, via: 'in-process' };
+    }
+  } catch (e) {
+    r = { ok: false, code: null, out: '', err: String((e && e.message) || e), timedOut: false, via: 'import-failed' };
   }
-  const body = r.out || r.err || '';
   facts.raw = body.trim();
   // **结构化判定优先**：能不能解析出 `healthy` 布尔，决定这一项是「知道」还是「不知道」。
   // 解析不出来（旧版 watch.mjs / 输出被截断）时 `facts.healthy` 保持 `null`，

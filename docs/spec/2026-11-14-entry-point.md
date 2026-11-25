@@ -117,7 +117,7 @@
 | `sources` | `<claudeDir>/jobs`、`<claudeDir>/sessions` 的存在与计数 | 直接读 |
 | `claude/` | 仓库 `.claude/agents`、`.claude/skills`、`.claude/settings.local.json` | 直接读 |
 | `gate` | **`pre-write-gate.mjs` 导出的 `cli(['status', '--cwd', <repo>])`** | **进程内调用**（截获它自己的 stdout） |
-| `watcher` | 安装状态：`install-watcher.mjs` 的 `launcherPath(repo)` / `shortcutPath(env)`；存活判定：**`node scripts/watch.mjs --health`** | 前者进程内，后者 **spawn**（见 §5.1） |
+| `watcher` | 安装状态：`install-watcher.mjs` 的 `launcherPath(repo)` / `shortcutPath(env)`；存活判定：**`watch.mjs` 导出的 `healthCheck()`**（与 `--health` 同一个判据） | **全部进程内**（2026-11-24 起，见 §5.1） |
 | `platform` | `notify.mjs` 的 `isNotificationAvailable()`、`install-watcher.mjs` 的 `startupDir(env)` | 直接读 |
 
 取词只做**去字形**（`✓ ✗ ⚠ ● ○` 与 `**`）和**按键名取值**，不做判定：
@@ -128,31 +128,58 @@
 > 判据的第二份实现永远比第一份少测。规矩：这里的每一行都必须是**既有函数/命令的原文**或
 > **一次 `stat`/`readdir` 的直接结果**，不得出现「我认为它算不算通过」。
 
-### 5.1 ⚠ `watch.mjs` 只能 spawn，不能 import —— 本文件踩过的坑
+### 5.1 `watch.mjs` 曾经只能 spawn —— 2026-11-24 修掉了根因
 
-`watch.mjs` 的「我是不是被当 CLI 跑的」判据是 `/watch\.mjs$/.test(process.argv[1])`，
-而本入口叫 **`over**watch.mjs`，**以 `watch.mjs` 结尾**。
+**这一节原来的结论是「必须 spawn」，而那条结论是错的。** 留下这段是因为它记录的是
+一个真实的失效链，且它的「修法」比它本身更值得记。
 
-于是 `await import('./watch.mjs')` 会让它认为自己是主模块并**当场启动守护进程**。
-实测后果：`doctor` 的输出里混进 `watch 启动 dir=… tick=15000ms`，然后进程**永不退出**
-（守护进程的定时器还活着）—— 一个自检命令把自己变成了守护进程。
+**原判据**：`watch.mjs` 的「我是不是被当 CLI 跑的」写的是
+`/watch.mjs$/.test(process.argv[1])`。本入口叫 **`over**watch.mjs`，以 `watch.mjs` 结尾 ——
+于是 `await import('./watch.mjs')` 会让它认为自己是主模块并**当场启动守护进程**：
+输出里混进 `watch 启动 dir=… tick=15000ms`，进程永不退出。
+当时的处置是「那就 spawn 吧」，并把这条写成了架构约束（`watcher` 必需 spawn）。
 
-所以：`watcher` 的存活判定走 **spawn**（`argv[1]` 是 watch.mjs 自己的路径）。
-`scripts/overwatch.test.mjs` 里有一条 `★` 标记的测试专门钉这件事，判据是
-「输出里不许出现 `watch 启动` / `tick=Nms` / `candidates=N`」。
+**那个处置的代价**：spawn 一个完整的 node 去问一句健康度，实测 **3451ms**，
+而它问的问题（`healthCheck`）本身只要 **2ms**。`doctor` 的预算是 1000ms，
+所以这一项**永远超支** —— 本 spec 那句「1000ms 是硬约束」因此一直是假话。
 
-另外两个模块的判据不匹配 `overwatch.mjs`，import 安全：
-`install-watcher.mjs` 比**解析后的路径**，`pre-write-gate.mjs` 比 `pre-write-gate\.mjs$`。
+**真正的修法**（`DF-095`）：把判据换成 `render-plan.mjs` / `launch.mjs` 用的同一份
+**realpath 比较**，而不是 `argv[1]` 的后缀：
 
-### 5.2 为什么 `gate` 在进程内、`watcher` 在 spawn
+```js
+const realOrResolve = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
+const isDirect = Boolean(process.argv[1])
+  && realOrResolve(process.argv[1]) === realOrResolve(fileURLToPath(import.meta.url));
+```
 
-| 项 | 方式 | 单次成本（本机实测） |
+换掉之后 `overwatch.mjs` 与 `watch.mjs` 的真实路径不同 → 不会误启动；
+而经符号链接执行时两边**都是真实路径** → 也不会误判成「被 import」。
+
+**实测**（`doctor` 的 `watcher` 那一项）：**3451ms → 34ms**（约 100 倍）。
+`WATCHER_COST_MS` 随之 420 → 120（差 12 倍会撞 AC-8 的「不得差 10 倍以上」）。
+
+**那条 `★` 测试仍然保留。** 它守的是**行为**（「doctor 不得变成 watch」），不是
+「必须用 spawn」这个实现方式。换成 import 之后它照样能抓：判据还是
+「输出里不许出现 `watch 启动` / `tick=Nms` / `candidates=N`」——
+如果有人把 realpath 判据改回后缀，它会立刻红。
+
+另外两个模块的判据从一开始就比**解析后的路径**，import 一直安全：
+`install-watcher.mjs`、`pre-write-gate.mjs`。
+
+### 5.2 两项都在进程内（2026-11-24 之后）
+
+| 项 | 方式 | 单次成本（本机实测，2026-11-24） |
 |---|---|---|
-| `gate` | 进程内调 `cli()` | **4 ms**（spawn 要 210–350 ms） |
-| `watcher` | spawn `watch.mjs --health` | 300–350 ms（不能不 spawn，见 §5.1） |
+| `gate` | 进程内调 `cli()` | **87 ms**（spawn 要 210–350 ms） |
+| `watcher` | 进程内调 `healthCheck()` | **34 ms**（spawn 要 **3451 ms**，见 §5.1） |
 
 早期版本两项都 spawn，实测墙钟稳定在 1000 ms 边缘 —— 那 900 ms 里 800 ms 是
-「启动 Node 去问一个 4 ms 的问题」。把 `gate` 移进进程内后，报告值降到 500–740 ms。
+「启动 Node 去问一个 4 ms 的问题」。`gate` 先搬进进程内（报告值降到 500–740 ms），
+`watcher` 在 `DF-095` 之后也搬了进来 —— 实测 `workMs` **762 ms**，仍在 1000 ms 内。
+
+**这里曾经有一个错误的结论**：「`watcher` 不能不 spawn」。它不是判据结论，而是
+一条**入口守卫写错**造成的约束。一件事被写成「架构要求」之前，值得再问一次
+「这是判据的性质，还是我某个实现细节的副作用」。
 
 `--cwd` 必须显式传给 `cli()`：它默认读 `process.cwd()`，而 `doctor` 的语义是
 「在**本仓库**里问闸门」。不传的话，用户在别的目录敲 `node <repo>/scripts/overwatch.mjs`

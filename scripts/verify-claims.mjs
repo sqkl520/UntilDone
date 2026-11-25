@@ -447,6 +447,63 @@ export const RUNTIME_CMD_RE = /\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMetho
 // 「0 failed」「0 个失败」本来就不匹配（前面是 0 不是 [1-9]），保持原样。
 export const FAIL_OUTPUT_RE = /\bBUILD\s+FAILURE\b|\b[1-9]\d*\s+(?:failing|failed|failures?|errors?)\b(?![=:\s]*0\b)|\bFAIL(?:ED|URE)\b[:\s!]|\bTests?\s+run:\s*\d+,\s*Failures:\s*[1-9]|npm\s+ERR!|Traceback\s+\(most\s+recent\s+call|error\s+TS\d+|exit\s+code\s+[1-9]|Command\s+failed/i;
 
+/** 宿主对「命令跑完但什么都没打印」的**占位文本**。
+ *
+ *  实测（250 份真实 transcript、53,896 个 tool_result）：空字符串 272 个，
+ *  而宿主占位 `(Bash completed with no output)` **437 个**、`(PowerShell …)` 12 个。
+ *  也就是说真实语料里「空输出」主要表现为**这句占位符**，不是空串。
+ *  只判 `text.trim() === ''` 会漏掉 94% 的空输出 —— 这道门会看起来修好了而实际没修。
+ *  两种形态都要认，且必须认成同一件事。 */
+export const EMPTY_OUTPUT_RE = /^\((?:Bash|PowerShell|Bash completed|PowerShell completed)[^)\n]*with no output[^)\n]*\)\s*$/i;
+
+/** 「这条 tool_result **根本没有 content 字段**」与「content 是空串」是两件事。
+ *
+ *  真实宿主总会写 `content`（正文，或上面那句占位符）。`content` **缺失**只出现在
+ *  合成夹具里 —— 例如 `replay-stop-gate.test.mjs` 的 `{ type:'tool_result', is_error:false }`。
+ *  把它当成「什么都没打印」会得出一个荒谬的结论：**这条命令静默通过**，
+ *  而实际上我们从没读到它的输出。
+ *
+ *  所以 `isSilentOutput()` 只对「有 content 但内容是空/占位」返回 true；
+ *  「没有 content」这个形态**不算静默**（沿用旧行为：只看 `is_error`）。
+ *  代价与取舍写在这里而不是测试里：这条区分只在合成数据上可见，真实语料里
+ *  两个形态不会同时出现，于是它带来的风险只有「夹具掩盖了新判据」——
+ *  为对冲这一点，`verify-claims.test.mjs` 的 DF-058 用例**显式带上 content**。 */
+
+/** 「成功」本身就是**安静**的命令：它们的正常输出就是什么都不打印。
+ *
+ *  ## 为什么需要这张表，而不是「空输出一律不算」
+ *
+ *  实测（250 份真实 transcript、363 次真实验证调用）：空输出 4 次，全部是
+ *  `pytest`/`python -m …` 这类**真跑了但没打印**的形态，占 1.1%。
+ *  所以「空输出」既可能是「检查通过」（`node --check` 永远静默），
+ *  也可能是「脚本什么都没做」（DF-058 的攻击形态：空 `exit 0` 脚本）。
+ *  两者在 transcript 里**一模一样**。
+ *
+ *  诚实的做法不是挑一边假设，而是：
+ *    · 对**这张表里的已知工具**，静默 = 通过（它们的契约就是这样，写进文档的）；
+ *    · 对其余一切（尤其是靠**文件名**认出来的项目脚本、以及必须打印计数的测试运行器），
+ *      静默 = **分不清**，不能当证据。
+ *
+ *  ## 为什么项目自有脚本**刻意不在**这张表里
+ *
+ *  DF-058 的攻击形态正是 `node scripts/<带验证词的名字>.mjs` 指向一个空文件。
+ *  把这类脚本收进来，等于给「写个空脚本」发一张永久通行证 —— 那正是要堵的洞。
+ *  代价：一个真的静默成功的自有脚本会被判「分不清」。这个代价是**可接受的**，
+ *  因为它只需要作者加一行 `console.log('ok')` 就能消除，而误判拦截的下一步
+ *  （见 `buildReason`）正好在教它这么做。 */
+export const SILENT_OK_RE = /(?:\bnode\s+(?:--check|-c)\b|\btsc\b(?=[^\n]*--noEmit)|--noEmit\b|\bnpx\s+tsc\b|\b(?:eslint|ruff|flake8|mypy|pylint|shellcheck|golangci-lint)\b|\bgo\s+vet\b|\bgofmt\s+-l\b|\bpython\d?\s+-m\s+py_compile\b)/i;
+
+/** 这段 tool_result 是「什么都没打印」吗（空串或宿主占位符）。 */
+export function isSilentOutput(text) {
+  const t = String(text ?? '').trim();
+  return t === '' || EMPTY_OUTPUT_RE.test(t);
+}
+
+/** 这条命令的「静默成功」是不是可信的（见 `SILENT_OK_RE`）。 */
+export function isSilentByDesign(cmd) {
+  return SILENT_OK_RE.test(normalizeCommand(cmd));
+}
+
 /** git commit 成功的形态：`[main abc1234] msg` 或 `create mode`。 */
 export const COMMIT_OK_RE = /\[[^\]\n]{1,60}\s+[0-9a-f]{7,40}\]|\bcreate\s+mode\b|\b\d+\s+files?\s+changed\b/i;
 /** git push 成功的形态：`abc..def  main -> main` 或 `Everything up-to-date`。
@@ -719,18 +776,69 @@ function projectScriptVerification(cmd, depth = 0) {
   return null;
 }
 
+/** 「这一整条命令只是在**读**文件」的判据 —— `grep -n foo scripts/check-gate.mjs`
+ *  这类命令**不许**被算成一次验证。
+ *
+ *  为什么必须有这一条（DF-058 的第二半）：`VERIFY_CMD_RE` 的最后一个分支是
+ *  「命令里任意位置出现 `check*.(sh|ps1|mjs|js)` 字样」，它**不看命令结构**。
+ *  于是实测这四条全部返回 true：
+ *
+ *      grep -n foo check-x.mjs      cat check-gate.mjs
+ *      git log --oneline check.mjs  tail -20 scripts/check-structure.mjs
+ *
+ *  这四条一条检查都没做 —— 它们读了一份**名字像检查**的文件。而这正是
+ *  「vague-completion」这一族最需要挡住的东西：任何会话都有大量 Read/grep 观测，
+ *  把它们算成验证，本族立刻形同虚设。脚本自己的注释就写着「只读观测不算验证」，
+ *  但那条判据只覆盖了 `ls`/`cat`/`grep` **作为命令首词**的形态，
+ *  一旦 `grep` 后面跟着一个 `check*.mjs`，名字支就把它捞了回来。
+ *
+ *  判据形态：命令按 `&& | || ;` 与换行切段，**每一段**去掉 `cd`/`export` 前缀后
+ *  都要以读取动词开头，且段内不许出现执行动词或重定向。任何一段不满足 → 整条不是
+ *  只读（宁可判成「可能是验证」，因为反过来会把 `grep x && node check.mjs` 这种
+ *  真验证判掉）。
+ *
+ *  **实测代价**（250 份真实 transcript、2207 次被判为验证的调用）：
+ *  被这条新判据翻成 false 的只有 **9 次（0.41%）**，逐条看过，全部是
+ *  `grep … | head` / `sed -n '45,70p' run-tests.sh` / `head -50 build-apk.sh` 这种
+ *  真的只读。也就是说这条判据**几乎不误伤**，而它堵掉的正是最容易伪造的那一类。 */
+const READONLY_HEAD_RE = /^\s*(?:grep|egrep|fgrep|rg|ag|cat|head|tail|less|more|awk|find|ls|dir|wc|stat|od|xxd|sed\b|Get-Content|gc|Select-String|sls|type|echo|printf|test\s|\[|git\s+(?:log|show|diff|status|rev-parse|branch|remote)\b)\s*(?:$|[\s;&|(])/i;
+/** 只读段里不该出现的：解释器/构建器，以及任何重定向（`> file` 是写）。 */
+const SEG_EXEC_RE = /(?:^|[\s;&|(])(?:node|nodejs|bash|sh|zsh|pwsh|powershell|python\d?|deno|bun|npx|npm|pnpm|yarn|mvn\w*|gradlew\w*|gradle|dotnet|cargo|go|make|cmake|jest|vitest|pytest|tsc|eslint)\b|>>?\s*[^\s&|]/i;
+
+export function isReadOnlyCommand(cmd) {
+  // heredoc 的正文是被**写入**的内容，不是命令。先剥掉，否则
+  // `cat > run-tests.sh <<'EOF' … EOF` 会因为正文里的 `node x.mjs` 被判成执行。
+  const body = String(cmd || '').replace(HEREDOC_BODY_RE, ' ');
+  const segs = body.split(/\n|&&|\|\||;|\|/).map((s) => s.trim()).filter(Boolean);
+  if (!segs.length) return false;
+  let sawRead = false;
+  for (const s of segs) {
+    const t = s.replace(/^(?:(?:cd|export)\s+\S+\s*)+/, '').trim();
+    if (!t) continue;                        // 纯 cd / export 段，跳过
+    if (!READONLY_HEAD_RE.test(t)) return false;
+    if (SEG_EXEC_RE.test(t)) return false;
+    sawRead = true;
+  }
+  return sawRead;
+}
+
 /** 这条命令是不是「做过某种检查」。skip-tests 的构建不算 —— 它恰好什么都没验证。
  *
- *  两条判据取「或」：
+ *  三条判据取「或」，再过一条「只读」否决：
  *    1. `VERIFY_CMD_RE`：已知工具白名单（npm / mvn / gradle / pytest …）。
  *    2. `projectScriptVerification`：项目自有的、被**执行**的、文件名主干带验证动词的脚本。
- *  两条都过 `SKIP_TESTS_RE`：`mvn -DskipTests` 与 `node scripts/test.mjs --skip-tests`
- *  一样，都是「故意什么都没验」。 */
+ *    3. **只读否决**（`isReadOnlyCommand`）：整条命令只是在读文件 → 不算验证。
+ *  前两条都过 `SKIP_TESTS_RE`：`mvn -DskipTests` 与 `node scripts/test.mjs --skip-tests`
+ *  一样，都是「故意什么都没验」。
+ *
+ *  否决放在**最后**、且只否决「整条只读」的形态：`grep x && node scripts/check.mjs`
+ *  里有一段是执行，整条因此不是只读，仍然算验证 —— 那是对的，它确实跑了一次检查。 */
 export function isVerificationCommand(cmd) {
   const c = normalizeCommand(cmd);
   if (SKIP_TESTS_RE.test(c)) return false;
-  if (VERIFY_CMD_RE.test(c)) return true;
-  return projectScriptVerification(cmd) !== null;
+  const hit = VERIFY_CMD_RE.test(c) || projectScriptVerification(cmd) !== null;
+  if (!hit) return false;
+  return !isReadOnlyCommand(cmd);
 }
 
 /** 源码类扩展名。**只有它们会作废「测试通过」**——改一份 CHANGELOG.md 不会让昨天
@@ -1217,8 +1325,30 @@ export function buildEvidenceIndex(records) {
           // 转成后台任务（结果里只有 "Command running in background with ID"），前台没有任何
           // 退出码，把它算成一次成功测试就是本检测器自己说谎。
           const backgrounded = /running in background with ID|Output is being written to/i.test(text);
+          // 「静默」（什么都没打印）是一个**独立于成功/失败**的第三态（DF-058）。
+          //
+          // 旧判据把成功只挂在退出码上：`node scripts/check-gate.mjs` 指向一个空
+          // `exit 0` 文件 → `is_error:false` → `ok:true` → 判 SUPPORTED。负向实测过：
+          // 空脚本 + 「三个 bug 都修好了」→ `allow, all-claims-supported`。
+          //
+          // **`ok` 的语义不在这里改**：`git commit -q` / `git push -q` 成功时本来
+          // 就什么都不打印（那是已修的 DF，靠退出码兜底），`sed -i` 写文件也不打印。
+          // 把它们一并按「静默 = 不算成功」处理，会把三条真的成功判成失败。
+          // 所以静默只记成字段，由**该族自己的判据**决定它算不算数：
+          //   · `test-count` / `build` / `vague-completion` —— 静默是可疑信号，见
+          //     `silentUnprovenOf()` 与 `classifyEvidence` 里那一段；
+          //   · commit / push / 文件改动 —— 静默是正常形态，保持原行为。
+          //
+          // `hasContent` 这个区分见 `EMPTY_OUTPUT_RE` 上方那段注释：缺失 content 的
+          // tool_result 只出现在合成夹具里，它不是「静默」，而是「我们没读到」。
+          const hasContent = 'content' in b;
+          const silent = hasContent && isSilentOutput(text);
+          const silentOk = silent && isSilentByDesign(use.cmd);
           const ok = !err && !backgrounded && !FAIL_OUTPUT_RE.test(text);
-          shell.push({ index: use.index, name: use.name, cmd: use.cmd, ok, error: err, backgrounded, output: text });
+          shell.push({
+            index: use.index, name: use.name, cmd: use.cmd, ok, error: err, backgrounded,
+            output: text, silent, silentOk,
+          });
           // shell 命令也可能改动工作区（sed -i / cp / patch / git apply）。
           // 它们计入时间线，否则「编辑后有没有重跑」根本无从判断。
           // kind 必须按**实际写入的目标**判：写 .jar / .md / .gitignore 不作废测试证据。
@@ -1249,6 +1379,20 @@ function attempts(index, re) {
   return index.shell.filter((c) => re.test(c.cmd));
 }
 
+/** 「静默但按设计不该静默」的调用：既不能算成功，也算不上失败。
+ *
+ *  这是 DF-058 的核心判据：`ok` 由退出码决定，而空 `exit 0` 脚本的退出码就是 0。
+ *  在**必须打印点什么**的族里（测试 / 构建 / 「做完了」），一次什么都没打印的调用
+ *  提供不了任何信息 —— 它可能是真通过，也可能是脚本根本没做事，transcript 里两者
+ *  一模一样。所以它从 `successIndexes` 里摘出去，单独计数，由 `classifyEvidence`
+ *  给出「分不清」的结论并**照常拦截**。
+ *
+ *  `isSilentByDesign()` 为真的命令（`node --check`、`tsc --noEmit`、`eslint`）是例外：
+ *  它们的契约就是「只有出错才打印」，把它们摘掉会让几乎所有 JS 会话被误拦。 */
+function silentUnprovenOf(list) {
+  return list.filter((c) => c.silent && !c.silentOk && !c.backgrounded);
+}
+
 /** 本族相关的尝试（已应用 skip-tests 之类的语义过滤）。 */
 function attemptsOf(index, family) {
   if (family === 'test-count') return index.shell.filter((c) => isTestCommand(c.cmd));
@@ -1276,17 +1420,28 @@ export function findEvidence(records, claim) {
   if (family === 'test-count') {
     const a = attemptsOf(index, 'test-count');
     base.attempts = tag(a);
-    base.successIndexes = a.filter((c) => c.ok).map((c) => c.index);
+    // 静默的测试运行不算成功（`silentUnprovenOf` 的注释是完整理由）。
+    const unproven = silentUnprovenOf(a);
+    base.successIndexes = a.filter((c) => c.ok && !unproven.includes(c)).map((c) => c.index);
     base.failureIndexes = a.filter((c) => !c.ok && !c.backgrounded).map((c) => c.index);
-    base.detail = { testRuns: a.length, testPassed: base.successIndexes.length };
+    base.detail = {
+      testRuns: a.length,
+      testPassed: base.successIndexes.length,
+      silentRuns: unproven.length,
+    };
     return base;
   }
   if (family === 'build') {
     const a = attemptsOf(index, 'build');
     base.attempts = tag(a);
-    base.successIndexes = a.filter((c) => c.ok).map((c) => c.index);
+    const unproven = silentUnprovenOf(a);
+    base.successIndexes = a.filter((c) => c.ok && !unproven.includes(c)).map((c) => c.index);
     base.failureIndexes = a.filter((c) => !c.ok && !c.backgrounded).map((c) => c.index);
-    base.detail = { buildRuns: a.length, buildPassed: base.successIndexes.length };
+    base.detail = {
+      buildRuns: a.length,
+      buildPassed: base.successIndexes.length,
+      silentRuns: unproven.length,
+    };
     return base;
   }
   if (family === 'commit') {
@@ -1346,9 +1501,17 @@ export function findEvidence(records, claim) {
     // 这一个维度上严。见 VERIFY_CMD_RE 的注释：只读观测（ls/cat/git status）不算。
     const a = attemptsOf(index, 'vague-completion');
     base.attempts = tag(a);
-    base.successIndexes = a.filter((c) => c.ok).map((c) => c.index);
+    const unproven = silentUnprovenOf(a);
+    base.successIndexes = a.filter((c) => c.ok && !unproven.includes(c)).map((c) => c.index);
     base.failureIndexes = a.filter((c) => !c.ok && !c.backgrounded).map((c) => c.index);
-    base.detail = { verifyRuns: a.length, verifyPassed: base.successIndexes.length };
+    base.detail = {
+      verifyRuns: a.length,
+      verifyPassed: base.successIndexes.length,
+      silentRuns: unproven.length,
+      // 给拦截文案用：哪一条静默调用让它判不了的。不给出具体命令，模型只会再跑一遍
+      // 同一个脚本然后被第二次拦。
+      silentCmds: unproven.slice(0, 3).map((c) => String(c.cmd || '').slice(0, 120)),
+    };
     return base;
   }
   if (family === 'file-count') {
@@ -1505,6 +1668,26 @@ export function classifyEvidence({ claim, evidence, truncated = false, records =
       status: 'FAILED_ONLY',
       reason: `只有失败的「${kind}」（${fail.length} 次，其中编辑后 ${failAfter.length} 次）`,
       mayHideOlderSuccess: truncated,
+    };
+  }
+  // ── DF-058：静默的验证调用 ──
+  //
+  // 位置很重要：**排在 `inconclusive` 与 `truncated` 之前**，因为静默是一个
+  // 我们**已经拿到**的事实（命令跑完了、退出码 0、什么都没打印），
+  // 而 UNKNOWN 说的是「我们没拿到」。把已拿到的事实报成「没拿到」是更坏的那种不诚实。
+  //
+  // 判 NO_EVIDENCE 而不是新增档位：语义与它完全一致 ——「本会话里找不到能支持这句话的
+  // 证据」，而空输出恰恰什么都不能支持。新增一个档位会让 `EVIDENCE_STATUS`
+  // 这个对外枚举多一格，四份文档 + CLI 输出 + README 的表都要跟着改，
+  // 而收益只是换个名字。
+  const silentN = (ev.detail && ev.detail.silentRuns) || 0;
+  if (silentN && !succ.length) {
+    const cmds = (ev.detail && ev.detail.silentCmds) || [];
+    const sample = cmds.length ? `（例如 \`${cmds[0]}\`）` : '';
+    return {
+      status: 'NO_EVIDENCE',
+      reason: `唯一的「${kind}」调用${sample}什么都没打印 —— 空输出既可能是真通过，`
+        + '也可能是脚本根本没做事；两种情况在记录里一模一样，不能当证据',
     };
   }
   // 只有「丢到后台去了」的调用：既不是成功也不是失败。判 UNKNOWN 是对的 ——

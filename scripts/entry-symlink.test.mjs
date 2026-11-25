@@ -27,23 +27,52 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const HERE = import.meta.dirname;
 const ROOT = join(HERE, '..');
 
 /** 临时目录**优先放在 `tasks/runs/`**（gitignored，与真实布局同盘，符号链接行为最接近
- *  交付现场）；不可写时退回系统临时目录。两者都不进版本库。 */
+ *  交付现场）；不可写时退回系统临时目录。两者都不进版本库。
+ *
+ *  ## 必须**惰性**创建（DF-050 的根因）
+ *
+ *  本文件顶上有一句 `const LEDGER_DIR = join(makeTmp(), 'ledgers')` —— 模块级求值。
+ *  而 `regression-count.mjs` 的探针会 **import 每一个测试文件**（只注册用例，不跑用例体），
+ *  于是**光是数一下测试条数**就在被检查的项目里建出了 `tasks/runs/ow-entry-sym-*`。
+ *  实测（`/tmp` 下一个只有 `README.md` + `git init` 的项目）：
+ *
+ *      跑门前：ls -d tasks → 不存在
+ *      node scripts/check-structure.mjs → 创建 tasks/runs/（空）
+ *      再跑一次 → 报「tasks/runs 私有路径未在 .gitignore 中排除」（自污染闭环）
+ *
+ *  根因不是「临时目录不该在仓库里」，是**在 import 阶段建目录**：一个只为登记用例而
+ *  import 它的调用方，凭什么要承受它建目录的副作用？所以这里只**算**路径，不建；
+ *  第一次真的需要目录时（`tmpDir()`）才 `mkdirSync`。
+ *
+ *  另外认 `UNTILDONE_TEST_TMP_BASE`：探针（`regression-count.mjs`）把自己的沙箱传进来，
+ *  于是「数条数」这件事在任何项目里都**零写盘**。这不是给本测试开后门，而是把
+ *  「谁决定临时目录落哪」交还给调用方 —— 默认值仍然是仓库内（与交付现场同盘）。 */
 function makeTmp() {
-  for (const base of [join(ROOT, 'tasks', 'runs'), tmpdir()]) {
+  const base = process.env.UNTILDONE_TEST_TMP_BASE || null;
+  const candidates = base ? [base, tmpdir()] : [join(ROOT, 'tasks', 'runs'), tmpdir()];
+  for (const b of candidates) {
     try {
-      mkdirSync(base, { recursive: true });
-      return mkdtempSync(join(base, 'ow-entry-sym-'));
+      // 只试探可写性，**不建临时目录**（真正的目录在 tmpDir() 里建）。
+      mkdirSync(b, { recursive: true });
+      return mkdtempSync(join(b, 'ow-entry-sym-'));
     } catch { /* 换下一个 */ }
   }
   throw new Error('没有可写的临时目录');
 }
+
+/** 惰性临时目录：第一次调用才建，之后复用。`after()` 里删的是它的父目录。 */
+let _tmpDir = null;
+const tmpDir = () => {
+  if (!_tmpDir) _tmpDir = makeTmp();
+  return _tmpDir;
+};
 
 // ── 不许往生产台账里写字 ─────────────────────────────────────────────
 //
@@ -59,27 +88,43 @@ function makeTmp() {
 // 三个 hook 各自留了覆盖路径的环境变量，所以把子进程指到本测试自己的临时目录。
 // **`spawnSync` 的 `env` 是整体替换而不是合并**，因此必须 `{ ...process.env, ...隔离项 }`
 // —— 只传隔离项会把 `PATH` / `SystemRoot` 一起抹掉（Windows 上 Node 起不来）。
-const LEDGER_DIR = join(makeTmp(), 'ledgers');
-const ISOLATED_ENV = {
-  ...process.env,
-  OVERWATCH_STOP_VERIFY_LOG: join(LEDGER_DIR, 'stop-hook.jsonl'),
-  OVERWATCH_STOP_VERIFY_STATE: join(LEDGER_DIR, 'stop-hook-state.json'),
-  OVERWATCH_STOP_VERIFY_SAMPLES: join(LEDGER_DIR, 'stop-hook-samples.jsonl'),
-  OW_PRE_WRITE_GATE_LOG: join(LEDGER_DIR, 'pre-write-gate.jsonl'),
+//
+// **也是惰性的**（DF-050）：模块级 `join(makeTmp(), 'ledgers')` 会让「数测试条数」
+// 这样一个只为登记用例的 import 也在被检查的项目里建出目录。现在只在第一次真的
+// spawn 时才算路径、建目录。
+let _ledgerDir = null;
+const ledgerDir = () => {
+  if (!_ledgerDir) {
+    _ledgerDir = join(tmpDir(), 'ledgers');
+    mkdirSync(_ledgerDir, { recursive: true });
+  }
+  return _ledgerDir;
+};
+const isolatedEnv = () => {
+  const d = ledgerDir();
+  return {
+    ...process.env,
+    OVERWATCH_STOP_VERIFY_LOG: join(d, 'stop-hook.jsonl'),
+    OVERWATCH_STOP_VERIFY_STATE: join(d, 'stop-hook-state.json'),
+    OVERWATCH_STOP_VERIFY_SAMPLES: join(d, 'stop-hook-samples.jsonl'),
+    OW_PRE_WRITE_GATE_LOG: join(d, 'pre-write-gate.jsonl'),
+  };
 };
 // 非 hook 的入口（`render-plan` / `stop-signals` / `overwatch`）不看这几个变量，
 // 多传无害 —— 与其逐个入口判断「它会不会写台账」（那种判断迟早漏一个），
 // 不如让所有 spawn 走同一份 env。
-after(() => { rmSync(dirname(LEDGER_DIR), { recursive: true, force: true }); });
+after(() => {
+  if (_tmpDir) rmSync(_tmpDir, { recursive: true, force: true });
+});
 
 const run = (script, args = ['--help']) => spawnSync(process.execPath, [script, ...args], {
-  encoding: 'utf8', timeout: 30000, cwd: ROOT, input: '', env: ISOLATED_ENV,
+  encoding: 'utf8', timeout: 30000, cwd: ROOT, input: '', env: isolatedEnv(),
 });
 /** 给 hook 类入口喂一份 stdin —— 那是它们的真实调用形态（宿主从 `settings.json`
  *  按路径调起来，input 走 stdin）。`--help` 对它们没有意义，所以不能拿空输出去判定。
  *  超时压到 10 秒：这些入口本该立刻返回，等 30 秒只是在为「它挂住了」浪费时间。 */
 const runWithStdin = (script, stdin) => spawnSync(process.execPath, [script], {
-  encoding: 'utf8', timeout: 10000, cwd: ROOT, input: stdin, env: ISOLATED_ENV,
+  encoding: 'utf8', timeout: 10000, cwd: ROOT, input: stdin, env: isolatedEnv(),
 });
 const text = (r) => String(r.stdout || '') + String(r.stderr || '');
 
@@ -219,7 +264,7 @@ test('argv[1] 指向不存在的路径时，import 入口不抛（realpath 失�
     "console.log('IMPORTED');",
   ].join('\n');
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
-    encoding: 'utf8', timeout: 30000, cwd: ROOT, env: ISOLATED_ENV,
+    encoding: 'utf8', timeout: 30000, cwd: ROOT, env: isolatedEnv(),
   });
   assert.equal(r.status, 0,
     `argv[1] 不存在时 import 入口抛了 —— realpathSync 的异常没有被吞掉。stderr: ${String(r.stderr || '')}`);
@@ -238,7 +283,7 @@ test('被 import 时入口不执行 main（修复不能把「不执行」也修�
     "console.log(Object.keys(m).length > 0 ? 'imported-quietly' : 'no-exports');",
   ].join('\n');
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
-    encoding: 'utf8', timeout: 30000, cwd: ROOT, env: ISOLATED_ENV,
+    encoding: 'utf8', timeout: 30000, cwd: ROOT, env: isolatedEnv(),
   });
   assert.equal(r.status, 0, `import 入口失败：${String(r.stderr || '')}`);
   assert.equal(String(r.stdout || '').trim(), 'imported-quietly',

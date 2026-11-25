@@ -17,6 +17,7 @@
 | 「AI 问没问、先读后问还是先问后读」 | [spec/2026-11-14-question-audit.md](spec/2026-11-14-question-audit.md) | 四条判据哪条能判哪条不能 + `overwatch.config.json` 校验规则 + 本机实测分布 |
 | 「这东西是什么形态、装在哪、怎么升级」 | [adr/0003-application-not-plugin.md](adr/0003-application-not-plugin.md) | **应用**：不是插件、不是配置库、不是样板间；逐条取代 ADR-0001 |
 | 「为什么只能手动接力」 | [adr/0001-config-only.md](adr/0001-config-only.md) | 纯配置库的取舍与代价（**定位部分已被 ADR-0003 取代**） |
+| 「Stop hook 到底能保证什么、不能保证什么」 | [adr/0005-stop-hook-scope.md](adr/0005-stop-hook-scope.md) | 它验的是「说过的检查做了没有」，**不是**「活儿做完了没有」；附 412 条台账的实测拆分 |
 | 「**现在到底什么是真的**」 | [FACTS.md](FACTS.md) | 逐条实测的事实清单：证据等级 + 复跑命令 + 已被推翻的结论 |
 | 「这条结论还成立吗」 | [research/README.md](research/README.md) | 研究索引 + **已推翻结论清单** |
 | 「这个设计做出来了吗」 | [design/README.md](design/README.md) | 设计存档索引，**全部未实现** |
@@ -52,6 +53,7 @@
 | `checkCapabilities()` | 能力清单里的每条命令必须可执行；README 必须指向它 | 改命令或补入口 |
 | `checkLinks()` | 文档相对链接不能悬空 | 修链接 |
 | `checkDesignIndex()` | 设计文档必须在索引里、且索引写明「未实现」 | 登记状态 |
+| `checkEvidenceTaxonomy()` | 红队三档（`block`/`accept`/`advisory`）与证据强/弱 `kind` 的**表格行**必须与 `delivery-verdict.mjs` 的枚举逐档一致；「缺省不是 `advisory`」那一句必须存在 | 补规范表格行，或改代码枚举 |
 | `checkChangelog()` | 改了源码/规格却没有 CHANGELOG 条目 | 补条目 |
 
 这些检查的共同思路：**把「记得同步」换成「不同步就红」**。它们在每次提交前跑，

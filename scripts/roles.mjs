@@ -304,6 +304,37 @@ export function readonlyOf(frontmatter) {
   return truthyFlag(frontmatter && frontmatter.readonly);
 }
 
+/** 只读角色的 `Bash` 声明。**合法取值只有一个**：`read-only`。
+ *
+ *  ## 为什么需要这个字段（2026-11-23，`oversight-verifier`）
+ *
+ *  `checkAgents()` 的规则是「`readonly: true` 的角色不得拥有 `Bash`」，理由是
+ *  「`Bash` 能写盘，而 `Write` 至少可以从路径上限制」。这条规则在一个场景下是错的：
+ *  **核验类角色**的职责就是跑只读命令去核事实（`grep` / `wc` / `node --test`），
+ *  没有 `Bash` 它物理上做不了这件事，只能退化成「读一遍源码觉得它对」—— 那是判断，
+ *  不是核验。
+ *
+ *  ## 为什么不是「放开 Bash」
+ *
+ *  放开 `Bash` 会让六个只读角色全部获得写盘能力，而它们的职责里没有一条需要跑命令。
+ *  所以这里**不放开工具**，而是要求角色额外声明 `bashScope: read-only`：
+ *    · 写了 → `Bash` 合法，但正文必须同时给出「允许的命令」清单（`checkAgents()` 核这一条）；
+ *    · 没写 → 与修前逐字相同，`Bash` 仍然是违规。
+ *
+ *  这是**收紧**不是放松：修前「只读 + Bash」一律违规；修后要求多一个字段 + 一段清单。
+ *  一个漏写清单的角色照样红。
+ *
+ *  ## 认不出的值一律当「没写」
+ *
+ *  `bashScope: readonly` / `read-only-bash` / `r` 都不认 —— 与 `truthyFlag` 同一条理由：
+ *  拼错的值如果被当成「是」，一个本来该红的角色会静默变绿。 */
+export const BASH_SCOPES = Object.freeze(['read-only']);
+
+export function bashScopeOf(frontmatter) {
+  const v = String((frontmatter && frontmatter.bashScope) || '').trim().toLowerCase();
+  return BASH_SCOPES.includes(v) ? v : null;
+}
+
 /** 从 `name` 去前缀得 id。前缀不匹配时原样返回（别人的角色不必叫 oversight-*）。 */
 export function idFromName(name, agentPrefix = DEFAULT_AGENT_PREFIX) {
   const n = String(name || '').trim();
@@ -318,7 +349,7 @@ export function idFromName(name, agentPrefix = DEFAULT_AGENT_PREFIX) {
  * @param {string} [dir] 默认 `agentsDir()`（按包根探测两种布局；见该函数）
  * @param {{agentPrefix?: string}} [opts]
  * @returns {Array<{id:string, file:string, tools:string[], readonly:boolean,
- *                  forbiddenContext:string[], display:string, name:string}>}
+ *                  bashScope:string|null, forbiddenContext:string[], display:string, name:string}>}
  *   `file` 是绝对路径（读它用）；提示词里要打印**相对路径**，由调用方用 `displayPath()`
  *   算，绝不把本机路径写进任何会被发出去的东西。
  *   目录不存在时返回 `[]` —— 空注册表让下游「一个角色都不合法」，
@@ -379,6 +410,10 @@ function scanRolesDir(d, { agentPrefix = DEFAULT_AGENT_PREFIX } = {}) {
       file,
       tools,
       readonly: readonlyOf(fm),
+      // `bashScope`（2026-11-23）：只读角色要跑只读命令时的显式声明。
+      // 注册表把它带出来，是为了让「为什么这个只读角色能有 Bash」只有一个答案 ——
+      // 一份 .md 的 frontmatter 里写了 `bashScope: read-only`，且正文给了命令清单。
+      bashScope: bashScopeOf(fm),
       forbiddenContext,
       display: String(fm.display || '').trim() || id,
       name,

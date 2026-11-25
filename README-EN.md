@@ -13,7 +13,7 @@ Cross-session monitoring exists only so you can see how far this pass actually g
 ![CI](https://github.com/sqkl520/UntilDone/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4%20%C2%B7%20tests%2020.16%2B-blue?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
-![Tests](https://img.shields.io/badge/regression%20tests-1792%20passing-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/regression%20tests-2126-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 **Zero dependencies** · **Nothing to install** · **Evidence checking works without logging in** —
@@ -68,7 +68,7 @@ Cross-session monitoring exists only so you can see how far this pass actually g
 
 - **One entry point** — `overwatch.mjs` reports 8 prerequisite facts on a **1000 ms budget and says so when it overruns** (measured 1133 ms here; the last line prints "1133ms / budget 1000ms"), without scanning the corpus
 - **Start a session with the payload attached** — `launch`; `--dry-run` shows the exact command line first, `--verify` checks the payload only and needs no login
-- **Structural hard gate** — 23 checks (test-count reconciliation, document paths and commands, capability list, links, ledger format, …)
+- **Structural hard gate** — 30 checks (test-count reconciliation, document paths and commands, capability list, links, ledger format, …)
 - **Two ledgers** — `tasks/dev-findings.md` (out-of-scope findings), `tasks/accepted-deviations.md` (known deviations)
 
 > The **exact command** behind each capability lives in [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) —
@@ -183,9 +183,9 @@ ledger**; and **when it can't be judged, say so — never treat missing as evide
 | Layer | What it uses |
 |---|---|
 | Runtime | Node (≥ 18.20.4 for tools, ≥ 20.16.0 for tests), **no `package.json`, no `node_modules`** |
-| Size | 54 production scripts + 43 test files (1792 `test(` calls, reconciled by the hard gate against source) |
+| Size | 62 production scripts + 57 test files (2126 tests, reconciled by the hard gate against real registration) |
 | Surface | host hooks (`PreToolUse` / `Stop`) + command line + plain text / JSON output |
-| Roles | 12 markdown role definitions under `.claude/agents/` + 1 dispatch skill (loaded by the host directly) |
+| Roles | 13 markdown role definitions under `.claude/agents/` + 1 dispatch skill (loaded by the host directly) |
 | Storage | host transcripts are read-only; own state lives in `tasks/runs/` (gitignored) and a user state directory |
 | CI | GitHub Actions: [`validate.yml`](.github/workflows/validate.yml) — structure gate + payload layout + full test suite |
 
@@ -386,9 +386,9 @@ This boundary is spelled out because it is easily mistaken for "not built yet":
 **Requirements**: Node ≥ 18.20.4 (tools) / ≥ 20.16.0 (tests).
 
 ```bash
-node scripts/check-structure.mjs     # structural gate: 23 checks, green only at 0 violations
-node scripts/check-links.mjs         # relative doc links resolve (170 .md files, 0 broken)
-node --test scripts/                 # full regression: 43 files, 1792 tests
+node scripts/check-structure.mjs     # structural gate: 30 checks, green only at 0 violations
+node scripts/check-links.mjs         # relative doc links resolve (174 .md files, 0 broken)
+node --test scripts/                 # full regression: 57 files, 2126 tests
 ```
 
 `check-structure.mjs` and the full test suite **must both be green before a commit**. Both run in
@@ -414,9 +414,8 @@ test or the gate must go red.
 - **When reporting a bug, include**: the output of `node scripts/overwatch.mjs`, `node --version`, and reproduction steps. It only reports facts, which is exactly what triage needs.
 - **Please open an Issue before writing code**, so the work isn't wasted.
 - **Security reports**: **do not open a public issue** — see [`SECURITY.md`](SECURITY.md).
-- **Running the tests**: `node --test scripts/` (1792 regression tests; **that number is reconciled by the
-  hard gate against `test(` calls in source, so a wrong value goes red** — copy it, don't hand-count.
-  The live run reports a few more, because subtests are counted separately).
+- **Running the tests**: `node --test scripts/` (2126 regression tests; **that number is reconciled by the
+  hard gate against real registration in source, so a wrong value goes red** — copy it, don't hand-count.
 
 > **No contributor wall and no star chart here, on purpose.** The star count is 0, so a star-history
 > chart would render empty, and the two GitHub accounts in the commit log are the same person. Both

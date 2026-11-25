@@ -126,7 +126,13 @@ function syncTestCount(dir) {
   const sites = [
     ['README.md', /（(\d+)\s*条回归测试/g],
     ['CLAUDE.md', /全量回归测试（(\d+)\s*条/g],
-    ['docs/GUIDE.md', /(\d+)\s*项全绿/g],
+    // **这里的正则必须与 `check-structure.mjs` 的 `TALLY_SITES` 同形。**
+    // 2026-11-24 实测：GUIDE 那处的口径从「N 项全绿」改成了「N 条已注册」
+    // （DF-090：旧正则的形状在逼文档断言执行结果），而本文件仍匹配旧串 →
+    // 「未改动的副本应当绿」这条对照用例红了，报的却是「文档数字对不上」。
+    // 判据漂移的表现是「对照组变红」，而红的那句话指向的是别人的错 —— 这正是
+    // 本仓反复记的那类「判据自己错、报出来的却是被判断对象」。
+    ['docs/GUIDE.md', /(\d+)\s*条已注册/g],
     ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/g],
     // README 的徽章与正文各有一处，两个正则都覆盖。
     // 徽章不带 `passing` 字样：本仓有 2 条按平台 skip 的用例，写 `passing` 会把
@@ -220,10 +226,22 @@ test('元检查 · 表行还在但调用被跳过 → 门必须红（真删 disp
     // 这是决定性实验的更隐蔽形态：`CHECKS` 表完整，只有运行循环里不再调它。
     // 只对 `CHECKS` ↔ `ran` 的元检查**抓不到**「表行被删」那一半，
     // 所以两个用例都要有 —— 它们守的是元检查的两条不同的腿。
+    //
+    // ## 锚点为什么是 `CURRENT_CHECK = name;` 而不是 `fn();`
+    //
+    // 2026-11-24（DF-051）：运行循环加了适用域过滤，`fn()` 前面多了
+    // `if (PRODUCT_REPO === false && domain === 'product') { … continue; }`。
+    // 原锚点 `if (disabled.has(name)) continue;\n  fn();` 因此匹配不到，本用例
+    // 以「前提失效」的形式红了 —— 那是**夹具的失败长得像被测代码的失败**（本文件
+    // 自己在别处记过这个坑）。
+    //
+    // 现在锚在**每一轮都必须执行的那一行**（`CURRENT_CHECK = name;`）：它与域过滤
+    // 无关，只要循环还在跑就一定在。注射点选 `continue` 之后、`fn()` 之前，
+    // 于是「表行还在、只是这一条不跑」这个形态被精确复现。
     const before = readGate(dir);
-    const anchor = 'for (const [name, fn] of CHECKS) {\n  if (disabled.has(name)) continue;\n  fn();';
+    const anchor = '  CURRENT_CHECK = name;\n  fn();';
     const after = before.replace(anchor,
-      'for (const [name, fn] of CHECKS) {\n  if (disabled.has(name)) continue;\n  if (name === \'ledger\') continue;\n  fn();');
+      '  if (name === \'ledger\') continue;\n  CURRENT_CHECK = name;\n  fn();');
     assert.notEqual(after, before, '没有匹配到运行循环 —— 本用例的前提失效了');
 
     writeGate(dir, after);

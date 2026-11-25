@@ -1444,6 +1444,22 @@ function runHookProcess(input, env = {}, extraArgs = []) {
     timeout: 20000,
     env: { ...process.env, ...env },
   });
+  // **超时不许伪装成「输出为空」**（DF-105，2026-11-25）。
+  //
+  // 现场：全量并发跑到这里偶发变红，报的是
+  //   `The input did not match the regular expression /marker state: exists/. Input: ''`
+  // —— 断言以为「脚本没打印那一行」，实际是 `spawnSync` 被 20 秒超时 kill 了，
+  // `stdout` 是空串。两件事的处置相反（前者去查脚本，后者去查机器负载），
+  // 而**空输出让它们长得一模一样**。
+  //
+  // 这与本仓记过的 DF-099 / DF-102 / DF-104 是同一形态：
+  // 判据采到的都是真事实（确实没读到那行），结论那一步把「没读到」说成了
+  // 「它没写」。这里把 `signal` / `error` 原样抛出去，让失败的第一句话就是真原因。
+  if (r.error || r.signal) {
+    throw new Error(`hook 进程超时或被信号终止（signal=${r.signal} error=${r.error && r.error.message}）`
+      + ` args=${JSON.stringify(extraArgs)} —— 这不是脚本的输出问题，是它没能跑完`
+      + '（本机在多测试并发时会压满 CPU，见 DF-105）');
+  }
   return { status: r.status, stdout: (r.stdout || '').trim(), stderr: (r.stderr || '').trim() };
 }
 

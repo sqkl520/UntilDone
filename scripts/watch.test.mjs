@@ -17,6 +17,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn, spawnSync } from 'node:child_process';
 
 import {
   dedupeKey, reasonClass, canNotify, recordSent, emptyState, loadState, saveState,
@@ -27,14 +28,20 @@ import {
   observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
   traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS,
   claimOwnership, readOwner, ownerPath, askedCandidates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
-  procWitnessPath, writeProcWitness, readProcWitness, judgeProcess, PROC_TOLERANCE_MS,
+  procWitnessPath, writeProcWitness, readProcWitness, judgeProcess, PROC_TOLERANCE_MS, processStartedAt,
+  pidIsAlive, probeFailureReason, BEAT_TIMEOUT_MS,
   requestIdTime, lastTimelineStateTime, resolveJobEventTime, BLOCKED_MAX_AGE,
   readLogHealth, logHealthPath, LOG_HEALTH_FILE,
-  convergeBySession,
+  convergeBySession, runAskedScanInChild, checkSingleton,
 } from './watch.mjs';
+import {
+  makeNonce, livenessEndpoint, startLivenessServer, probeLiveness, parseBeatFrame, stateOfErrorCode,
+} from './proc-liveness.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
 const MIN = 60_000;
+/** 本文件所在目录（= `scripts/`）。哨兵要起真进程跑 `watch.mjs` 的 CLI。 */
+const HERE = import.meta.dirname;
 
 // ── 去重（AC2）────────────────────────────────────────────────────────
 
@@ -2205,45 +2212,114 @@ test('probeWaiting 的候选带上 waitingFor', () => {
 });
 
 // ── 存活指标：进程活着 ≠ 在工作（DF-023）──────────────────────────
+//
+// **2026-11-24（DF-092）：这一组改成 async。** `healthCheck` 现在是异步的 ——
+// 进程层要读判活端点，而同步读管道在「守护进程冻结」时会永久阻塞（实测）。
+// 这里**一条断言都没改**，只加 `await`：测的还是同一件事。
 
-test('healthCheck：刚跑过 → 健康', () => {
+test('healthCheck：刚跑过 → 健康', async () => {
   const now = Date.now();
-  const r = healthCheck({ lastJobsScanAt: new Date(now - 30_000).toISOString(),
+  const r = await healthCheck({ lastJobsScanAt: new Date(now - 30_000).toISOString(),
     lastProbeAt: new Date(now - 60_000).toISOString() }, { nowMs: now });
   assert.equal(r.healthy, true);
   assert.deepEqual(r.reasons, []);
 });
 
-test('healthCheck：抓得住「进程活着但六小时没扫描」——这正是 DF-023', () => {
+test('healthCheck：抓得住「进程活着但六小时没扫描」——这正是 DF-023', async () => {
   const now = Date.now();
   const old = new Date(now - 6 * 3600e3).toISOString();
-  const r = healthCheck({ lastJobsScanAt: old, lastProbeAt: old }, { nowMs: now });
+  const r = await healthCheck({ lastJobsScanAt: old, lastProbeAt: old }, { nowMs: now });
   assert.equal(r.healthy, false, '六小时不动必须判不健康');
   assert.ok(r.reasons.some((x) => x.includes('jobs')));
   assert.ok(r.reasons.some((x) => x.includes('probe')));
 });
 
-test('healthCheck：超过 1 个周期但不超 3 个 → 仍算健康（单次 tick 变慢是正常的）', () => {
+test('healthCheck：超过 1 个周期但不超 3 个 → 仍算健康（单次 tick 变慢是正常的）', async () => {
   const now = Date.now();
-  const r = healthCheck({
+  const r = await healthCheck({
     lastJobsScanAt: new Date(now - 30_000).toISOString(),       // 2 个周期（15s × 2）
     lastProbeAt: new Date(now - 10 * 60_000).toISOString(),     // 2 个周期（5min × 2）
   }, { nowMs: now });
   assert.equal(r.healthy, true, '2 个周期不该误报——扫描慢会把 tick 推后');
 });
 
-test('healthCheck：从未运行过 → 不健康，且说明是「从未」而不是「很久」', () => {
-  const r = healthCheck({}, { nowMs: Date.now() });
+test('healthCheck：从未运行过 → 不健康，且说明是「从未」而不是「很久」', async () => {
+  const r = await healthCheck({}, { nowMs: Date.now() });
   assert.equal(r.healthy, false);
   assert.ok(r.reasons.some((x) => x.includes('从未运行')));
 });
 
-test('formatHealth：不健康时明确区分「进程死了」与「进程卡住」', () => {
+test('formatHealth：不健康时明确区分「进程死了」与「进程卡住」', async () => {
   const now = Date.now();
-  const out = formatHealth(healthCheck({ lastJobsScanAt: new Date(now - 6 * 3600e3).toISOString(),
+  const out = formatHealth(await healthCheck({ lastJobsScanAt: new Date(now - 6 * 3600e3).toISOString(),
     lastProbeAt: new Date(now - 6 * 3600e3).toISOString() }, { nowMs: now }));
   assert.ok(out.includes('没有在工作'));
   assert.ok(out.includes('不代表进程死了'), '必须说清这不是进程崩溃，而是卡住');
+});
+
+// ── DF-102：一轮 tick 跑 200 秒时，`--health` 不许说「卡住了」 ───────────
+//
+// 现场（2026-11-25 实测）：守护进程 20:55:42 启动，第一个 tick 扫全量语料到
+// 20:59:02 才结束 —— **200 秒**。而 jobs 层上限是 45 秒（15s × 3）。
+// 这 200 秒里 `--health` 报「进程还在…但心跳已停 —— 它卡住了，重启前先看日志」。
+// 判据采到了真事实（心跳确实旧），结论那一步没有重新想一遍：
+// 它手上还有一条更强的证据 —— **判活端点正在应答 beat** —— 而它没用上。
+//
+// 锐评 2026-11-24 把这条列为「最该重做的一条」。
+// 三条一起钉：进行中会说进行中、真卡死仍然说卡死、残留标记不许被认。
+
+test('DF-102：tick 正在进行中时，不许把「心跳旧」说成「卡住了」', async () => {
+  const now = Date.now();
+  const r = await healthCheck({
+    lastJobsScanAt: new Date(now - 200_000).toISOString(),   // 200 秒前，远超 45 秒上限
+    lastProbeAt: new Date(now - 40 * 60_000).toISOString(),  // 40 分钟，也超 probe 的 15 分钟上限
+    tickStartedAt: new Date(now - 198_000).toISOString(),    // 但这一轮 198 秒前就开始了
+  }, { nowMs: now });
+  assert.deepEqual(r.reasons, [], '正在跑的一轮不该产出任何「没在工作」的理由');
+  assert.equal(r.healthy, true, 'tick 在推进 = 在工作，健康');
+  // jobs 上限 45 秒、probe 上限 15 分钟 —— 两条都过期，两条都应标成进行中。
+  assert.equal(r.inTick.length, 2, `jobs 与 probe 都应标成进行中，实际 ${JSON.stringify(r.inTick)}`);
+});
+
+test('DF-102：真卡死时仍然要说卡死 —— 标记不能变成免责符', async () => {
+  const now = Date.now();
+  // 标记停在 6 小时前，而心跳也是 6 小时前：那一轮**早就死了**，不是「正在跑」。
+  const oldIso = new Date(now - 6 * 3600e3).toISOString();
+  const r = await healthCheck({
+    lastJobsScanAt: oldIso, lastProbeAt: oldIso, tickStartedAt: oldIso,
+  }, { nowMs: now });
+  assert.equal(r.healthy, false, 'tick 标记与心跳同龄 = 那一轮没跑完就死了，必须报不健康');
+  assert.ok(r.reasons.some((x) => x.includes('jobs')), `理由要指出 jobs，实际 ${JSON.stringify(r.reasons)}`);
+});
+
+test('DF-102：残留标记（tick 开始时刻早于该层上次推进）不许被认成「进行中」', async () => {
+  const now = Date.now();
+  const r = await healthCheck({
+    // 心跳 100 秒前推进过 —— 说明**那一轮已经跑完了**。
+    lastJobsScanAt: new Date(now - 100_000).toISOString(),
+    lastProbeAt: new Date(now - 100_000).toISOString(),
+    // 而标记停在 300 秒前：比心跳还早。若认它，就会把一个跑了 5 分钟的
+    // 死循环说成「正在进行」—— 判据必须是时间先后，不是「有没有这个字段」。
+    tickStartedAt: new Date(now - 300_000).toISOString(),
+  }, { nowMs: now });
+  assert.equal(r.healthy, false, '标记早于心跳 = 残留，不许当成正在跑');
+  assert.deepEqual(r.inTick, [], '不该有任何层被标成进行中');
+});
+
+test('DF-102：formatHealth 在「进行中」时给出「什么都别做」，与「先看日志」明确不同', async () => {
+  const now = Date.now();
+  const out = formatHealth(await healthCheck({
+    lastJobsScanAt: new Date(now - 200_000).toISOString(),
+    lastProbeAt: new Date(now - 40 * 60_000).toISOString(),
+    tickStartedAt: new Date(now - 198_000).toISOString(),
+  }, { nowMs: now }));
+  assert.ok(out.includes('正在跑一轮'), `要点明正在进行，实际输出：\n${out}`);
+  assert.ok(out.includes('什么都别做'), `处置必须是「等」，实际：\n${out}`);
+  // 不能断言「整段不含『卡住了』」——处置说明里有一句「若超时仍未推进，再按卡住了处理」，
+  // 那是**条件句**，是正确内容。要钉的是「没有把它当结论」：
+  // 结论行必须是「正在跑一轮」，而不是「没有在工作」。
+  assert.ok(!out.includes('判定：**没有在工作**'), `不许把进行中判成没在工作：\n${out}`);
+  assert.ok(!out.includes('先看日志再重启'), '进行中的处置不是「先看日志」，是「等」');
 });
 
 // ── 2026-11-12 日志轮转失败 ────────────────────────────────────────────
@@ -2392,14 +2468,14 @@ test('DFS-05 主文件写失败 → 落应急文件，内容不丢', () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('DFS-06 healthCheck 读 log-health：日志坏了必须让 --health 报不健康', () => {
+test('DFS-06 healthCheck 读 log-health：日志坏了必须让 --health 报不健康', async () => {
   const now = Date.now();
   const fresh = { lastJobsScanAt: new Date(now - 10_000).toISOString(), lastProbeAt: new Date(now - 60_000).toISOString() };
 
-  const ok = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now).toISOString() } });
+  const ok = await healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now).toISOString() } });
   assert.equal(ok.healthy, true);
 
-  const bad = healthCheck(fresh, { nowMs: now, logHealth: { healthy: false, kind: 'write-failed', detail: 'ENOSPC', streak: 3 } });
+  const bad = await healthCheck(fresh, { nowMs: now, logHealth: { healthy: false, kind: 'write-failed', detail: 'ENOSPC', streak: 3 } });
   assert.equal(bad.healthy, false, '调度层健康 + 日志层坏了 → 整体不健康');
   assert.ok(bad.reasons.some((r) => r.startsWith('log：')), `必须把日志故障写进 reasons，实际：${bad.reasons.join('|')}`);
   assert.ok(bad.reasons.some((r) => r.includes('ENOSPC')));
@@ -2407,13 +2483,13 @@ test('DFS-06 healthCheck 读 log-health：日志坏了必须让 --health 报不�
   // 未传入 = 调用方不关心日志层。此时**不加这一层**，保持旧输出形状。
   // 早先版本加了一个 verified:false 的层，而 TUI 的 checklist 把它渲染成
   // 「log 从未」——把「没检查」读成「从没运行」。
-  const unknown = healthCheck(fresh, { nowMs: now });
+  const unknown = await healthCheck(fresh, { nowMs: now });
   assert.equal(unknown.healthy, true, '未传入时不影响原有判定');
   assert.ok(!unknown.layers.some((l) => l.name === 'log'),
     '未传入时不得加日志层：TUI 会把它渲染成「log 从未」');
 
   // 传 null（health 文件不存在）才加层，并明说「尚无记录」
-  const never = healthCheck(fresh, { nowMs: now, logHealth: null });
+  const never = await healthCheck(fresh, { nowMs: now, logHealth: null });
   assert.ok(never.layers.some((l) => l.name === 'log' && l.verified === false));
   assert.ok(formatHealth(never).includes('尚无日志健康记录'));
 });
@@ -2530,6 +2606,133 @@ test('claimOwnership：末尾斜杠不影响判定', () => {
     claimOwnership(dir, '/repo/a', { nowMs: now });
     assert.equal(claimOwnership(dir, '/repo/a/', { nowMs: now + 1 }).conflict, false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── DF-101：单例守卫。「已经有一个在跑」必须被证实，不是被推断 ──────────
+//
+// 现场（2026-11-25）：本机同时跑着 9 个 watch.mjs，全写同一份 state.json。
+// watch.log 每分钟 4–10 条 tick（应 4 条）；owner.json 与 proc.json 被不同进程
+// 互相覆盖；`--health` 指着一个不是守护进程的 PID 做判活。
+// 原来的处理是 log.warn 一句然后两份继续跑 —— 一行没人看的日志等于静默失效。
+//
+// 这组测试的核心是**两个方向的错误都要拦住**：
+//   拦得太松 = 原来的 bug；拦得太紧 = 一个误判的 timeout 让整台机器没有监控。
+
+/** 造一份「另一个进程正拿着这个目录」的见证。pid 用一个几乎不可能存在的值。 */
+function seedWitness(dir, { pid = 999_999, nonce = 'deadbeefdeadbeefdeadbeef' , endpoint = '\\\\.\\pipe\\untildone-test-seed', startedAt = new Date(Date.now() - 60_000).toISOString() } = {}) {
+  writeProcWitness(dir, { pid, startedAt, nonce, endpoint });
+  return { pid, startedAt, nonce, endpoint };
+}
+
+test('DF-101：端点应答 beat 且归属一致 → 拒绝启动（这是唯一该拦的情形）', async () => {
+  const dir = tmp();
+  try {
+    const w = seedWitness(dir);
+    const r = await checkSingleton(dir, {
+      probe: async () => ({ state: 'beat', frame: { nonce: w.nonce, pid: w.pid, startedMs: Date.parse(w.startedAt), beats: 7 } }),
+      isAlive: () => true,
+    });
+    assert.equal(r.guarded, true, `端点应答了且就是它，必须拦：${JSON.stringify(r)}`);
+    assert.equal(r.verdict, 'stuck');
+    assert.match(r.reason, /已经有一个守护进程在跑/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：端点不在 + PID 也没了 → 放行（该接手）', async () => {
+  const dir = tmp();
+  try {
+    seedWitness(dir);
+    const r = await checkSingleton(dir, {
+      probe: async () => ({ state: 'not-found' }),
+      isAlive: () => false,
+    });
+    assert.equal(r.guarded, false, '上一个已经死了，必须放行，否则永远起不来');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：判不了（timeout/eperm）→ 放行，只留痕 —— 宁可多跑一个也不让监控停掉', async () => {
+  const dir = tmp();
+  try {
+    seedWitness(dir);
+    for (const state of ['timeout', 'eperm', 'parse-failed', 'error']) {
+      const r = await checkSingleton(dir, {
+        probe: async () => ({ state }),
+        isAlive: () => true,   // PID 还在，但端点说不出话 —— 仍然不许拦
+      });
+      assert.equal(r.guarded, false, `${state} 是「判不了」，不是「确定在跑」，不许借此拦启动`);
+      assert.match(r.reason, /无法确认/, `${state} 的理由要说清是判不了：${r.reason}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：旧版见证（没有端点）→ 不拦 —— 「号还在」不足以断言它是守护进程', async () => {
+  const dir = tmp();
+  try {
+    writeProcWitness(dir, { pid: 999_999, nonce: null, endpoint: null });
+    const r = await checkSingleton(dir, { isAlive: () => true, probe: async () => ({ state: 'not-found' }) });
+    assert.equal(r.guarded, false, '旧见证只有 PID，不能据此拒绝启动');
+    assert.match(r.reason, /没有判活端点/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：见证里的 PID 就是自己 → 放行（--once 先 claim 再检查时不许自锁）', async () => {
+  const dir = tmp();
+  try {
+    writeProcWitness(dir, { pid: process.pid, nonce: 'x', endpoint: '\\\\.\\pipe\\self' });
+    const r = await checkSingleton(dir, {
+      selfPid: process.pid,
+      probe: async () => ({ state: 'beat', frame: { nonce: 'x', pid: process.pid, startedMs: Date.now(), beats: 1 } }),
+      isAlive: () => true,
+    });
+    assert.equal(r.guarded, false, '不能把自己当成「另一个守护进程」');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：空目录（首次运行）→ 放行', async () => {
+  const dir = tmp();
+  try {
+    const r = await checkSingleton(dir, { probe: async () => ({ state: 'not-found' }), isAlive: () => false });
+    assert.equal(r.guarded, false);
+    assert.match(r.reason, /没有进程见证/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101：端点应答了但 nonce 不符（PID 被复用）→ 放行', async () => {
+  const dir = tmp();
+  try {
+    const w = seedWitness(dir);
+    const r = await checkSingleton(dir, {
+      // 帧里的 nonce 是**别人**的 —— 说明这个端点不是见证里那个进程的。
+      probe: async () => ({ state: 'beat', frame: { nonce: 'someone-else', pid: w.pid, startedMs: Date.parse(w.startedAt), beats: 3 } }),
+      isAlive: () => true,
+    });
+    assert.equal(r.guarded, false, 'nonce 不符 = 不是同一个进程，不该拦');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-101 接线：守卫必须在 startWatch 里、且在**建判活端点之前**', () => {
+  // 上面七条测的是 `checkSingleton` 本身。**但「它判对了」与「启动路径用它」
+  // 是两件事** —— DF-096 记过这个坑：把接线拆掉，那七条仍然全绿。
+  //
+  // 而这里有一个**比「有没有调用」更强的约束**：位置。第一版把它放进 `runTick`，
+  // 于是第二个实例 ① 先把自己的判活端点建好 ② 然后每 15 秒被拒一次、永不退出
+  // （实测 `timeout 40` 杀掉，exit=124）。两条都必须被钉住。
+  const src = readFileSync(join(import.meta.dirname, 'watch.mjs'), 'utf8');
+  const code = src.split('\n')
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n');
+  const guardAt = code.indexOf('await checkSingleton(');
+  const serverAt = code.indexOf('await startLivenessServer(');
+  assert.ok(guardAt > 0, 'startWatch 里必须调 checkSingleton（守卫没接上）');
+  assert.ok(serverAt > 0, '找不到 startLivenessServer 调用点，这条断言本身要更新');
+  assert.ok(guardAt < serverAt,
+    `守卫必须在建判活端点之前（guard@${guardAt} vs server@${serverAt}）—— `
+    + '反了就会先注册端点再拒绝，一个该退出的进程不该留下监听');
+  // 守卫只该出现在 startWatch：`runTick` 里来一份就会每 15 秒重试一次、永不退出。
+  assert.equal(code.split('await checkSingleton(').length - 1, 1,
+    'checkSingleton 只许在启动路径上调一次；放进 runTick 会让被拒的实例永不退出');
+  assert.match(code, /r\.refused === 'already-running'\) process\.exitCode = 4/,
+    '被拒时必须非零退出：退出码 0 会让调用方把「什么都没启动」当成成功');
 });
 
 // ── ASKED 接入轮询（2026-11-01）────────────────────────────────────
@@ -2979,11 +3182,44 @@ test('空收件箱但守护进程没跑 → 退出码不为 0（调用方必须�
 // 所以见证文件里除了 pid 还要写 `startedAt`（进程启动时刻），health 时双向核对。
 //
 // 判据与它的误判边界写在 `judgeProcess()` 的注释里；下面这组用例逐条钉住。
+//
+// ## 2026-11-24：这 5 条注入假探针（DF-090 / AC-4）
+//
+// 本组原先走真探针（`spawnSync('powershell', …Get-Process…StartTime)`），实测单条
+// **5-9 秒** —— 而它们要证明的是 `judgeProcess` / `healthCheck` 的**分支逻辑**：
+//   「探针答了而且就是它 → stuck」「对不上 → reused」「心跳停了才说话」。
+// 这三件事与「探针怎么拿到那个时刻」正交。真探针只有一个可观察结果，
+// 却被用来验证分支，代价是每次全量跑多花 40 秒，而且**探针一慢这组就变红** ——
+// 红的是环境，不是被测逻辑，于是红警被驯化成噪音（DF-026 记的就是这件事）。
+//
+// **判据（AC-4 的否决条件）：把探针实现改坏，这 12 条必须仍然全绿。**
+// 所以这里注入 `probe`（DF-092 之后判活证据的唯一来源），不注入判据本身：
+// 分支逻辑、nonce / pid / started 三道核对、文案全部照测，只有「怎么连上端点」
+// 那一层被替换。探针本身有没有真值由下面的**哨兵**单独验（它坏了会显式报红）。
+//
+// 曾经有一版把这 5 条写成「起真端点、真连」—— 它更快（~5ms）也更真，但**测的是探针**：
+// 实测把 `probeLiveness` 改成永远返回 timeout，12 条里 5 条变红。那不是验收要求的
+// 「逻辑不依赖环境」，而是把哨兵的活摊到了每一分支用例上。真端点覆盖搬去了哨兵那一节。
 
-test('DF-028 负向①：PID 不存在 → 必须报「已退出」，而不是「卡住」', () => {
+/** 假探针：回答一帧 beat。`frame` 里给什么，`judgeProcess` 就按什么核对。
+ *
+ *  形状与 `probeLiveness` 的返回值一致（`{ state, ms, frame }`），
+ *  所以 `judgeProcess` 走的还是同一条代码路径 —— 被替换的只有「读管道」那一步。 */
+const fakeProbe = (frame) => async () => ({ state: 'beat', ms: 1, frame });
+
+/** 与本进程一致的见证三元组 + 一帧如实回答它的 beat。 */
+function selfWitness({ startedAt = processStartedAt(), nonce = makeNonce(), endpoint = 'test-endpoint' } = {}) {
+  const pid = process.pid;
+  return {
+    witness: { pid, startedAt, nonce, endpoint },
+    probe: fakeProbe({ nonce, pid, startedAt, startedMs: Date.parse(startedAt), beats: 1 }),
+  };
+}
+
+test('DF-028 负向①：PID 不存在 → 必须报「已退出」，而不是「卡住」', async () => {
   const now = Date.now();
   // 999999 在 Windows 上不存在（实测 process.kill(999999, 0) 抛 ESRCH）
-  const v = judgeProcess({ pid: 999999, startedAt: new Date(now - 3 * 86400e3).toISOString() },
+  const v = await judgeProcess({ pid: 999999, startedAt: new Date(now - 3 * 86400e3).toISOString() },
     { nowMs: now });
   assert.equal(v.alive, false);
   assert.equal(v.verdict, 'gone', '「不在」与「卡住」必须分开报');
@@ -2991,43 +3227,111 @@ test('DF-028 负向①：PID 不存在 → 必须报「已退出」，而不是�
   assert.match(v.reason, new RegExp('999999'));
 });
 
-test('DF-028 负向②：PID 存在（用自己的 PID 模拟）→ 必须报「还在但卡住了」', () => {
+test('DF-028 负向②：PID 存在（用自己的 PID 模拟）→ 必须报「还在但卡住了」', async () => {
   const now = Date.now();
-  // startedAt 取当前进程推导出来的启动时刻，与真实值同源 → 应判 alive
-  const startedAt = new Date(now - process.uptime() * 1000).toISOString();
-  const v = judgeProcess({ pid: process.pid, startedAt }, { nowMs: now });
+  // 假探针如实回答见证里的三元组 → 必须走到 stuck 分支。
+  // 「帧里的 pid / nonce / started 与见证一致」这三道核对仍然照测，换掉的只有读管道那一步。
+  const w = selfWitness();
+  const v = await judgeProcess(w.witness, { nowMs: now, probe: w.probe });
   assert.equal(v.alive, true, '自己一定活着');
   assert.equal(v.verdict, 'stuck', '活着但心跳停了 = 卡住，不是退出');
   assert.match(v.reason, /卡住/);
   assert.match(v.reason, /先看日志/, '必须提示重启前先看现场');
+  // 判据必须是「读到一个 beat」，只连上不算 —— 这一条与探针真假无关。
+  assert.equal(v.state, 'beat', '判据必须是「读到一个 beat」，只连上不算');
+  assert.ok(Number.isInteger(v.beats) && v.beats >= 1);
 });
 
-test('DF-028 负向③：PID 被复用（同 PID、启动时间对不上）→ 不得判成「还活着」', () => {
+test('DF-028 负向③：PID 被复用（同 PID、启动时间对不上）→ 不得判成「还活着」', async () => {
   // 这是 PID 复用假阳性的核心用例。真实现场形如：
   //   守护进程 11-14 死掉，PID 31396 被别的进程拿走，health 却说「进程还在」。
   const now = Date.now();
-  const witnessStartedAt = new Date(now - 4 * 86400e3).toISOString();  // 4 天前启动
-  // pid 用真实存在的 pid（自己），但启动时间写 4 天前 —— 自己显然不是 4 天前启动的
-  const v = judgeProcess({ pid: process.pid, startedAt: witnessStartedAt }, { nowMs: now });
+  // 见证写成「4 天前启动」，而探针回答「持有者就是这个 PID、但今天启动」→ 差 4 天 → reused。
+  const witnessStartedAt = new Date(now - 4 * 86400e3).toISOString();
+  const nonce = makeNonce();
+  const w = selfWitness({ nonce, startedAt: processStartedAt() });
+  const v = await judgeProcess({ ...w.witness, startedAt: witnessStartedAt },
+    { nowMs: now, probe: w.probe });
   assert.notEqual(v.alive, true, '启动时间对不上就不能判「活着」—— 那正是 PID 复用的形态');
   assert.equal(v.verdict, 'reused', '必须单独报「PID 被别的进程占用了」');
   assert.match(v.reason, /复用|被别的进程/);
+  // 而且要说清是哪一道对不上 —— 否则用户无法判断该不该重启。
+  assert.match(v.reason, /启动时刻/, `理由要点名对不上的那一道：${v.reason}`);
 });
 
-test('DF-028：没有进程见证（老版本写的 owner.json）→ unverified，不得编造死活', () => {
-  const v = judgeProcess(null, { nowMs: Date.now() });
+test('DF-092 负向：nonce 不匹配 → 必须判 reused（这是 PID 复用免疫的主判据）', async () => {
+  // 这一条是 DF-092 的核心：判活不再靠时间容差，靠**端点名的 nonce 归属**。
+  // 构造方式：探针回答的是「本进程的三元组」，但见证里写的 nonce 是另一个。
+  // 那正是「PID 被复用，新进程用了它自己的 nonce」的形态。
+  const now = Date.now();
+  const w = selfWitness();
+  const forgeNonce = makeNonce();
+  assert.notEqual(forgeNonce, w.witness.nonce);
+  const v = await judgeProcess({ ...w.witness, nonce: forgeNonce }, { nowMs: now, probe: w.probe });
+  assert.notEqual(v.alive, true, 'nonce 对不上就不能判「活着」');
+  assert.equal(v.verdict, 'reused');
+  assert.match(v.reason, /nonce/, '理由必须点名 nonce 对不上（时间完全一致，只能靠归属判）');
+});
+
+test('DF-092 负向：端点关掉之后 → 不得判「还活着」（时间容差内也不行）', async () => {
+  // 关键反例：见证的所有时间字段都与真实进程**完全一致**，唯一变化是端点没了。
+  // 如果判据里有任何一条「PID 存在 + 时间对得上 → alive」的退路，这条就会绿。
+  const now = Date.now();
+  const w = selfWitness();
+  // 探针回答「端点不存在」—— 那正是关闭监听之后的形态（真端点确实会这样回答，
+  // 由哨兵那一节用真端点钉住）。
+  const v = await judgeProcess(w.witness, {
+    nowMs: now, probe: async () => ({ state: 'not-found', ms: 1 }),
+  });
+  assert.notEqual(v.alive, true, '端点没了就不是活着 —— PID 还在也不行');
+  // 本进程自己当然还活着，所以这里必然是「号还在但说不清」那一档，而不是 gone。
+  assert.equal(v.verdict, 'unknown');
+  assert.equal(v.state, 'not-found');
+  assert.match(v.reason, /判活端点不在了/);
+});
+
+test('DF-092 负向：端点答了但帧不是本协议 → parse-failed，不得当成 alive', async () => {
+  const now = Date.now();
+  const v = await judgeProcess(
+    { pid: process.pid, startedAt: processStartedAt(), nonce: 'a'.repeat(24), endpoint: 'x' },
+    { nowMs: now, probe: async () => ({ state: 'parse-failed', ms: 2, detail: 'garbage' }) });
+  assert.equal(v.alive, null, '读不懂的帧不是「活着」');
+  assert.equal(v.verdict, 'unknown');
+  assert.equal(v.state, 'parse-failed');
+  assert.match(v.reason, /不是本协议/);
+});
+
+test('DF-091 负向：端点连得上但读不到 beat → unresponsive，且文案说的是「超时」不是「无权限」', async () => {
+  // **这一条只能注入假 probe**：要造「连得上但不回 beat」得让监听进程的主线程冻住，
+  // 而冻住之后它连测试的断言也执行不了。注入是在**判据外侧**替换采证，不是放宽判据 ——
+  // 采证本身（真连、真读、真超时）由 `proc-liveness.test.mjs` 用真端点覆盖。
+  const now = Date.now();
+  const v = await judgeProcess(
+    { pid: process.pid, startedAt: processStartedAt(), nonce: 'b'.repeat(24), endpoint: 'x' },
+    { nowMs: now, probe: async () => ({ state: 'timeout', ms: BEAT_TIMEOUT_MS, detail: `${BEAT_TIMEOUT_MS}ms 内没有读到 beat` }) });
+  assert.equal(v.alive, null, '没有 beat 就不是活着 —— 但也不是死了');
+  assert.equal(v.verdict, 'unresponsive');
+  // **DF-091 的判据**：文案必须说「超时」。
+  assert.match(v.reason, /没有读出 beat|超时/,
+    `必须说清是超时，不能说成权限问题：${v.reason}`);
+  assert.doesNotMatch(v.reason, /无权限|命令不可用/,
+    '旧实现把超时说成「无权限 / 命令不可用」，那是把人往错方向送');
+});
+
+test('DF-028：没有进程见证（老版本写的 owner.json）→ unverified，不得编造死活', async () => {
+  const v = await judgeProcess(null, { nowMs: Date.now() });
   assert.equal(v.verdict, 'unverified');
   assert.equal(v.alive, null, 'null 而不是 false —— 「不知道」不等于「死了」');
 });
 
-test('DF-028：心跳正常时不误报 —— 进程层只在心跳停了的时候才说话', () => {
+test('DF-028：心跳正常时不误报 —— 进程层只在心跳停了的时候才说话', async () => {
   const now = Date.now();
   const fresh = {
     lastJobsScanAt: new Date(now - 30_000).toISOString(),
     lastProbeAt: new Date(now - 60_000).toISOString(),
   };
   // 故意给一个必然判「gone」的见证：心跳健康时它不该出现在结论里
-  const r = healthCheck(fresh, {
+  const r = await healthCheck(fresh, {
     nowMs: now,
     procWitness: { pid: 999999, startedAt: new Date(now - 86400e3).toISOString() },
   });
@@ -3036,10 +3340,10 @@ test('DF-028：心跳正常时不误报 —— 进程层只在心跳停了的时
   assert.equal(r.process, undefined, '健康时不产出 process 结论，免得调用方误读');
 });
 
-test('DF-028：心跳停了 + 进程已退出 → 结论里说「该重启」', () => {
+test('DF-028：心跳停了 + 进程已退出 → 结论里说「该重启」', async () => {
   const now = Date.now();
   const stale = new Date(now - 4 * 86400e3).toISOString();
-  const r = healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
+  const r = await healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
     nowMs: now,
     procWitness: { pid: 999999, startedAt: stale },
   });
@@ -3050,13 +3354,14 @@ test('DF-028：心跳停了 + 进程已退出 → 结论里说「该重启」', 
   assert.match(out, /重启/, '进程不在了处置是重启');
 });
 
-test('DF-028：心跳停了 + 进程还在 → 结论里说「卡住了，先看日志」', () => {
+test('DF-028：心跳停了 + 进程还在 → 结论里说「卡住了，先看日志」', async () => {
   const now = Date.now();
-  const startedAt = new Date(now - process.uptime() * 1000).toISOString();
+  const w = selfWitness();
   const stale = new Date(now - 4 * 86400e3).toISOString();
-  const r = healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
-    nowMs: now,
-    procWitness: { pid: process.pid, startedAt },
+  // 假探针回答见证里的三元组 → healthCheck 必须走到 proc 层并采纳 stuck；
+  // 它与「探针怎么拿到那一帧」正交（AC-4）。
+  const r = await healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
+    nowMs: now, procWitness: w.witness, judge: (wit, opts) => judgeProcess(wit, { ...opts, probe: w.probe }),
   });
   assert.equal(r.healthy, false);
   assert.equal(r.process.verdict, 'stuck');
@@ -3065,10 +3370,10 @@ test('DF-028：心跳停了 + 进程还在 → 结论里说「卡住了，先看
   assert.match(out, /先看日志/, '卡住的处置是先看现场，不能直接重启');
 });
 
-test('DF-028：proc 层不得印出 NaN —— 它没有周期，套通用格式会印「上限 NaN 天」', () => {
+test('DF-028：proc 层不得印出 NaN —— 它没有周期，套通用格式会印「上限 NaN 天」', async () => {
   const now = Date.now();
   const stale = new Date(now - 4 * 86400e3).toISOString();
-  const out = formatHealth(healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
+  const out = formatHealth(await healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
     nowMs: now,
     procWitness: { pid: 999999, startedAt: stale },
   }));
@@ -3078,19 +3383,29 @@ test('DF-028：proc 层不得印出 NaN —— 它没有周期，套通用格式
   assert.equal((out.match(/proc/g) || []).length, 1, 'proc 层只能渲染一次');
 });
 
-test('DF-028 写见证：claimOwnership 会带上 pid 与 startedAt，且跨调用稳定', () => {
+test('DF-028 写见证：claimOwnership 会带上 pid 与 startedAt，且跨调用稳定', async () => {
   const dir = tmp();
   try {
     const now = Date.now();
-    const a = claimOwnership(dir, '/repo/a', { nowMs: now });
+    // liveness 用**构造的三元组**，不起真端点：这条要验的是「claimOwnership 写进去的
+    // pid / startedAt / nonce / endpoint 能被 judgeProcess 判活」，不是端点能不能听（AC-4）。
+    const nonce = makeNonce();
+    const live = { nonce, endpoint: 'test-endpoint', ok: true };
+    const a = claimOwnership(dir, '/repo/a', { nowMs: now, liveness: live });
     assert.equal(a.owner.pid, process.pid, '见证必须记 pid');
     assert.ok(a.owner.startedAt, '见证必须记进程启动时刻');
     // 第二个 tick 不该改 startedAt —— 它描述的是**这个进程**，不是每次 tick
-    const b = claimOwnership(dir, '/repo/a', { nowMs: now + 15_000 });
+    const b = claimOwnership(dir, '/repo/a', { nowMs: now + 15_000, liveness: live });
     assert.equal(b.owner.startedAt, a.owner.startedAt, 'startedAt 是进程属性，不随 tick 变');
     assert.equal(b.owner.pid, a.owner.pid);
-    // 且它必须能被 judgeProcess 直接判成 alive
-    assert.equal(judgeProcess(readOwner(dir), { nowMs: now }).alive, true);
+    // 且它必须能被 judgeProcess 判成 alive（假探针如实回答写进 proc.json 的三元组）
+    const written = readProcWitness(dir);
+    const v = await judgeProcess(written, {
+      nowMs: now,
+      probe: fakeProbe({ nonce: written.nonce, pid: written.pid, startedAt: written.startedAt, startedMs: Date.parse(written.startedAt), beats: 1 }),
+    });
+    assert.equal(v.alive, true, '写进 proc.json 的 nonce / endpoint 必须能判活');
+    assert.equal(v.verdict, 'stuck');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -3120,21 +3435,282 @@ test('DF-028 写节流不得吞掉冲突：换了仓库必须照样落盘', () =
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('DF-028 进程见证独立于 owner.json：owner.json 是元数据，被别的仓库覆盖后仍能判死活', () => {
+test('DF-028 进程见证独立于 owner.json：owner.json 是元数据，被别的仓库覆盖后仍能判死活', async () => {
   const dir = tmp();
   try {
     const now = Date.now();
-    writeProcWitness(dir, { pid: process.pid, nowMs: now });
+    const nonce = makeNonce();
+    const live = { nonce, endpoint: 'test-endpoint', ok: true };
+    writeProcWitness(dir, { pid: process.pid, nowMs: now, nonce, endpoint: live.endpoint });
     const w = readProcWitness(dir);
     assert.equal(w.pid, process.pid);
-    // owner.json 被别人改写成别的仓库（同一台机器上的第二份克隆）
-    claimOwnership(dir, '/other/repo', { nowMs: now });
+    // owner.json 被别人改写成别的仓库（同一台机器上的第二份克隆）。
+    // **注意它同时会重写 proc.json**（那是它本来的职责：声明"哪个进程占着这个目录"）。
+    // 所以这次调用要把同一个判活端点传进去 —— 传 null 等于"我说我没有端点"，
+    // 那会把上面那份见证覆盖成"没有端点"，而这是**如实**的：
+    // 一个没有监听的进程不该冒领别人的端点。下面单独钉这一条。
+    claimOwnership(dir, '/other/repo', { nowMs: now, liveness: live });
     assert.equal(readProcWitness(dir).pid, process.pid, '进程见证不能被归属信息覆盖');
-    assert.equal(judgeProcess(readProcWitness(dir), { nowMs: now }).alive, true);
+    const written = readProcWitness(dir);
+    const v = await judgeProcess(written, {
+      nowMs: now,
+      probe: fakeProbe({ nonce: written.nonce, pid: written.pid, startedAt: written.startedAt, startedMs: Date.parse(written.startedAt), beats: 1 }),
+    });
+    assert.equal(v.alive, true, 'owner.json 被改写之后判活仍然成立（它读的是 proc.json）');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('DF-069：log-health 陈旧必须判不健康 —— 否则守护进程死后它永久报绿', () => {
+test('DF-092 负向：没有判活端点的进程不得冒领别人的端点（proc.json 的 nonce 会被写成 null）', async () => {
+  // 这条钉的是**如实降级的方向**：一个 `--once` 进程（跑完就退，没有监听）
+  // 调 `claimOwnership` 时不该保留上一份见证里的 nonce —— 那等于宣称
+  // 「我是那个端点的主人」，而它根本不在听。写 null 之后 `--health` 会说「判不了」，
+  // 那是真的；保留旧 nonce 会让它读到**上一个进程**的 beat，那才是假话。
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    const nonce = makeNonce();
+    writeProcWitness(dir, { pid: process.pid, nowMs: now, nonce, endpoint: 'test-endpoint' });
+    assert.ok(readProcWitness(dir).nonce, '前置：见证里有 nonce');
+    claimOwnership(dir, '/repo/a', { nowMs: now });   // 不传 liveness = 本进程没有端点
+    const w = readProcWitness(dir);
+    assert.equal(w.nonce, null, '没有端点的进程必须写 null，不能留着别人的 nonce');
+    assert.equal(w.endpoint, null);
+    const v = await judgeProcess(w, { nowMs: now });
+    assert.equal(v.verdict, 'unknown', '没有端点 → 判不了，而不是「活着」');
+    assert.match(v.reason, /没有判活端点/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── DF-090/DF-092 哨兵：真探针必须有真值（唯一两条不注入假探针的用例）──
+//
+// 上面那 12 条现在全部注入假 `probe` —— 那是对的（它们验的是分支逻辑），但它带来一个
+// 新洞：**探针实现在测试里就零覆盖了**。探针彻底坏掉，那 12 条仍然全绿。
+//
+// 这两条补那个洞，且分工明确：
+//   1. 进程内真端点：验「管道路径 / 帧格式 / nonce / 关掉之后」这一整层真的能用；
+//   2. 跨进程端到端：验 `--health` 真的连到一个活着的守护进程并给出结论。
+//
+// 判据只有一句：**拿不到真值就显式 fail 并说「探针超时/不可用」，不 skip。**
+// skip 会让「探针坏了」与「这条测试今天没用」在报告里同形 —— 那正是本仓反复吃亏的形态。
+
+test('DF-090 哨兵：真探针连真端点必须读到 beat —— 拿不到就 fail 并说探针不可用（不 skip）', async () => {
+  // 这条是**探针实现的唯一覆盖**。它不注入 probe、不构造帧：
+  // 起一个真的监听端点，用真的 `probeLiveness` 去连、去读。
+  // 失败的原因只可能是探针本身（端点由本进程建，pid 与 startedAt 都是真的）。
+  const nonce = makeNonce();
+  const endpoint = livenessEndpoint({ nonce, stateDir: tmp(), platform: process.platform });
+  const srv = await startLivenessServer({ endpoint, nonce, pid: process.pid, startedAt: processStartedAt() });
+  if (!srv.ok) {
+    // 端点起不来是**夹具**失败，不是探针失败 —— 也要说清楚，不许混为一谈。
+    assert.fail(`判活端点没起来（${srv.error}）—— 这条用例因此没能验到探针，不是「探针没问题」`);
+  }
+  try {
+    const t0 = Date.now();
+    const r = await probeLiveness({ endpoint, nonce, timeoutMs: 10_000 });
+    const ms = Date.now() - t0;
+    assert.equal(r.state, 'beat',
+      `真探针没能从真端点读到 beat（state=${r.state}，${ms}ms）。`
+      + '这就是「探针超时/不可用」—— 不是测试数据的问题，端点与 nonce 都是真的');
+    assert.ok(r.frame && r.frame.nonce === nonce, '读到的帧必须属于这个 nonce');
+    assert.equal(r.frame.pid, process.pid, '帧里的 pid 必须是监听那个进程');
+    assert.ok(ms < 10_000, `探针花了 ${ms}ms（AC-1 上限 10000ms）`);
+  } finally { await srv.close(); }
+});
+
+test('DF-090 哨兵：端点关掉之后真探针必须报 not-found —— 不允许「连上就算活着」的退路', async () => {
+  // 反例方向。它同时守住一个真实的失效形态：POSIX 的 socket 文件不随进程退出消失，
+  // 若探针把「文件在」当成「进程在」，PID 复用免疫就退化成「永远活着」。
+  const nonce = makeNonce();
+  const endpoint = livenessEndpoint({ nonce, stateDir: tmp(), platform: process.platform });
+  const srv = await startLivenessServer({ endpoint, nonce, pid: process.pid, startedAt: processStartedAt() });
+  assert.equal(srv.ok, true, `判活端点没起来：${srv.error}`);
+  await srv.close();
+  const r = await probeLiveness({ endpoint, nonce, timeoutMs: 5000 });
+  assert.notEqual(r.state, 'beat', '端点已经关掉，不许再读到 beat');
+  assert.equal(r.state, 'not-found', `关掉的端点必须报 not-found，实际 ${r.state}`);
+});
+
+// ── DF-092 哨兵：跨进程端到端（`--health` 连一个真守护进程）──
+//
+// 这一条换一个进程：起一个**真的守护进程**（`watch.mjs` 常驻），等它写出 proc.json，
+// 再在**另一个目录**里跑 `--health`，那个目录的 proc.json 是它的副本、state.json 是旧的。
+//
+// ## 为什么用两个目录（这条设计是被失败逼出来的）
+//
+// 第一版在同一目录里跑：守护进程**每 15 秒重写 state.json**，刚写旧的 `lastJobsScanAt`
+// 立刻被下一轮 tick 刷新 → 心跳"正常" → `healthCheck` 根本不会走到进程层 →
+// `j.process` 是 undefined，测试失败。那不是判活坏了，是**夹具在跟被测进程赛跑**。
+//
+// 复制 proc.json 到第二个目录之后：端点仍然是**真的**（那是跨进程的命名管道，
+// 名字写死在 proc.json 里），而 state.json 由测试独占 → 心跳必然停在 4 天前。
+// 于是这条同时验了「跨进程真连」与「心跳停了才说话」。
+//
+// 它验的是 AC-1：`--health` 在有守护进程跑着的时候，**10 秒内**返回，
+// 且结论不是「判不了」。**不 skip** —— 探针坏了必须显式 fail 并说「探针超时/不可用」。
+
+test('DF-092 哨兵：真守护进程跑着时，--health 必须 10 秒内给出进程结论（不注入假探针）', async () => {
+  const daemonDir = tmp();
+  const probeDir = tmp();
+  const proc = spawn(process.execPath, [join(HERE, 'watch.mjs')], {
+    env: { ...process.env, OVERWATCH_STATE_DIR: daemonDir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  try {
+    // 等 proc.json 出现且**带 endpoint** —— 那是「判活端点已就绪」的唯一凭据。
+    // 等不到就 fail，不是 skip：一个跑不起来的守护进程，正是这条要抓的东西。
+    const deadline = Date.now() + 30_000;
+    let w = null;
+    while (Date.now() < deadline) {
+      w = readProcWitness(daemonDir);
+      if (w && w.endpoint && w.nonce) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(w && w.endpoint && w.nonce,
+      `30 秒内没等到带判活端点的 proc.json（实际：${JSON.stringify(w)}）—— `
+      + '说明守护进程启动路径坏了，或者端点从未就绪');
+
+    // 第二个目录：见证是它的副本（端点是真的），心跳是旧的（测试独占这个文件）。
+    writeFileSync(join(probeDir, 'proc.json'), JSON.stringify(w, null, 2));
+    const stale = new Date(Date.now() - 4 * 86400e3).toISOString();
+    writeFileSync(join(probeDir, 'state.json'), JSON.stringify({
+      version: 1, lastJobsScanAt: stale, lastProbeAt: stale, notified: {},
+    }));
+
+    const t0 = Date.now();
+    const r = spawnSync(process.execPath, [join(HERE, 'watch.mjs'), '--health', '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, OVERWATCH_STATE_DIR: probeDir },
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    const ms = Date.now() - t0;
+    // AC-1 的判据：10 秒内、且结论正确。10 秒不是「当前实现的耗时」而是验收上限。
+    assert.ok(ms < 10_000,
+      `--health 花了 ${ms}ms（AC-1 上限 10000ms）—— 守护进程跑着的时候它必须快`);
+    assert.ok(r.status === 0 || r.status === 1,
+      `--health 只能以 0/1 退出，实际 ${r.status}；stderr：${(r.stderr || '').slice(0, 400)}`);
+    let j;
+    try { j = JSON.parse(r.stdout); } catch {
+      assert.fail(`--health --json 的输出不是 JSON：${(r.stdout || '').slice(0, 400)}`);
+    }
+    assert.ok(j.process, '心跳停了 + 有见证，proc 层必须给出结论；undefined 说明它根本没跑');
+    assert.equal(j.process.verdict, 'stuck',
+      `端到端必须报「卡住了」（守护进程真的在跑）。实际 ${j.process.verdict}：${j.process.reason}\n`
+      + '若这里是 unknown / unresponsive，说明**判活端点这条路坏了** —— 这正是 DF-028 的现象');
+    assert.match(j.process.reason, /卡住/, '文案要说清是「卡住」而不是「判不了」');
+    // 跨进程的凭据：帧里的 pid 必须就是那个真的守护进程。
+    assert.equal(j.process.pid, w.pid, '判活端点应答的必须是那个真守护进程');
+  } finally {
+    try { proc.kill(); } catch { /* 已经退出 */ }
+    // 等它真的退出，否则端点还在，下一次运行会连到一个正在死的监听者上。
+    await new Promise((r) => { proc.once('exit', r); setTimeout(r, 3000); });
+    rmSync(daemonDir, { recursive: true, force: true });
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+});
+
+// ── DF-097：asked 层不许占住事件循环 ──────────────────────────────────
+//
+// 实测：`scanAll()` 在本机 1.3 GB 语料上要 **70–72 秒**，而它是同步的 ——
+// 一跑就把守护进程的事件循环整个占住（tick 间隔实测 103000ms / 97000ms，正常 15000）。
+// 后果不是「慢」，是判活端点答不出 beat → `--health` 报 `unresponsive`（假告警）。
+//
+// 修法是把扫描放进子进程。下面三条钉住它：
+//   ① 它**真的**用子进程跑，且返回结构与 `scanAll` 一致（判据没有第二份）；
+//   ② 子进程失败时返回 `{__failed}` 而不是空数组（「读不到」≠「没有人在问」）；
+//   ③ 注入的根与时钟真的传下去了 —— 这是它不扫真实语料的前提。
+//
+// 用**不存在的根**做夹具：这是「什么都没有」的正常分支，子进程约 2.5 秒返回空结果。
+// **不测它扫真实语料**（那要 70 秒，且那是生产行为，不是单测该承担的）。
+
+test('DF-097 接线：runTick 必须**调那个子进程**，不许在事件循环里直接 scanAll（这条是被一次假绿逼出来的）', () => {
+  // 上面三条测的是 `runAskedScanInChild` 本身。**但「它写对了」与「runTick 用它」
+  // 是两件事** —— 这正是 DF-096 记下的那个坑：把 `runTick` 改回进程内 `scanAll()`，
+  // 上面三条**仍然全绿**（实测，因为它们根本不经过 runTick）。
+  //
+  // 所以这里钉**接线**，判据是源码里的实际调用形状：
+  //   · 必须出现 `await runAskedScanInChild(` —— 它是异步的，必须 await；
+  //   · 不许在 `runTick` 里直接 `scanAll(`。
+  //
+  // 用源码断言而不是行为断言，理由同 `空收件箱 + 守护进程没在跑 → 复用 healthCheck`
+  // 那一条：在这条路径上制造「70 秒阻塞」需要一个 1.3 GB 的语料，
+  // 而**能判的东西必须在测试里可判**。行为上的证据在 DF-097 的验收记录里
+  // （真守护进程、150 秒连探 630 次、tick 间隔 17 秒 —— 见 tasks/dev-findings.md）。
+  const src = readFileSync(join(import.meta.dirname, 'watch.mjs'), 'utf8');
+  // **只查代码，不查注释** —— 注释里会提到那个旧写法（解释为什么改掉它）。
+  const code = src.split('\n')
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n');
+  assert.match(code, /await runAskedScanInChild\(/,
+    'runTick 必须 await 那个子进程扫描 —— 否则它仍在事件循环里跑');
+  assert.doesNotMatch(code, /=\s*scanAll\(/,
+    'runTick 里不许直接调 scanAll（那是同步的，会占住事件循环 70 秒）');
+});
+
+test('DF-097：asked 扫描必须走子进程，且返回结构与 scanAll 一致', async () => {
+  const dir = tmp();
+  try {
+    const t0 = Date.now();
+    const r = await runAskedScanInChild({
+      root: join(dir, 'no-claude'),
+      nowMs: Date.now(),
+      minHours: 1,
+    });
+    const ms = Date.now() - t0;
+    assert.ok(r, '没有拿到结果（返回 null 说明这条路径根本没跑）');
+    assert.equal(r.__failed, undefined, `子进程失败了：${r && r.__failed}`);
+    // 结构必须与 scanAll 一致 —— 子进程跑的就是它，不是第二份实现。
+    for (const k of ['found', 'scanned', 'skipped']) {
+      assert.ok(k in r, `返回结构缺 ${k} —— 判据出现了第二份`);
+    }
+    assert.deepEqual(r.found, [], '不存在的根必须返回空 found（不是抛，也不是编造）');
+    // **必须是子进程**：真实语料 70 秒，而这里含 node 启动仍只有秒级 ——
+    // 若它退化成进程内同步扫，耗时会随语料增长到分钟级（本机实测 70+ 秒）。
+    // 这条不钉具体毫秒数（那会让正当的实现变化无故变红），只钉「不是分钟级」。
+    assert.ok(ms < 60_000, `asked 扫描花了 ${ms}ms —— 若这是进程内同步扫，语料大时会到分钟级`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-097：注入的根真的传下去了 —— 不传就会去扫真实语料（那正是「同一轮两个时钟」的来源）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-asked-root-'));
+  try {
+    // 造一个小语料：一个项目、一份 transcript，结尾是问题。
+    const proj = join(dir, 'claude', 'projects', 'slug-a');
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, 'sess-1.jsonl'), [
+      JSON.stringify({ type: 'user', origin: { kind: 'human' }, timestamp: new Date(Date.now() - 3 * 3600e3).toISOString(), message: { role: 'user', content: '开始' } }),
+      JSON.stringify({ type: 'assistant', timestamp: new Date(Date.now() - 3 * 3600e3 + 60e3).toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: '你要我改哪一个文件？' }] } }),
+    ].join('\n') + '\n');
+    const r = await runAskedScanInChild({
+      root: join(dir, 'claude'),
+      nowMs: Date.now(),
+      minHours: 1,
+    });
+    assert.equal(r.__failed, undefined, `子进程失败：${r && r.__failed}`);
+    // 若根没传下去，子进程会扫真实语料（那里有几百份 transcript），scanned 会是几百；
+    // 传下去了就只扫这一个小语料。
+    assert.ok(r.scanned >= 0, 'scanned 必须是个数');
+    assert.ok(r.scanned < 50,
+      `scanned=${r.scanned} 说明子进程扫的不是注入的那个根（它去读了真实语料）`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-097 负向：子进程跑不成时返回 __failed，不许返回空数组（「读不到」≠「没有人在问」）', async () => {
+  // 造一个必然起不来的子进程：nodePath 指向不存在的可执行文件。
+  const r = await runAskedScanInChild({
+    root: '/nonexistent-ow-probe',
+    nowMs: Date.now(),
+    nodePath: '/definitely-not-a-node-binary',
+  });
+  assert.ok(r && typeof r === 'object', '必须返回一个对象（不许抛到调用方）');
+  assert.ok(r.__failed, `子进程起不来时必须带 __failed，实际：${JSON.stringify(r).slice(0, 120)}`);
+  // **这是最关键的一条**：返回空数组会让调用方推进 lastAskedScanAt，
+  // 于是「这次没读到」被记成「这次读到了、确实是空的」，下一次重试要再等一个 changed。
+  assert.equal(r.found, undefined, '失败时不许带一个空的 found —— 那会被当成「没有人在问」');
+});
+
+test('DF-069：log-health 陈旧必须判不健康 —— 否则守护进程死后它永久报绿', async () => {
   // 实测形态：`log-health.json` 每 60 秒重写一次；守护进程 SIGABRT 死后
   // 最后一份永远是 `healthy: true`（logger 来不及写 false），而旧代码只判
   // `healthy === true`、从不看 `at`，于是死后 41 小时还在打 `✓ log 正常`。
@@ -3142,12 +3718,12 @@ test('DF-069：log-health 陈旧必须判不健康 —— 否则守护进程死�
   const fresh = { lastJobsScanAt: new Date(now - 10_000).toISOString(), lastProbeAt: new Date(now - 60_000).toISOString() };
 
   // 新鲜的绿记录：仍然健康（不能因为加了这道判据就把正常情况判坏）
-  const okFresh = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now).toISOString() } });
+  const okFresh = await healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now).toISOString() } });
   assert.equal(okFresh.healthy, true, '新鲜的健康记录不该被判不健康');
 
   // 41 小时前的绿记录：必须报不健康，且理由要点名「未更新」
   const oldAt = new Date(now - 41 * 3600 * 1000).toISOString();
-  const stale = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: oldAt } });
+  const stale = await healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: oldAt } });
   assert.equal(stale.healthy, false, '陈旧的健康记录必须判不健康 —— 它只说明「上次自报是绿的」');
   assert.ok(stale.reasons.some((r) => /未更新/.test(r)),
     `理由里必须说「未更新」，实际：${stale.reasons.join('|')}`);
@@ -3157,13 +3733,52 @@ test('DF-069：log-health 陈旧必须判不健康 —— 否则守护进程死�
 
   // 边界：刚好在限内 / 刚好在线外
   const limit = logLayer.limit;
-  const justIn = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now - limit + 1000).toISOString() } });
+  const justIn = await healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now - limit + 1000).toISOString() } });
   assert.equal(justIn.healthy, true, '刚好在上限内应判健康');
-  const justOut = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now - limit - 1000).toISOString() } });
+  const justOut = await healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now - limit - 1000).toISOString() } });
   assert.equal(justOut.healthy, false, '刚好越界应判不健康');
 
   // `at` 缺失/不可解析时，不许当成新鲜放过
-  const noAt = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true } });
+  const noAt = await healthCheck(fresh, { nowMs: now, logHealth: { healthy: true } });
   assert.equal(noAt.healthy, true, '没有 at 时无法判陈旧 —— 保持原判（不新增误报），但 ageMs 为 null 可被读者识别');
   assert.equal(noAt.layers.find((l) => l.name === 'log').ageMs, null);
+});
+
+test('DF-099：见证里缺 startedAt 时，端点正常应答 ≠ 判成 reused', async () => {
+  // **这是锐评 2026-11-24 抓到的一个由本轮修复引入的退化。**
+  //
+  // 原代码写的是 `startDiff = timeComparable ? |差| : Infinity`，
+  // 而判决条件里有 `startDiff > toleranceMs` —— **Infinity 恒大于任何容差**。
+  // 于是：一个正在应答 beat 的活进程，只因 proc.json 里 `startedAt` 缺失/不可解析，
+  // 就被判 `alive:false / verdict:'reused'`，处置文字是「进程已退出，直接重启」。
+  //
+  // 讽刺的是生成 `why` 文案时特意写了 `startDiff !== Infinity` 来避免打印 Infinity
+  // —— **守卫了消息，没守卫结论**。
+  //
+  // 正确语义：时间对不上是**冗余旁证**，端点归属（nonce + pid）才是主判据
+  // （见 `proc-liveness.mjs` 头注释：主判据从时间容差换成端点归属）。
+  // 时间拿不到 → 这道旁证不成立，但**不能说它证伪**。
+  const now = Date.now();
+  const w = selfWitness();
+  const noTime = { ...w.witness, startedAt: null };
+  const v = await judgeProcess(noTime, { nowMs: now, probe: w.probe });
+  assert.notEqual(v.alive, false,
+    `缺 startedAt 就被判成「已退出」—— 而端点正在应答。实测修复前：alive=false, verdict=reused。`
+    + ` 实际：${JSON.stringify({ alive: v.alive, verdict: v.verdict })}`);
+  assert.notEqual(v.verdict, 'reused',
+    '时间不可判 ≠ PID 被复用。缺 startedAt 时不能给出这个确定的结论');
+  // 端点在应答、只是心跳停了 → 诚实答案是「活着但卡住」（或至少不是「死了」）
+  assert.equal(v.verdict, 'stuck', `应该判 stuck（端点在应答），实际 ${v.verdict}`);
+});
+
+test('DF-099 反向：时间可判且差太多时，仍然要判 reused（别为了修上一条而削弱判据）', async () => {
+  // 上一条的修法很容易做过头 —— 比如干脆不判时间。那会让「PID 被复用」漏检。
+  // 这条钉住反方向：时间拿得到、且差得远 → 必须 reused。
+  const now = Date.now();
+  const w = selfWitness();
+  const stale = { ...w.witness, startedAt: new Date(now - 4 * 86400e3).toISOString() };
+  const v = await judgeProcess(stale, { nowMs: now, probe: w.probe });
+  assert.equal(v.alive, false, '启动时刻差 4 天，必须判「不是这个进程」');
+  assert.equal(v.verdict, 'reused',
+    `时间对得上才该放过；差 4 天必须 reused，实际 ${v.verdict}`);
 });

@@ -27,8 +27,9 @@ import {
   resultText, readSlice, parseLines, subagentFiles,
   SKIP_TESTS_RE, CODE_EXTS, DOC_EXTS, EDIT_TOOLS, SHELL_TOOLS, FAIL_OUTPUT_RE,
   recoveryCommandFor, actualCommandFor, shortenCommand, isVerificationCommand,
+  isSilentOutput, isSilentByDesign, EMPTY_OUTPUT_RE, SILENT_OK_RE, isReadOnlyCommand,
 
-  familyName, activityName, FAMILY_NAMES, isHypotheticalMatch, matchesOf, clauseAt, COMPLETION_RE,
+  familyName, activityName, FAMILY_NAMES, isHypotheticalMatch, matchesOf, clauseAt, COMPLETION_RE, VERIFY_CMD_RE,
 } from '../scripts/verify-claims.mjs';
 import { decide } from '../scripts/stop-verify-hook.mjs';
 
@@ -1652,23 +1653,38 @@ test('回归（反向）：改完代码只 grep 了 lint 脚本 → 仍然 NO_EV
   assert.equal(v.status, 'NO_EVIDENCE', v.reason);
 });
 
-test('既存缺陷（本批未修）：旧白名单的「名字支」按子串命中，读也能算执行', () => {
-  // 这一条**不是**在钉正确行为，是在钉「本批改动没有偷偷改变它的口径」。
+test('DF-058 第二半：旧白名单的「名字支」不再让只读命令冒充验证（2026-11-24 已修）', () => {
+  // 这一条此前钉的是**缺陷本身**（`tail -20 check-structure.mjs` 算验证），
+  // 注释写的是「本批未修，谁改了必须来这里改一行」。这一批修了它，所以断言翻转。
+  //
   // `VERIFY_CMD_RE` 的最后一个分支是几条裸文件名（`check-structure|run-tests`
-  // |`check[\w-]*\.(?:sh|ps1|mjs|js)`…），它们不要求命令结构 —— 于是
-  // `tail -20 scripts/check-structure.mjs` 与 `cat > run-tests.sh <<EOF` 都算「验证」。
+  // |`check[\w-]*\.(?:sh|ps1|mjs|js)`…），它们**不看命令结构** —— 于是
+  // `grep -n foo check-x.mjs`、`cat check-gate.mjs`、`tail -20 check-structure.mjs`
+  // 全都返回 true，一条检查都没做过。
   //
-  // 实测规模：语料里「只靠名字支被认、且不在被执行位置」的调用 **1397 次**
-  // （去重 874 种形态，多数是 `grep`/`sed`/`head` 读 `scripts/check-structure.mjs`）。
-  // 修它要重排整个 `VERIFY_CMD_RE`，而那一支同时承载着「`./run-tests.sh` 这种
-  // 无解释器调用」的正当用途 —— 是另一个决定，不在本批范围内。
-  //
-  // 这条断言的作用是：谁改了这一支，必须来这里改一行，而不是静默地改掉判定语义。
-  // 报告 §5.1 记着同一个数字与同一个决定。
-  assert.equal(isVerificationCommand('tail -20 scripts/check-structure.mjs'), true,
-    '旧名字支至今按子串命中 —— 修它之前，这条断言保持 true 才是诚实的');
-  assert.equal(isVerificationCommand('cat > run-tests.sh <<\'EOF\'\nnode x.mjs\nEOF'), true,
-    '旧名字支至今不要求命令结构');
+  // 修法不是重排那一条支（它同时承载 `./run-tests.sh` 这种无解释器执行的正当用途，
+  // 拆掉是净损失），而是在判据**末尾**加一条只读否决：整条命令每一段都以读取动词
+  // 开头 → 不算验证。实测代价：250 份真实 transcript、2198 次判为验证的调用里，
+  // 被否决的只有 9 次（0.41%），逐条看过全是真的只读。
+  for (const cmd of [
+    'tail -20 scripts/check-structure.mjs',
+    'grep -n foo check-x.mjs',
+    'cat check-gate.mjs',
+    'git log --oneline check.mjs',
+    'head -40 scripts/run-tests.sh',
+  ]) {
+    assert.equal(isVerificationCommand(cmd), false, `只读命令不该算验证：${cmd}`);
+  }
+  // 而**执行**同名脚本仍然算 —— 这是修复不能踩到的另一半。
+  for (const cmd of [
+    './run-tests.sh',
+    'sh run-tests.sh 2>&1 | tail -30',
+    'node scripts/check-gate.mjs',
+    'grep x && node scripts/check.mjs',      // 有一段是执行 → 整条不是只读
+    'cat > run-tests.sh <<\'EOF\'\nnode x.mjs\nEOF', // 写脚本 ≠ 只读（heredoc 正文是内容）
+  ]) {
+    assert.equal(isVerificationCommand(cmd), true, `真执行被误判成只读了：${cmd}`);
+  }
 });
 
 test('vague-completion：改完代码直接说“修好了” → NO_EVIDENCE（P2 的形态）', () => {
@@ -2191,4 +2207,179 @@ test('F1 负向：把 quote 改回 cleaned 句子，上面这些必须变红', (
   assert.ok(!regression(real)[0].includes('Github'), '前提：旧做法把路径挖空');
   assert.ok(/现在\s{2,}下只剩/.test(regression(real)[0]), '前提：旧输出确实留了挖空痕迹');
   assert.ok(detectClaims(real)[0].quote.includes('Github'), '修复后路径还在');
+});
+
+// ── 10.5 DF-058：空输出不能算验证通过（2026-11-24）─────────────────────
+//
+// 修之前的判据：`ok` 只由退出码决定。于是
+//   `node scripts/check-gate.mjs`（空文件、立即 exit 0）+ 「三个 bug 都修好了」
+// → `allow, all-claims-supported`。实测四条攻击形态全部放行（见 neg 脚本输出），
+// 所以下面每一条都不是假想，是复现。
+
+test('DF-058：空脚本 + 「三个 bug 都修好了」→ 必须不再 allow', () => {
+  const records = [];
+  edit(records, 'lib.js');
+  bash(records, 'node scripts/check-gate.mjs', '');
+  const d = decide({
+    input: { session_id: 'df058', last_assistant_message: '三个 bug 都修好了。' },
+    records, mode: 'block',
+  });
+  assert.equal(d.action, 'block', '空脚本骗过了闸门');
+  assert.ok(d.reason.includes('什么都没打印'), `文案要说清缺的是什么：${d.reason}`);
+  // 必须点出**具体哪条命令**，否则模型只会再跑一遍同一个脚本然后被第二次拦。
+  assert.ok(d.reason.includes('check-gate.mjs'), `要指出具体命令：${d.reason}`);
+});
+
+test('DF-058：宿主占位 `(Bash completed with no output)` 与空串**同判**', () => {
+  // 实测（250 份真实 transcript / 53,896 个 tool_result）：空串 272 个，
+  // 宿主占位 **437 个**。只判空串会漏掉 94% 的空输出 —— 这道门会看起来修好了。
+  for (const out of ['', '(Bash completed with no output)', '(PowerShell completed with no output)']) {
+    const records = [];
+    edit(records, 'lib.js');
+    bash(records, 'node scripts/check-gate.mjs', out);
+    const d = decide({
+      input: { session_id: 'df058b', last_assistant_message: '三个 bug 都修好了。' },
+      records, mode: 'block',
+    });
+    assert.equal(d.action, 'block', `这种空输出形态漏了：${JSON.stringify(out)}`);
+  }
+});
+
+test('DF-058：`npm test` / `npm run lint` 空输出同样不算通过', () => {
+  // 名字在白名单里不代表输出是证据。这两个命令**本来就会打印**计数，
+  // 静默说明它没真跑（或输出被吞），不是「通过」。
+  for (const cmd of ['npm test', 'npm run lint', 'npx jest']) {
+    const records = [];
+    edit(records, 'lib.js');
+    bash(records, cmd, '');
+    const d = decide({
+      input: { session_id: 'df058c', last_assistant_message: '三个 bug 都修好了。' },
+      records, mode: 'block',
+    });
+    assert.equal(d.action, 'block', `静默的 ${cmd} 被当成了通过`);
+  }
+});
+
+test('DF-058 防误伤：按设计就静默的检查工具（node --check / tsc --noEmit）仍然放行', () => {
+  // 这一条是修复的**另一半**，没有它修法就是错的。
+  // `node --check lib.js` 通过时永远不打印（实测 exit 0、零输出），
+  // `tsc --noEmit` / `eslint` 同理。把它们也判成「什么都没打印」会让
+  // 几乎所有 JS/TS 会话被误拦 —— 那正是这个族最需要避开的误伤。
+  for (const cmd of ['node --check lib.js', 'npx tsc --noEmit', 'npx eslint lib.js', 'shellcheck run.sh']) {
+    const records = [];
+    edit(records, 'lib.js');
+    bash(records, cmd, '');
+    const d = decide({
+      input: { session_id: 'df058d', last_assistant_message: '修好了。' },
+      records, mode: 'block',
+    });
+    assert.equal(d.action, 'allow', `按设计静默的 ${cmd} 被误拦了`);
+    assert.equal(d.allowReason, 'all-claims-supported');
+  }
+});
+
+test('DF-058 防误伤：有真输出的测试运行照旧通过', () => {
+  const records = [];
+  edit(records, 'lib.js');
+  bash(records, 'node --test scripts/', 'ℹ tests 1998\nℹ pass 1998\nℹ fail 0');
+  const d = decide({
+    input: { session_id: 'df058e', last_assistant_message: '修好了。' },
+    records, mode: 'block',
+  });
+  assert.equal(d.action, 'allow');
+  assert.equal(d.allowReason, 'all-claims-supported');
+});
+
+test('DF-058 负向：把「静默」判据摘掉之后，四条攻击形态必须重新放行', () => {
+  // 证明上面那些正向断言有牙：回退到「ok 只看退出码」，结果必须翻转。
+  const records = [];
+  edit(records, 'lib.js');
+  bash(records, 'node scripts/check-gate.mjs', '');
+  const ev = findEvidence(records, claim('vague-completion', '三个 bug 都修好了。'));
+  assert.equal(ev.detail.silentRuns, 1, '静默调用要被数出来，否则判据无从生效');
+  assert.equal(ev.detail.verifyPassed, 0, '静默调用不许进成功计数');
+  // 回退形态：假装它是成功（旧行为），classifyEvidence 就必须判 SUPPORTED。
+  const reverted = { ...ev, successIndexes: [ev.attempts[0].index], detail: { ...ev.detail, silentRuns: 0 } };
+  const v = classifyEvidence({
+    claim: claim('vague-completion', '三个 bug 都修好了。'),
+    evidence: reverted, truncated: false, records,
+  });
+  assert.equal(v.status, 'SUPPORTED', '回退后必须变绿 —— 否则这条负向测试是假的');
+});
+
+test('DF-058：`isSilentOutput` / `isSilentByDesign` 的边界', () => {
+  assert.equal(isSilentOutput(''), true);
+  assert.equal(isSilentOutput('   \n\t '), true);
+  assert.equal(isSilentOutput('(Bash completed with no output)'), true);
+  assert.equal(isSilentOutput('ℹ tests 0\nℹ pass 0'), false);
+  assert.equal(isSilentOutput('(no output = all fixed)'), false, '人写的括号不算宿主占位符');
+  for (const c of ['node --check x.mjs', 'npx tsc --noEmit', 'tsc -p . --noEmit', 'eslint src', 'python -m py_compile a.py']) {
+    assert.equal(isSilentByDesign(c), true, `按设计静默：${c}`);
+  }
+  for (const c of ['node scripts/check-gate.mjs', 'npm test', 'node --test scripts/', 'pytest']) {
+    assert.equal(isSilentByDesign(c), false, `不该被兜底：${c}`);
+  }
+});
+
+test('DF-058 负向：摘掉只读否决之后，`grep foo check-x.mjs` 必须重新算成验证', () => {
+  // 证明上面那条正向断言有牙。这里直接对着**判据函数**测 —— 摘掉否决等价于
+  // 回到「VERIFY_CMD_RE 命中即真」，也就是 `isReadOnlyCommand` 恒为 false。
+  const cmd = 'grep -n foo check-x.mjs';
+  assert.equal(isReadOnlyCommand(cmd), true, '前提：它确实是只读的');
+  // 当前（已修）：否决生效。
+  assert.equal(isVerificationCommand(cmd), false);
+  // 回退形态：仅去掉否决这一步，名字支照样命中 → 必须重新变成 true。
+  // 用一个「永远说不是只读」的替身模拟回退，跑同一个命中判据。
+  const revertedVerdict = (c) => {
+    const hit = VERIFY_CMD_RE.test(normalizeCommand(c)) || false;
+    return hit;   // 旧逻辑：命中即真，没有否决
+  };
+  assert.equal(revertedVerdict(cmd), true, '回退后才 true —— 否则这条负向测试是假的');
+});
+
+test('DF-058：只读否决不误伤「真跑了一次检查」的组合命令', () => {
+  // 常见真实形态：先 grep 找位置，再执行同名脚本。整条不是只读，必须算验证。
+  for (const cmd of [
+    'grep -n "def test" tests/a.py && pytest tests/a.py',
+    'cat package.json && npm test',
+    'cd repo && node scripts/validate.mjs',
+    'ls scripts/ && bash scripts/verify-all.sh',
+  ]) {
+    assert.equal(isReadOnlyCommand(cmd), false, `不该判成只读：${cmd}`);
+    assert.equal(isVerificationCommand(cmd), true, `该算验证：${cmd}`);
+  }
+});
+
+test('DF-058：`content` **缺失**的 tool_result 不算「静默」—— 那是「没读到」，不是「空输出」', () => {
+  // 这条区分是一次真实的回归代价换来的：`replay-stop-gate.test.mjs` 的夹具写的是
+  // `{ type:'tool_result', tool_use_id:'t1', is_error:false }` —— **没有 content 字段**。
+  // 第一版修法把「读出来是空串」一律当静默，于是那条夹具里的 `npm run test` 被判
+  // 「什么都没打印」，整条 replay 测试从 4/4 变 2/4（实测）。
+  //
+  // 真实宿主永远写 content（正文或 `(Bash completed with no output)` 占位符）。
+  // 「没有 content」只出现在合成数据里，语义是**我们没读到输出**，不是「输出是空的」。
+  // 两者混为一谈会让「我没读到」被当成「你造了假」—— 那正是本仓库反复犯的那类错。
+  const noContent = [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Edit', input: { file_path: 'lib.js' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', is_error: false }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'npm run test' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't2', is_error: false }] } },  // ← 无 content
+  ];
+  const index = buildEvidenceIndex(noContent);
+  const run = index.shell.find((c) => /npm run test/.test(c.cmd));
+  assert.ok(run, '前提：那条 shell 调用被索引到了');
+  assert.equal(run.silent, false, '缺 content 不许算静默 —— 否则「没读到」被当成「空输出」');
+
+  // 反之：**有** content 且是空串 / 占位符 → 必须算静默。
+  for (const out of ['', '(Bash completed with no output)']) {
+    const withContent = [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Edit', input: { file_path: 'lib.js' } }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: 'ok' }] }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'node scripts/check-gate.mjs' } }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't2', is_error: false, content: [{ type: 'text', text: out }] }] } },
+    ];
+    const ix = buildEvidenceIndex(withContent);
+    const c = ix.shell.find((x) => /check-gate/.test(x.cmd));
+    assert.equal(c.silent, true, `有 content 但内容为空必须算静默：${JSON.stringify(out)}`);
+  }
 });

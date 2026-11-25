@@ -119,8 +119,8 @@ function fakeHost(dir) {
   return p;
 }
 
-/** 12 个角色的名字，从真实载荷里读 —— 不在测试里抄第二份清单。
- *  抄一份的后果是「有人加了第 13 个角色，测试还在断言 12」，而那正是它该红的时候。 */
+/** 角色的名字，从真实载荷里读 —— 不在测试里抄第二份清单。
+ *  抄一份的后果是「有人加了新角色，测试还在断言旧数」，而那正是它该红的时候。 */
 function realAgents() {
   return readdirSync(join(PAYLOAD_DIR, 'agents'))
     .filter((f) => f.endsWith('.md'))
@@ -193,7 +193,7 @@ test('--dry-run 打印的命令行含 --plugin-dir（逐字可复制，指向实
   });
 });
 
-test('--dry-run 的输出让人一眼看出挂上了什么（12 个角色名逐个出现）', () => {
+test('--dry-run 的输出让人一眼看出挂上了什么（每个角色名逐个出现）', () => {
   withTmp((dir) => {
     const r = run(['launch', '--dry-run'], { env: { OVERWATCH_RUNS_DIR: isolatedRuns(dir) } });
     assert.equal(r.code, 0, r.err);

@@ -2510,12 +2510,12 @@ const LIVING_DOCS = [
 
 ---
 
-### DF-050 [open] 硬门会在**被检查的项目**里创建 `tasks/runs/`，第二次跑再报它违规
+### DF-050 [fixed] 硬门会在**被检查的项目**里创建 `tasks/runs/`，第二次跑再报它违规
 
 - 发现于：2026-11-21 框架现状测绘（主线程复算）
 - 位置：`scripts/entry-symlink.test.mjs:38-46` 的 `makeTmp()` → `mkdirSync(join(ROOT,'tasks','runs'), {recursive:true})`；
   经 `scripts/check-structure.mjs` 的 `checkTestCount()`（`:498`）→ `regression-count.mjs` 的 `probeScript()`（`:116`）
-- 证据（在 `/tmp/owport` 复现，一个只有 `scripts/` + `README.md` + `.git` 的外来项目）：
+- 证据（在 `/tmp/owport` 复现，一个只有 `scripts/` + `README.md` + `*.git` 的外来项目）：
   ```
   跑门前：ls -d tasks        → No such file or directory
   node scripts/check-structure.mjs → EXIT=1，59 项违规
@@ -2523,13 +2523,21 @@ const LIVING_DOCS = [
   再跑一次 → [tasks/runs] 私有路径未在 .gitignore 中排除，可能被误提交
              [tasks/runs] 空目录不会被 git 跟踪，clone 后会消失
   ```
-- **注意因果链的边界**：探针只 `import()` 模块、不执行 `test()` 体，所以**不是** `makeTmp` 直接触发。
-  成立的是更弱但同样致命的一条：门在别人项目里跑完会留下 `tasks/runs/`，而这个残留恰好触发自己的
-  `emptyDirs` 与 `privatePaths` 两条检查。触发点未定位到具体一行，**标为已验证现象、未定位机制**。
+- **状态**：**fixed（2026-11-24）**。修前的记载写着「触发点未定位到具体一行，
+  标为已验证现象、未定位机制」—— 本轮把它定位到了，**就是模块级求值**：
+  `entry-symlink.test.mjs:91` 原为 `const LEDGER_DIR = join(makeTmp(), 'ledgers');`，
+  而 `regression-count.mjs:116` 的探针 **import 每一个测试文件**（只登记 `test()`、不跑用例体）。
+  于是**光是数一下测试条数**就执行了 `makeTmp()` 的 `mkdirSync`。
+- **两个修法缺一不可**：
+  1. `entry-symlink.test.mjs` 的 `makeTmp()` / 账本目录改为**惰性**（第一次真的 spawn 时才建）；
+  2. `regression-count.mjs` 的探针注入 `UNTILDONE_TEST_TMP_BASE`，让测试自己的临时目录
+     也进探针沙箱 —— 「数条数」在任何项目里零写盘。
+     只做 2 的话，「不该在 import 阶段建目录」这个原则仍不成立（换个测试文件就会再犯）。
+- **负向证据**：`check-config.test.mjs` 的「DF-050 跑门前后，陌生项目的 git status 必须干净」
+  用 `--untracked-files=all` 的差集判（不是「应该不会写」）。把 `makeTmp()` 改回模块级求值这一条会红。
 - 影响：一个只读性质的检查工具修改了被检查方。在别人的项目里跑一次门，等于给那个项目留了一个红。
-- 建议归属：独立任务（与 DF-051 同批）
 
-### DF-051 [open] 硬门把「本仓库的文档长相」当成「任何项目的合格线」：54 / 59 条违规是这个
+### DF-051 [fixed] 硬门把「本仓库的文档长相」当成「任何项目的合格线」：54 / 59 条违规是这个
 
 - 发现于：2026-11-21 框架现状测绘（主线程复算）
 - 位置：`scripts/check-structure.mjs` 全文；25 条 `CHECKS`（`:2706-2732`）里 17 条无任何「规则怎么算」的配置键
@@ -2543,7 +2551,31 @@ const LIVING_DOCS = [
   要么把 13 条整体 `disabledChecks` —— 那时真正还剩判据的只有 `syntax/importable/emptyDirs/links` 四条，
   而 `importable/unregisteredExports` 的探针表（`PROBE_ARGS` 646 条、`REGISTERED` 583 个名字）
   还写死本仓 48 个模块的导出名。
-- 建议归属：独立任务（本轮不做，见给用户的结论）
+- **状态**：**fixed（2026-11-24）**。**不是**加十几条开关 —— 那要求用户先知道 17 个内部名字，
+  而且下一次有人加一条新的产品规矩，默认又是红的（失效方式是结构性的）。
+  缺的概念是**适用域**：每条检查属于「任何仓库都该成立」（`universal`）还是
+  「本产品自身的规矩」（`product`）。
+  - `check-config.mjs` 新增 `CHECK_DOMAINS`（名 → 域），`CHECK_NAMES` **由它派生**
+    （不再单独维护，两份清单必然漂）；`domainOf()` 对未登记的名字返回 `null`。
+  - `.untildone/checks.json` 新增 `productRepo`（默认 `false` = 对任何项目安全），
+    **本仓显式写 `true`**。`loadChecks()` 新增 `declared`（显式写了哪些键），
+    让「本仓声明了 true」与「没写、恰好用默认」可区分。
+  - `requirePath()` 拆出 `requireProduct()`：本产品自身的产物，`productRepo=false` 时
+    记「本轮没跑」而不是报红（但**不静默** —— 输出末尾单列那一族 + 开关名字）。
+  - 元检查新增一条：`CHECKS` 里有检查没登记域 → 当场红（否则 DF-051 以「新加的一条规矩」复发）。
+- **实测（改前 / 改后，同一夹具：只有 `README.md` + `git init` + `scripts/` 副本）**：
+
+  | | 违规 | 其中「规定产物」 | exit |
+  |---|---|---|---|
+  | 改前 | **66** | **63** | 1 |
+  | 改后 | **0** | **0** | 0 |
+
+  判据本来是「违规 ≤ 5 且都是真问题」，实测 **0** —— 剩下的都是「未跑」（有登记、不阻塞）。
+- **负向证据**：`check-config.test.mjs` 的「DF-051 正向对照」用**同一份夹具**只翻
+  `productRepo` 一位，断言 `true` 时违规数必须比 `false` 时多 10 条以上且点名
+  `docs/CHANGELOG.md` —— 它证明「≤ 5」不是因为门什么都没查。
+  另一条直接断言违规行里**不许**出现「规定产物」这几个字。
+
 
 ### DF-052 [open] 台账 50 条 finding 里，只有 4 条真的属于「框架表达力不足」
 
@@ -2556,7 +2588,7 @@ const LIVING_DOCS = [
   若把 DF-003/014/030 划进 A，则变成 7/49。
 - 建议归属：记录，供决策；不作为施工项
 
-### DF-053 [open] 文档里的「检查条数」写 23，实际 25，且没有任何检查在对账这个数
+### DF-053 [fixed] 文档里的「检查条数」写 23，实际 25，且没有任何检查在对账这个数
 
 - 发现于：2026-11-21 批判 Agent 点名 + 主线程复核
 - 位置：`README.md:68`（`- **结构硬门** —— 23 项检查…`）、`README.md:365`（`# 结构硬门：23 项检查，0 违规才绿`）；
@@ -2604,7 +2636,7 @@ const LIVING_DOCS = [
   `docs/research/2026-11-13-critique-stop-hook-product.md` 已由红队指出同类问题，**未修**。
 - 建议归属：独立任务（小修，可立刻做）
 
-### DF-056 [open] 台账里 `action:"block"` 有 8 条，真实项目真实拦截 0 次——`block` 字段会骗人
+### DF-056 [fixed] 台账里 `action:"block"` 有 8 条，真实项目真实拦截 0 次——`block` 字段会骗人
 
 - 发现于：2026-11-21 红队 Agent 声称；**主线程独立复算并修正了它的数字**
 - 证据（主线程复算 `tasks/runs/stop-hook` + `%LOCALAPPDATA%/Overwatch/stop-hook` 全部 376 条记录）：
@@ -2623,9 +2655,14 @@ const LIVING_DOCS = [
   对「全部测试通过，1626/1626」拦截。同一个会话、同一个门。
 - 影响：产品主张「一次做完」在「做没做完」这个维度上，实测拦截次数为 0。
   它验的是「你说过要验证的话有没有验证过」，不是「你说做完了到底做没做完」。
-- 建议归属：**产品方向决策**，不是施工项
+- **2026-11-24 处置（fixed）**：本轮按 `docs/roadmap.md` 目标 4 复算并**改写文档定位**。
+  复算仍是 0（412 条里 8 条 block：6 条 `mode:"off"` / 1 条合成会话 / 1 条 e2e 沙箱），
+  详见 `DF-087`。三处改写成「它验的是说过的检查，不是活儿」：`README.md`「边界二」整节、
+  `docs/CAPABILITIES.md` §3、新增 `docs/adr/0005-stop-hook-scope.md`。
+  **代码保持原定位**：没有为了让拦截数变好看而收紧判据 —— 那会造出第二个本条。
+  不修的根因（判据本身不存在）记在 `tasks/accepted-deviations.md` AD-005。
 
-### DF-057 [open] `Stop` hook 对「诚实地停下来」零杠杆：`no-checkable-claim` 占台账 40%
+### DF-057 [triaged] `Stop` hook 对「诚实地停下来」零杠杆：`no-checkable-claim` 占台账 40%
 
 - 发现于：2026-11-21 红队 Agent 实测
 - 证据：台账 376 条里 `no-checkable-claim` **131 条（34.8%）**、`unparsable-input` 214 条（56.9%）。
@@ -2635,9 +2672,15 @@ const LIVING_DOCS = [
   而用户经历的痛恰恰是后者（三轮问「还有哪些没做完」，代码零改动）。
 - **红队的自我限定**：它没能做反向抽样，「真失败率」没有基线，所以只能说「在这 3 个案例上没拦住」，
   不能说「拦不住 X% 的失败」。这一条按该限定收录。
-- 建议归属：产品方向决策
+- **2026-11-24 处置（triaged → AD-006）**：复算确认这个比例更高 —— 按**能解析的** 198 条记录算，
+  `no-checkable-claim` 是 **154 = 77.8%**（原 34.8% 是被 214 条 `unparsable-input` 老格式稀释过的）。
+  两个修法都被否掉并写进 `tasks/accepted-deviations.md` AD-006：
+  ① 把 `UNKNOWN`/`UNCHECKABLE` 改成拦 → 误拦诚实的人，闸会被关掉；
+  ② 让判据认出「诚实停下」→ **在线时判不了**（要看下一句，下一句还没发生；
+  本仓实测过同类问题：`classify-stop.mjs` 在线判定 95.4%→100% `UNCLASSIFIABLE`）。
+  这条**不修**，但 77.8% 这个数现在是 README「边界二」的正文 —— 它证明「本方向没有杠杆」。
 
-### DF-058 [open] 验证白名单靠**脚本名**判断，`exit 0` 的空脚本可骗过；空输出也算通过
+### DF-058 [fixed] 验证白名单靠**脚本名**判断，`exit 0` 的空脚本可骗过；空输出也算通过
 
 - 发现于：2026-11-21 红队 Agent 负向测试
 - 位置：`scripts/verify-claims.mjs` 的 `SCRIPT_VERIFY_NAME_WORDS`（含 lint/test/check/verify/validate 等词）与 `buildEvidenceIndex`
@@ -2645,9 +2688,17 @@ const LIVING_DOCS = [
   `cmd="node --test nonexistent-empty-dir/"` 输出为空 → `allow, all-claims-supported`。
   `ok` 由**退出码**而非输出内容决定。
 - 影响：`docs/research/` 里已由红队点过同一个洞（「写个 exit 0 的空脚本就永远通过」），**至今未堵**。
-- 建议归属：独立任务
+- **2026-11-24 处置（fixed）**：堵住了「输出为空 + exit 0」这一整类，外加顺带发现的
+  「只读命令被当成验证」（`DF-088`）与「空输出的真实形态是宿主占位符」（`DF-089`）。
+  修后四条攻击形态全部 `block`，且 reason 点名那条命令。
+  **另一半是防误伤**：`node --check` / `tsc --noEmit` / `eslint` 按设计静默，
+  专门有用例守着它们仍然放行 —— 没有这一半，修法本身就是错的。
+  仍然**没修**的那一层（断言里的数量不与实测比对）记在 `tasks/accepted-deviations.md` AD-007，
+  实测确认「跑 3 条测试、声称 1626 条」今天仍然放行。
+- 剩余风险：`isReadOnlyCommand` 是命令文本判据，一个**看起来像执行**的只读命令
+  （如 `node -e "读文件"`)仍可能被算成验证。判据不可能完备，代价已量化（0.41% 误伤）。
 
-### DF-059 [open] 台账状态的正则只认 `[a-z]+`：写 `[bogus-state]` 能整条逃过枚举检查
+### DF-059 [fixed] 台账状态的正则只认 `[a-z]+`：写 `[bogus-state]` 能整条逃过枚举检查
 
 - 发现于：2026-11-21 主线程对 `checkLedger` 做负向测试时发现
 - 位置：`scripts/check-structure.mjs:2082`（`text.split(/^### /m)` 后的 `head` 匹配）
@@ -2862,7 +2913,7 @@ const LIVING_DOCS = [
 静默吞掉真导入。**即使决定永远不给载荷加 `render-plan`，那个也必须修。**
 
 
-### DF-064 [open] 「角色在哪」有三套答案、两种配置来源，互相不认
+### DF-064 [fixed] 「角色在哪」有三套答案、两种配置来源，互相不认
 
 - 发现于：2026-11-21 红队第 6 条；主线程复核
 - 证据：
@@ -2878,7 +2929,34 @@ const LIVING_DOCS = [
 - 性质：这**不是 DF-062 引入的**（`roles.mjs` 从来没读过 `checks.json`），
   但 DF-062 的修复新增了 `<pkgRoot>/agents` 这条约定，等于给「角色在哪」添了第三个答案。
 - 影响：任何用 `checks.json` 调过 `agentsDir` 的项目，硬门和派发器看的是两个不同目录。
-- 建议归属：独立任务（先定「谁是权威」，再决定要不要让 roles.mjs 读配置）
+- **状态**：**fixed（2026-11-24）**。
+- **本轮先做了「三者会不会分叉」的实验**（`D:\tmp-ext\r32`：项目里只有 `team/agents/qa.md`，
+  `checks.json = {"agentsDir":"team/agents"}`，`scripts/` 是副本）：
+  ```
+  $ node scripts/check-structure.mjs
+    [team/agents/] 1 个角色定义里没有一个引用 --inbox    ← 硬门读了 team/agents（按配置）
+  $ node scripts/validate-run.mjs --help
+    [validate-run] 角色表 → 框架角色目录 ./.claude/agents（0 个；用户项目里没有 .claude/agents/）
+                                                        ← 运行期读了另一个地方
+  ```
+  **结论：会分叉**，而且分叉时两边都报绿/报红得「像那么回事」——没有一个机制发现它们不一致。
+- **修法是删掉一个真源，不是让 `roles.mjs` 也读配置**（那会添第二个真源，而两份必然漂，
+  本仓为这件事付过账：DF-013 / DF-044 / DF-062）：
+  1. **`checks.json` 不再有 `agentsDir` 键** —— 写进去就是「未知的键」错误
+     （`validateChecks()` 当场报，不静默回落）。
+  2. **硬门的 `AGENTS_DIR` 改为 `rolesDirFor(ROOT)`**（`check-structure.mjs:198`），
+     不再自己拼 `join(ROOT, CFG.agentsDir)`。
+  3. `rolesDirFor()` 恒等于 `<根>/.claude/agents` —— 与宿主加载项目角色的路径**同一个**。
+     唯一真源就是它：纯路径拼接，没有「探测」「候选」这些分支。
+- **修后实测**（本仓）：硬门 `AGENTS_DIR`、`rolesFor(root).dir`、`agentsDir()` 三者
+  逐字相同（`D:\Projects\Overwatch\.claude\agents`），`'agentsDir' in config === false`。
+- **负向证据**（`roles.test.mjs`，2 条）：
+  - `validateChecks({agentsDir:'team/agents'})` 必须 `ok:false` 且理由是「未知的键」；
+  - 硬门源码必须匹配 `const AGENTS_DIR = rolesDirFor(ROOT)` 且**不含** `CFG.agentsDir`
+    —— 判据从源码读但**不用** `src.includes('X(')` 那种能被注释骗过的形态（本仓吃过这个亏）。
+- 代价（如实记下）：**别人的项目不能再用 `checks.json` 把角色目录挪到 `team/agents`**。
+  这是有意的：宿主只认 `<项目根>/.claude/agents/`，允许配置挪走等于让「门看到的角色」
+  与「宿主实际加载的角色」永久不一致 —— 而那正是本条要消灭的东西。
 
 ### DF-065 [open] `displayPath` 在两个模块各导出一份，硬门探针表按名字命中，其中一份从未被验过
 
@@ -3411,3 +3489,924 @@ $ OVERWATCH_STATE_DIR=/tmp/fx node scripts/overwatch.mjs
 - 修法：在 `checkDispatchCoverage()` 里加一段——活文档（README / CLAUDE / GUIDE /
   CAPABILITIES）里凡写「N 项检查」，N 必须等于 `CHECK_NAMES.length`。
 - 负向：改回 23 → 两处同时红。
+
+### DF-079 [fixed] `roles.mjs` 声称 frontmatter 可覆盖 `forbiddenContext`，但没有任何调用方消费它
+
+- 发现于：2026-11-22 用户要求「核实上下文隔离是真在生效还是只是写着」，主线程实测
+- 位置：`scripts/roles.mjs:242`（注释承诺）、`scripts/roles.mjs:374`（读入注册表）、
+  `scripts/compose-agent-prompt.mjs:439`（`FORBIDDEN_BY_ID[roleId]`，读的是冻结表）
+- 证据（主线程实测，临时项目 + 一份 `oversight-executor.md` 副本，往 frontmatter 加
+  `forbiddenContext: self_assessment`）：
+  ```
+  注册表 executor.forbiddenContext = ["self_assessment"]
+  compose independence = true | 该角色无额外禁止项      ← 覆盖没生效
+  ```
+  对照：冻结表里的角色（`acceptor` / `review` / `redteam`）确实生效 ——
+  给 `acceptor` 注入 `review_score` 会被拒（exit 1，且不落文件）。
+- 影响：**任何依赖 frontmatter 覆盖来收紧独立性的项目会以为自己加了一道闸，而那闸没接线。**
+  与本仓台账最高频的缺陷形态同形：配置坏了但看起来一切正常（DF-031/033/039/040/041/047）。
+- **修法（2026-11-23，两处缺一不可）**：
+  1. `checkPromptSpec` 新增 `roles` 参数，第 9 项**先查注册表记录**，冻结表只在记录
+     不存在时作缺省。顺序不能反 —— 反了就等于「覆盖只在冻结表没有该角色时生效」，
+     而那正好是 6 个角色之外的所有人，是一项永远不会被注意到的半修。
+  2. `compose` 的 CLI 把 `rolesFor(root)` 传进 spec。不传的话函数回落到 `defaultRoles()`
+     （框架注册表），项目的 `.claude/agents/` 里的覆盖会在派发时被静默忽略。
+  3. 通过时的理由多一句「（来源：注册表 / 冻结表）」—— 没有它，「覆盖生效」与
+     「恰好没有禁止项」在屏幕上同形。
+- **负向（`scripts/forbidden-override.test.mjs`，6 条，全部 spawn 真 CLI，实跑）**：
+  - 正向：加覆盖 → `independence` ✗、exit 1；
+  - 反向：**去掉**覆盖 → 同样的 `self_assessment` → ✓、exit 0（否掉「永远拒绝」）；
+  - 覆盖是**替换**不是合并：acceptor 只写 `self_assessment` 时 `review_score` 不再拦；
+  - 对照组：acceptor 不写覆盖时冻结表照旧拦住（否掉「改成只读注册表」的半修）；
+  - 回退：删掉 CLI 里的 `roles,` 那一行 → 3 条红（正向 + 替换 + 回退断言），实测贴：
+    ```
+    ✖ 正向：executor 的 frontmatter 加 forbiddenContext: self_assessment → independence 判 ✗
+    ✖ 正向：覆盖是**替换**不是合并 —— 只写一项时，冻结表里的其他项不再拦
+    ✖ 回退：CLI 不再把 roles 传进 spec → 覆盖立刻失效（这条判据必须变红）
+    ```
+- 建议归属：已完成
+
+### DF-080 [fixed] 交付裁决函数已实现且有 39 条测试，但**还没有任何调用点**
+
+- 发现于：2026-11-22 本轮自评（写了 `scripts/delivery-verdict.mjs` 之后回头找调用方）
+- 位置：`scripts/delivery-verdict.mjs` 的 `deliverVerdict()`；应接进
+  `scripts/validate-run.mjs`（派发前声明 `keyPaths`）与一个收活时读 `redteam.md` 的读取器
+- 证据：`grep -rn "delivery-verdict" scripts/ docs/ .claude/ templates/` 只命中它自己、
+  它的测试、以及 `check-structure.mjs` 的两处登记（PROBE_ARGS / REGISTERED）。
+  没有任何生产路径 import 它。
+- 性质：**这就是 DF-042 的同一种形态**——「定义里写得再对，没人调用等于不存在」。
+  本轮把规范与函数写出来了，但如果不登记这条，下一个读者会以为裁决已经自动化了。
+- 影响：目前 `evidence-discipline.md` §10 的「调用位置」表描述的是**应当**在哪里调用，
+  不是**已经在**哪里调用。两者在屏幕上同形，所以必须显式记一笔。
+- 建议修法：
+  1. `validate-run.mjs` 的子树校验加 `keyPaths` / `requiredStrong`（可选字段，
+     但一旦写了就必须合法），并把它们注入 compose 的 L2；
+  2. 加一个收活命令（或 `claim-ledger` 的子命令）读
+     `tasks/runs/<run-id>/{acceptor,redteam}.md`，调 `deliverVerdict()` 打印裁决；
+  3. **必须有负向测试**：「验收 PASS + 红队 BLOCK → 打印 BLOCKED」这条要在
+     CLI 层跑一遍，不能只在纯函数层跑。
+- **修法（2026-11-23，第 2、3 项完成，第 1 项仍未做）**：
+  1. `delivery-verdict.mjs` 底部新增 `parseRedteamReport()`（表头驱动的红队报告读取）
+     与 `main()` + 入口守卫（CLI）。CLI 参数：`--acceptor` / `--redteam` /
+     `--key-paths` / `--required-strong` / `--subject` / `--deviation-refs` / `--json`。
+  2. **退出码就是裁决**：`0 PASS / 1 FAILED / 2 BLOCKED / 3 用法错误`。
+     `FAILED` 与 `BLOCKED` 分开，因为处置不同（修复后重验 vs 补采样/补强证据）。
+  3. `SKILL.md` 的 Phase E 新增第 0 条：先跑裁决，附完整命令 + 四行退出码对照表，
+     并写明「验收 PASS 但红队 BLOCK」是合法输入、裁决给 `BLOCKED`。
+  4. **读不到 ≠ 通过**：`--acceptor` 文件不存在时 exit 3；红队报告解析不出表时折成
+     一条 `dispatch=block` 的 malformed 条目 —— 一份判不了的红队报告不能当成
+     「没有阻断项」，那是静默共识。
+- **负向（`scripts/delivery-verdict-wiring.test.mjs`，14 条，实跑）**：
+  - 把 SKILL 里那条 `node scripts/delivery-verdict.mjs` 换成「主线程自己看着办」→
+    **2 条红**（「Phase E 段内有一条调用」+「回退断言」），实测：
+    ```
+    ✖ SKILL.md 的 Phase E 段内有一条 `node scripts/delivery-verdict.mjs` 调用
+    ✖ 回退：把 Phase E 里那条调用删掉，上面的判据必须变假
+    ```
+  - CLI 六个端到端用例（BLOCKED / PASS 对照 / FAILED / 读不到 / 缺 --acceptor /
+    key_path_undeclared）全部 spawn 真进程；「PASS + 红队 block → exit 2」
+    与「验收不通过 → exit 1」是分开的两条，混成一个码就无从知道下一步做什么。
+- **仍未做的（如实列出，不假装已做）**：第 1 项 —— `validate-run.mjs` 的派发前校验
+  **没有**接过 `keyPaths` 的合法性校验。`keypaths.json` 现在由主线程手写，
+  写成什么形状都不会在派发前被拒；它只会在收活时表现为「所有 block 条目都是
+  `key_path_undeclared`」。判据在收活侧仍然生效，但派发前就拦住更好。
+- 建议归属：主体已完成；`validate-run` 那一半是独立任务
+
+### DF-081 [fixed] 失败处理的默认路径是「把失败上下文交给 repair」，而那正是锚定源
+
+- 发现于：2026-11-23 用户给了一条外部实证后，主线程核对 Phase E
+- 位置：`.claude/skills/oversight/SKILL.md` 原 Phase E 第 2 条
+  （`2. 不通过 → oversight-repair → 完整重新验收`）、
+  `.claude/agents/oversight-repair.md:4` 的 description
+  （「仅在验收不通过或锐评低于阈值时触发。接收验收理由 + 原始交付物 + 锐评意见进行修复」）
+- 证据（外部实证，1.5B / 3B / 7B 匹配预算）：
+  | 观察 | 数字 |
+  |---|---|
+  | 盲重采样在 7B 以下是最强条件 | 7B 才与最佳「修复」持平 |
+  | 盲重采样相对「修复」的 token | 少 **2.5–5.5 倍** |
+  | 失败程序喂回去后复现近似相同的程序 | **33–68%** |
+  | 盲重采样的重复率 | **2–14%** |
+  | 「执行反馈」在无内容失败通知之外的额外贡献 | 无可测量的额外贡献 |
+- **证据等级：外部研究，不是本仓实测。** 本仓的失败样本量任何时候都做不了这个对照。
+  它支撑的是「默认值」这个选择，**不支撑**「本仓失败率会降几个点」这类断言。
+- 影响：每一次验收不通过 / 红队阻断 / 执行失败，都把失败输出当输入再喂一遍，
+  而且 recipient 是一个被明确要求「对着这些问题修」的角色 —— 这正是 33–68% 那个形态。
+- 修法：
+  1. `dispatch-contract.md` 新增 §8：A 盲重采样（默认，无条件）/ B 局部修复（例外，
+     C1 定位 + C2 局部 + C3 不复用三条同时成立），两条路径的输入差**只有**「有没有
+     `file:line`」，失败输出在两条路径上都**不给**。
+  2. §8.4 把「可定位性」的判定权归 Hub，明确禁止失败实例自报「我能修」。
+  3. §8.6 **如实列出两条判不了的**（「是否真可定位到局部」依赖 Hub 对代码的判断；
+     「7B 以上自修复更优」要求一份不存在的实验）。后者因此**当前不可开启**。
+  4. `compose-agent-prompt.mjs` 新增 `FAILURE_CATEGORIES` / `failureNoticeText()` /
+     `failureNoticeProblem()`，并把 `failure_notice` 做成 `checkPromptSpec` 的第 10 项。
+     **这才是关键**：`--prior-failure` 是 CLI 上真实存在的参数，只在文档里写「不许传
+     具体内容」等于没有约束（契约 §8.6 自己就是这么要求的）。
+  5. `SKILL.md` Phase E、`oversight-repair.md`、`oversight-executor.md`、
+     `templates/dispatch.md`、`docs/GUIDE.md` 同步。
+- 负向（都真跑过）：
+  - CLI 里删掉传 `priorFailure` 的那一行 → 带内容的失败通知重新通过（exit ≠ 1）；
+  - 把 `failureNoticeProblem` 放宽成「包含句式即可」→
+    `上一次派发失败（…）。本次从原始任务契约重新开始。另外你上次在 AC2 漏了 fail_if`
+    被放行；严格版拦住它；
+  - `FAILURE_*` 三个导出不登记功能表 → `checkStructure` 的「导出未登记」提示多三条。
+- **这一轮里我自己写错的一条测试**（记下来，因为它就是本仓反复批评的形态）：
+  `failure-path-wiring.test.mjs` 第一版用 `/盲重采样/` 判 Phase E 有没有接上新的默认路径。
+  那个词在那一段里出现 **5 次**（决定句、次数上限、理由段），所以把决定句改回
+  「交给 oversight-repair」时判据照样通过 —— **假绿**。改成锚在
+  `任一条不满足 → 盲重采样` 这一句上之后，回退才真的能打红。
+- 建议归属：已完成。**未做的事**留在这里，不要当成已做：
+  - 轮次与熔断（每子树 3 次 / 盲重采样 2 次）目前只有**文档判据**，没有脚本在数派发次数。
+    要机械判定得让 `claim-ledger` 或 `compose` 记「这是第几次派这个子树」；
+  - §8.5 的「7B 以上自修复」没有对照实验，也没有 ADR —— 它是**关闭**的，不是「待做」。
+
+### DF-082 [fixed] 主线程自己不在验证范围内：所有门禁都在核 Spoke，没有角色核 Hub 说过的话
+
+- 发现于：2026-11-23 主线程复盘本会话的错误分布（用户提出「不加架构的前提是架构是对的」）
+- 位置：门禁的角色分工 —— `oversight-acceptor` 核 Spoke 的交付物、
+  `oversight-redteam` 攻击 Spoke 的结论、`oversight-critic` 核拆解图。
+  **没有一条落在主线程的输出上。**
+- 证据（本会话实测）：
+  | 事实 | 数字 |
+  |---|---|
+  | 主线程（Hub）在本会话犯的错 | 7 次 |
+  | 其中被 Spoke（子 Agent）用可复现证据抓住 | 5 次 |
+  | 被用户抓住 | 1 次 |
+  | 自己后来发现 | 1 次 |
+  而 Hub 的错误里**一半是事实类断言**（说了一个数字/一句话）—— 这类错误不需要判断力
+  去发现，只需要有人跑一遍命令。此前没有任何角色被派去做这件事。
+- 影响：Hub 出错 → Spoke 打回 → Hub 修正这条链路是真的在起作用，但它**依赖 Spoke 恰好
+  需要用到那个事实**。一个没被下游用到的数字错了，就一直错着进交付物。
+- 修法：
+  1. `.claude/agents/oversight-verifier.md`（新角色，叶子）：
+     - `tools: Read, Grep, Glob, Bash, Write`，**无** `Task` / `Agent`（深度恒 1 不变）；
+     - 只核**四类可机械验证**的断言：数字 / 文件路径 / 命令输出 / grep 与行号。
+       **不核判断**（判断没有对错可判，塞进去会让它退化成第二份锐评）；
+     - 输入是主线程本轮输出的**原文**，不是自我总结；
+     - 判定只有三值：`成立` / `不成立` / `无法核验`。**「无法核验」不是「成立」。**
+  2. `SKILL.md` 新增 **Phase C.5**（汇总之后、验收之前）：派一个 `oversight-verifier`，
+     附 `compose` 命令、三种结论各自的处置。
+  3. 硬门新增 **`checkHubVerifier`**（`CHECK_NAMES` 28 → 29）：角色文件在、
+     `tools` 无派生工具、且 **SKILL.md 真的派发它**。第三条判据是「派 …」这种动词形态，
+     不是「名字出现过」—— `oversight-probe` 当年正是「定义在、从没派」。
+- **配套改动（必须写下来，因为它改变了硬门的一条规则）**：
+  `oversight-verifier` 是 `readonly: true` 且带 `Bash`。修前 `checkAgents()` 的规则是
+  「只读角色不得含 `Bash`」，理由是 `Bash` 能写盘。但核验类角色的职责**就是**跑只读命令，
+  没有 `Bash` 它只能退化成「读一遍源码觉得它对」—— 那是判断不是核验。
+  规则**没有放松**：`roles.mjs` 新增 `BASH_SCOPES = ['read-only']` 与 `bashScopeOf()`，
+  带 `Bash` 的只读角色必须 ① frontmatter 写 `bashScope: read-only`，**且**
+  ② 正文有 `## 允许的命令` 清单。两条缺一条照样红。认不出的值（`readonly` /
+  `read-only-bash`）一律当没写 —— 与 `truthyFlag` 同理，拼错的值不能静默变绿。
+- **负向（`scripts/hub-verifier.test.mjs`，9 条，硬门那三条跑真身 + 临时副本，实跑）**：
+  - SKILL 的「派」改成「本轮不使用」→ 红，报「只被提到、没被派发」，
+    且**未**误报「从不派发」另一分支（两条判据分支必须分开：功能被删 vs 接线断了）；
+  - `tools` 加 `Agent` + 删掉 SKILL 引用（同一份副本，一次门运行）→ 两条报错同时出现；
+  - 未改动的副本（对照组）→ exit 0（否掉「门永远红」）。
+- **这一轮修了一条自己的慢**：`hub-verifier.test.mjs` 第一版把两处变异分成两条用例，
+  各跑一次真门（各约 20–30 秒），合计 100 秒。改成「同一次运行里放两处独立变异」后
+  降到 17 秒，且**更强**：一次运行里两条报错都必须出现，「只出现一条」会让用例红 ——
+  那正是「某条判据悄悄失效」的形态。
+- 建议归属：已完成。**未做的事**留在这里：
+  - `oversight-verifier` 现在只有一条硬门守「被派发」，**没有任何东西守「派了之后真的在看」**。
+    一条「我核过了，全部成立」的空报告与真核过的报告在屏幕上同形 —— 这是下一个洞，
+    而堵它需要先定义「核验的最小覆盖」（例如「至少 N 条断言 + 每条带命令」），
+    那条判据现在还没写。
+
+### DF-083 [fixed] 五个成功指标一个都没在算，且「规范指定的归属键」实测 0 效率
+
+- 发现于：2026-11-23 目标 2。`docs/spec/success-metrics.md` 定义了五个指标，
+  但 `grep -rn "success-metrics" scripts/` 只命中它自己的文档引用 —— **零读取器**。
+- 位置：新增 `scripts/compute-metrics.mjs`（+ `compute-metrics.test.mjs`，27 条）
+- 证据（真实数据，本机 454 份 transcript / 730 MB）：
+  ```
+  $ node scripts/compute-metrics.mjs
+  | 1 | 每任务调用数 / token | 部分可算 | 454 份 transcript，去重后 55,656 次调用 / 231,056,476 计费 token；任务级归属 0/3 |
+  | 2 | 盲重采样命中率     | 不可算 | 分母可算（3 条 expect / 1 条 prompt），分子不可算 |
+  | 3 | 局部定位准确率     | 不可算 | C2（anchor ∈ outputs）4/5 · C1 机械部分 5/5 |
+  | 4 | 误放行 / 误拦截     | 不可算 | PASS 总数 7 · 1 条链「通过后又判不通过」（候选） |
+  | 5 | 一次 vs 终态成功率  | 不可算 | —（与 2 / 4 卡在同一条记录） |
+  ```
+- **本轮最硬的一条实测**：规范说任务归属用 `expect.nonce` + 首条 user 消息。
+  实测 **0/3**，且 `observe` 自己跑出同一个数：
+  ```
+  $ node scripts/claim-ledger.mjs observe --run 2026-11-13-output-reconciliation --session <会话>
+  扫了 256 份子 agent transcript，没有一份能归属到任务（nonce 对不上，也没有 --task）。
+  ```
+  真因不是 bug，是**数据形态**：nonce 在 transcript 的中段（实测 byte 288,185 / 423,275），
+  来自子 agent 自己 `Read` 了 `claims.jsonl`。`readHeadText` 只读前 64 KiB，永远读不到。
+  代理通道（outputs 写者）也归不了：每个任务有 **2 / 5 / 7** 份候选 transcript。
+- 影响：**「这个框架有没有用」至今没有任何数字**。而这一轮证明了：缺的不是五个能力，
+  是**同一条记录**（`kind:"verdict"`）—— 它一处落盘，指标 2 / 4 / 5 同时成立。
+- 三个口径决定（各自都有实测支撑，写在脚本注释里）：
+  1. token 去重**取最大**，不取第一条。实测 29,678 个 `message.id` 里 **5,177 个「0 与非 0 并存」**；
+     first-wins 少算 **15.0%**（81.65M vs 96.36M）；
+  2. 结局链**按声明轮次排**，不按完成时间。`50ec242b` 的 r2 最后完成，按时间排会得到
+     「不通过 → 不通过 → 通过 → 通过」这条**错的**链；
+  3. 同会话两套 AC 标准**按 AC 编号集合分组**。`71f44160` 的 10 项与 12 项是两个任务，
+     合成一条会串出假链。
+- **样本量必须说的话**：指标 2 / 5 的那两个数（平均重采样 2 次、first_pass 0/2）
+  **样本量不足以支撑结论**。n=2，且两条链全部来自 2026-10-29/30 两天的两个会话，
+  之后（11 月至今）**一条结局都没再产生过**。把它们当规律引用是错的。
+- 负向（都真跑过）：
+  - 删掉 `COMPUTE_METRICS_FNS` 登记 → 「未登记」提示从 0 条回到 **13 条**；
+  - `compute-metrics.test.mjs` 的 27 条里，钉住的是四种失效形态：不可算退化成 0、
+    小样本被当率、重复记录被当多干活、引用格式被当产出。每一条都有对应用例。
+- **这一轮我自己犯的错（必须记）**：初版 `metric1` 对「每任务 × 每 transcript」各读一次全文件，
+  在本仓语料上是 1062 次全文件读，命令 120s 超时被杀两次。改成「nonce 一次扫完 + 头部 64 KiB」
+  之后才能跑完。**如果不是被超时挡住，我会交出一个「跑不完的度量器」而不是一个错的数字** ——
+  后者更坏，因为前者至少会响。
+- 建议归属：已完成（度量器落地）。**未做的**：那三条记录点（`verdict` / `locator` / `usage`）
+  本轮**只写清加在哪，不实现** —— 因为加记录点要改 Phase E 的真实链路，
+  而 Phase E 现在刚接上 `deliverVerdict()`（DF-080），两个改动叠在一起会分不清是谁的回归。
+
+### DF-084 [fixed] 分域修法自己会复发：新加一条检查默认被当成「任何项目都该成立」
+
+- 发现于：2026-11-24 修完 DF-051 后自问「这个修法下一次怎么坏」
+- 位置：`scripts/check-structure.mjs` 的运行循环 + `scripts/check-config.mjs` 的 `CHECK_DOMAINS`
+- 性质：**这是 DF-051 修法自身的失效形态**，不是别人的缺陷。分域把「17 条产品规矩」
+  从任何项目里摘了出去，但摘的依据是 `CHECK_DOMAINS` 这张**手写表**。下一轮有人加一条
+  「本产品自身的规矩」，忘了登记域 → `domainOf()` 返回 `null` → 运行循环保守地当成
+  universal 执行 → **它在每个陌生项目里报红，而 DF-051 以「新加的一条规矩」的形式回来**。
+  这正是本仓最稳定的缺陷形态（手写清单 + 静默默认值）。
+- 修法：运行循环**不**把 `null` 当成 universal 兜底，而是把「未登记」这件事本身变成红 ——
+  `checkDispatchCoverage()` 新增一条比对：`CHECKS` 表里有名字 `domainOf()` 查不到 → fail，
+  报错文案写明「未声明 = 被当成任何项目都该成立，DF-051 会复发」。
+  运行循环仍然保守执行（宁可多查），但**屏幕上红着**，不会被忽略。
+- 负向证据：`check-config.test.mjs` 的「每一条检查都声明了适用域」直接遍历 `CHECK_NAMES`
+  断言 `domainOf(n)` 只能是 `universal` / `product`；拼错成 `universel` 会让那条检查
+  **永远不跑**（`PRODUCT_REPO === false && domain === 'product'` 判等失败），所以域值也一起核。
+- 代价：加一条检查现在必须回答两个问题（叫什么、属于哪一族），而不是一个。
+  这是有意的：那个问题本来就必须有人回答，只是以前默认答案是错的。
+
+### DF-085 [fixed] 「本产品自身的产物不在盘上」被逐份打印：3 条违规后面跟 60 行「未跑」
+
+- 发现于：2026-11-24 修 DF-051 时的第一次实跑（`D:\tmp-ext\pol3`）
+- 位置：`scripts/check-structure.mjs` 的 `requireProduct()` 与输出段
+- 证据：陌生项目里 `✗ 2 项违规` 之后跟 **61 处未跑**，其中 `docReferences` / `docCommands` /
+  `docConstants` 各 15 行（`livingDocs` 清单 16 份 × 3 条判据）。
+- 为什么这是缺陷而不是「详细」：DF-051 的判据是**观感**（「那不是检查，那是要求对方复制
+  我们整套文档」）。60 行「未跑」在屏幕上与 60 行违规没有区别 —— 读者只会去关掉这道门。
+  逐份打印说的是「你这儿少了一份 X」，而事实是「这条检查的覆盖面比它的名字窄」。**两件事。**
+- 修法：按检查聚合成**一行**（`检查名（N 处）`），并在摘要行里计入
+  「N 条因本产品的产物不在盘上而未覆盖」。`notApplicable`（整族不执行）与它分开列 ——
+  那是「这一族对你不适用」，不是「这条检查没查全」。
+- 负向证据：`check-config.test.mjs` 的陌生项目用例断言输出里必须出现
+  「本产品自身的规矩本轮不适用」与开关名字（不静默），同时违规行数 ≤ 5。
+  把聚合改回逐份打印**不会**让它红 —— 那一条靠的是「读者会不会被淹」这个判断，
+  不可机械判定。**如实记下：这一条修法没有测试守着，只有一次实测的前后对比。**
+
+### DF-086 [fixed] 测试文件模块级读本仓夹具，让「数测试条数」在别人项目里报假错
+
+- 发现于：2026-11-24 修 DF-050 时连带发现（同一次实跑的另一个症状）
+- 位置：`scripts/compose-agent-prompt.test.mjs:56-57`（修前）
+  `const ACCEPTOR_TEXT = read('.claude/agents/oversight-acceptor.md');`
+- 证据：陌生项目里结构门报
+  `[scripts/compose-agent-prompt.test.mjs] import 时就抛错，它的测试一条都不会被注册：ENOENT … .claude/agents/oversight-acceptor.md`
+- 性质：**这条报错本身是对的**（import 就炸的测试文件在全量跑里整块消失且不报错，
+  结构门该报它）。但它指向的是一份**只在本仓才有意义的夹具**，不是对方项目的缺陷。
+  与 DF-050 同源：`regression-count.mjs` 的探针会 import 每一个测试文件。
+- 修法：改**惰性读取**（`roleTextOrNull()`），import 永不抛；缺夹具时那两条用例
+  `t.skip(NEED_AGENTS)` 并写明原因 —— **不假装通过**。
+  刻意**不**写成「读不到就返回空串」：那会让断言对着空文本跑，失败信息变成
+  「tools 里没有 Bash」而不是「角色定义不在盘上」，一句指向错地方的诊断。
+- 负向证据：删掉角色目录后跑这两条用例必须 `skip`（不是 `pass`、不是 `fail`）；
+  结构门的「陌生项目」用例不再出现那条 import 报错。
+- **同类风险（未做，记在这里）**：`grep -n "^const .*readFileSync\|^const .*mkdtempSync" scripts/*.test.mjs`
+  还能再扫一轮 —— 本轮只修了实跑里**看得见**的那一处。别的测试文件如果在模块级读本仓夹具，
+  在陌生项目里会有同样的形态，只是当前没被 `regression-count` 的探针暴露（探针只 import 不跑）。
+
+### DF-087 [fixed] Stop hook 对「真实项目做没做完」实测拦截 0 次，而文档写的是「拦住过 2 条」
+
+- 发现于：2026-11-24 按 `docs/roadmap.md` 目标 4 复算（主线程亲自跑，不是 Agent 声称）
+- 位置：`README.md`「当前进度」表 + 旧「为什么不能自动接力」章节；`docs/CAPABILITIES.md` §3
+- 证据（复算 `tasks/runs/stop-hook/` + `%LOCALAPPDATA%/Overwatch/stop-hook/` 全部 412 条）：
+  ```
+  总 412 ｜ unparsable-input 214（51.9%，全是 11-18 前老格式）
+  能解析 198 ｜ no-checkable-claim 154 = 77.8%
+  action:"block" 8：
+    mode:"off" 观察记录            6   ← 不是拦截
+    合成会话（live-probe-2）        1   ← 不是真实项目
+    真 UUID 但 transcript 在         1   ← e2e 沙箱 hook-e2e-sandboxes/PC3-proj
+      e2e 沙箱（106aa1ae-…）
+  → 真实项目、真实会话的真实拦截 = 0。8 条 block 里 7 条不是真拦截。
+  ```
+  那唯一一条在**真实主机会话**上的判定（`ea4ef562-…`，87 条、跨 11-18→11-23，33 条有可核对断言）
+  全部 `allow`，**0 条被拦**。且被拦的 `106aa1ae` 之后**零条后续记录** —— 无「拦后补齐」闭环。
+- 影响：上一版 README 写「台账 355 条判定里拦住过 2 条」。355 是当时全量、2 是
+  `mode:"block"` 那两条 —— 而其中一条是合成会话、一条在 e2e 沙箱。**两个都不是真实项目。**
+  这不是精度问题，是把「脚本跑过这条路」当成了「它在真实项目里生效」。
+- 修法：README 新开「边界二」整节（判定表 + 412 条实测 + 怎么读这些数字），
+  功能条目 / 进度表 / CAPABILITIES §3 / 新增 ADR-0005 四处同步写实。
+  **没有改代码让它「看起来能拦更多」** —— 那会造出第二个 DF-056。
+- 建议归属：已完成（文档纠偏）。代码定位见 AD-005 / AD-006。
+
+### DF-088 [fixed] 验证白名单里「读一个名字像检查的文件」被算成一次验证
+
+- 发现于：2026-11-24 修 DF-058 时顺带负向测试 `isVerificationCommand`
+- 位置：`scripts/verify-claims.mjs` 的 `VERIFY_CMD_RE` 末段（裸文件名分支）
+- 证据（修前实测，四条全返回 `true`）：
+  ```
+  grep -n foo check-x.mjs        → true   ← 只是在读文件
+  cat check-gate.mjs             → true
+  git log --oneline check.mjs    → true
+  tail -20 scripts/check-structure.mjs → true
+  ```
+  测试里原本就把这条**钉成「本批未修」**（注释原文：「旧名字支至今按子串命中 ——
+  修它之前，这条断言保持 true 才是诚实的」）。
+- 影响：`vague-completion` 这一族要抓的是「一次检查都没做」，而任何会话都有大量
+  Read/grep 观测。只要被观测的文件名里带 `check`/`test`，这条就算「验证过」—— 本族形同虚设。
+- 修法：不动那条分支（它同时承载 `./run-tests.sh` 这类无解释器执行的正当用途），
+  在 `isVerificationCommand` **末尾**加只读否决 `isReadOnlyCommand()`：
+  整条命令按 `&& | || ;` 与换行切段，**每一段**去掉 `cd`/`export` 前缀后都要以读取动词开头，
+  且段内无执行动词、无重定向。任何一段不满足 → 不是只读 → 保持原判。
+- 实测代价（250 份真实 transcript、2207 次判为验证的调用）：翻成 false 的 **9 次（0.41%）**，
+  逐条看过全是真的只读（`grep … | head`、`sed -n '45,70p' run-tests.sh`、`head -50 build-apk.sh`）。
+- 负向证据：`verify-claims.test.mjs`「DF-058 负向：摘掉只读否决之后…」+ 原「既存缺陷」
+  那条测试**翻转**成「已修」并扩成 5 个只读形态 / 5 个执行形态。
+- 建议归属：已完成。
+
+### DF-089 [fixed] 「空输出」在真实语料里主要是宿主占位符，不是空串 —— 只判空串会漏 94%
+
+- 发现于：2026-11-24 修 DF-058 时，先量了「真实语料里空输出长什么样」而不是直接写判据
+- 位置：`scripts/verify-claims.mjs` `isSilentOutput()`
+- 证据（250 份真实 transcript、53,896 个 `tool_result`）：
+  ```
+  空字符串                                272 个
+  (Bash completed with no output)         437 个
+  (PowerShell completed with no output)    12 个
+  → 真实「空输出」里 94% 是宿主占位符，不是空串
+  ```
+  而**真实验证命令**里的空输出很少：363 次验证调用中 4 次（1.1%），
+  全是 pytest / `python -m …` 这类「真跑了但没打印」的形态。
+- 影响：只写 `text.trim() === ''` 的判据会**看起来修好了 DF-058，实际漏掉 94%**。
+  这个仓库已经吃过多次「判据写对了方向、量错了形态」的亏。
+- 修法：`EMPTY_OUTPUT_RE` 认两种形态并**同判**。另外必须区分第三件事：
+  「`content` 字段**缺失**」只出现在合成夹具里（实测 `replay-stop-gate.test.mjs`），
+  语义是「我们没读到输出」，不是「输出是空的」—— 混为一谈会把「我没读到」说成「你造了假」。
+- 代价（实测回归）：第一版没做这个区分，`replay-stop-gate.test.mjs` 从 4/4 变 2/4。
+  修法即上面那条区分，并补了一条测试钉住它。
+- 建议归属：已完成。
+
+### DF-026 补充（2026-11-23）：flaky 范围比原记录大，且全量跑必然出现
+
+**实测（本轮四个 Agent 并行 + 守护进程在跑时）**：
+```
+node --test scripts/   → tests 2080 / pass 2073 / fail 5  （两次）
+单跑同一批            → tests 12 / pass 12 / fail 0
+```
+**在干净 HEAD 的 worktree 上同样失败**：`tests 1998 / pass 1990 / fail 6`。
+所以**不是本轮改动引入的**，是既有问题。
+
+失败的 4-5 条全部集中在 `watch.test.mjs` 的 `DF-028` 组（进程存活探测）：
+- `DF-028 负向②：PID 存在（用自己的 PID 模拟）→ 必须报「还在但卡住了」`
+- `DF-028 负向③：PID 被复用（同 PID、启动时间对不上）→ 不得判成「还活着」`
+- `DF-028：心跳停了 + 进程还在 → 结论里说「卡住了，先看日志」`
+- `DF-028 写见证：claimOwnership 会带上 pid 与 startedAt，且跨调用稳定`
+
+共同特征：单条耗时 **5-6 秒**（正常应在百毫秒级），等于撞上了某个超时阈值。
+
+**推测（未验证）**：这组测试要 spawn `powershell -Command "Get-Process ..."` 或调
+`process.kill(pid, 0)`。并发负载下 powershell 启动慢，超过内部超时。
+**没有验证过**，不当作结论。
+
+**为什么没在本轮修**：它不在四个目标里，而且要修必须先稳定复现——
+本仓有先例（`DF-017` / `DF-026` 原文）：「没复现就改判据等于把『不知道』写成『知道』」。
+
+**影响**：每次全量测试都会红 4-6 条，导致「全绿才能提交」这条规则实际上做不到。
+这不是小问题——它会让所有人对红警免疫。
+
+### DF-090 [fixed] 硬门在认证一句假话：「2078 条 pass」是它自己逼着写的
+
+- 发现于：2026-11-24 修 DF-028 时，跑全量测试核对 `docs/GUIDE.md:512` 的那句话
+- 位置：`scripts/check-structure.mjs` 的 `checkTestCount()` / `TALLY_SITES`；`docs/GUIDE.md:512`
+- 证据（改前）：
+  ```
+  docs/GUIDE.md:512
+    **56 个测试文件，2080 项全绿**（…其中 **2078 条 pass、2 条按平台 skip**…）
+  node --test scripts/   →  ℹ tests 2080 / pass 2070 / fail 8 / skipped 2
+  ```
+  2080 这个总数是真的（注册数），所以「对账通过」也真的成立 —— 而「全绿」是假的。
+  更糟的是那处取数正则原本是 `(\d+)\s*项全绿`：**想通过硬门，文档里就必须出现「全绿」二字**。
+  门不只在盖章，它是这句话的作者。
+- 影响：一句需要**跑完全量测试**才能验证的话，被一句**只 import 不执行**的检查盖了绿章。
+  这比没有检查更坏：它让「硬门绿」这件事本身失去意义，而本仓把「硬门绿」当成提交门槛。
+- 评估过的三条修法（都否掉了，理由写进 `checkNoExecutionClaims()` 头注释）：
+  1. 硬门跑全量测试：实测 **258 秒**，且本门会被 `dispatch-coverage.test.mjs` 在副本里
+     跑多次；并发下那 7-8 条 flaky 用例会让门随机变红（DF-026，红警驯化成噪音）。
+  2. 硬门跑粗筛子集：仍要几十秒，且造出新的假话「粗筛全绿所以全量全绿」——
+     一条更隐蔽的同一类错误。
+  3. CI 跑、硬门核「与最近一次 CI 结果一致」：要把结果写回仓库，那份文件在本地永远旧，
+     「本地门绿」变成「上次 CI 时是对的」—— 一条**看不见它坏**的判据，比没有更坏。
+- 修法（第四条）：让文档**不再声称**它核不了的事。这不是降低标准，是把断言强度收回
+  到证据能支撑的位置：「N 条已注册」可核（import 数一遍）保留，「N 条 pass」核不了删掉，
+  「全绿」是前一句的推论随之删掉。
+  - `TALLY_SITES` 里 GUIDE 那行的正则改成 `(\d+)\s*条已注册`，与其余四处同一个命题。
+  - 新增硬门检查 `executionClaims`：扫四份自证文档（README / CLAUDE / GUIDE / CAPABILITIES），
+    行内同时出现「测试语汇」与「执行结果断言」即红。
+  - **跳过围栏代码块**：README 那段「AI 说 BUILD SUCCESS — 1341 例全绿」是被批判的反例，
+    不是对仓库的断言。不跳围栏会逼人删掉本产品最核心的那张图（实测 7 处误报）。
+  - **放行条件式 / 定义式**（「才能提交」/「绿的标准」/「不算绿」）：那是规矩，不是当前状态。
+- 负向证据（5 条，`regression-count.test.mjs` §4，全部真跑硬门子进程）：
+  ```
+  ✔ 文档声称「测试全绿」而硬门只核条数 → 必须红
+  ✔ 「2078 条 pass」这种带数的执行结果断言同样必须红
+  ✔ 负向：条件式「全绿才能提交」不是断言当前状态 —— 不许误报
+  ✔ 负向：围栏代码块里的反例不许误报（README 那张「AI 说 BUILD SUCCESS」就是这种）
+  ✔ 负向：讨论「这条测试为什么失败」不是执行结果断言 —— 不误报
+  ```
+  以及手工负向：把 GUIDE 那句假话放回去 →
+  `✗ [docs/GUIDE.md] 第 512 行 出现「全绿」—— 这是对执行结果的断言…`
+- 顺带抓出的漂移：`README.md` 两次写「29 项检查」，实际 30 条（本轮新增一条检查后由既有
+  的「N 项检查」对账抓出 —— 那条检查本身是好的，它证明了「数字漂了会被抓住」）。
+- 代价：结构门 +0 个子进程、+0.1 秒（纯文本扫描）；四份文档各改一行。
+- 建议归属：已完成。
+
+### DF-093 [fixed] 文档里的测试数漂了 11 条，而「四处同源」的机制本身没坏
+
+- 发现于：2026-11-24 加 DF-090 的测试后跑硬门
+- 位置：`README.md` / `CLAUDE.md` / `docs/GUIDE.md` / `.github/workflows/validate.yml`
+- 证据：改前四处写 2080，实跑注册 2093；硬门报
+  `[README.md] 回归测试数写的是 2082，实跑注册 2093 条（56 个文件）；换成 linux 平台也是 2093 条 → 与平台无关，是漏改文档`
+- 影响：无（这道门工作正常，红的就是它该红的）。**登记它的理由是反过来的**：
+  它是「门发现漂移」的正面样本，与 DF-090 的「门盖章假话」正好相反 ——
+  同一个文件里两条检查，一条在数事实（好），一条在认证结论（坏）。
+  这个对比值得留档：**判据该核事实，不该核结论**。
+- 修法：四处 2080 → 2107（测试数；并发 Agent 的 proc-liveness.test.mjs 同时进来，最终计数以硬门为准）；README 两处「29 项检查」→「30 项检查」。
+- 负向证据：改完重跑硬门 → `✓ 已执行的 30 条检查全部通过`。
+- 建议归属：已完成。
+
+### DF-091 [fixed] 探针失败一律说成「无权限 / 命令不可用」，而真实原因 100% 是超时
+
+- 发现于：2026-11-24 修 DF-028（判活探针在生产路径上完全失效）时
+- 位置：`scripts/watch.mjs` 的 `judgeProcess()`，`PID 存在但探不到启动时刻` 那条分支
+- 证据：本机复现（`OVERWATCH_STATE_DIR` 指向一份心跳停 4 天的状态目录）：
+  ```
+  ？ proc   PID 49984 存在，但探不到它的启动时刻（无权限 / 命令不可用）—— 无法确认是不是它
+  ```
+  而同一个 PID 真的在跑（`tasklist` 有它、`process.kill(pid, 0)` 成功），
+  真实原因是 `spawnSync('powershell', …, timeout: 5000)` **每次都撞满 5 秒超时**、
+  `stdout` 为空、`Date.parse('')` = NaN → 返回 null。
+  探针本身实测 **5–24 秒**（不是代码注释里那个 355–390ms 的旧数）。
+- 影响：用户照着「无权限 / 命令不可用」去查权限和 PATH，永远不会查到这里。
+  **一条把原因说错的错误信息比没有错误信息更坏**：它把人送到错误的方向，
+  而且看起来像已经排除了一种可能。
+- 修法：探针的失败原因升级成**枚举**（`PROBE_STATES`：`not-found` / `refused` /
+  `timeout` / `eperm` / `parse-failed` / `closed` / `error`），每个状态有自己的文案
+  （`probeFailureReason()`），且 `judgeProcess` 按状态落到不同的 verdict：
+  超时 → `unresponsive`（进程可能在，主循环没响应），端点不存在 → `gone`，
+  权限 → `unknown`（**判不了，不许说成死了**）。
+- 负向证据：`watch.test.mjs` 的
+  `DF-091 负向：端点连得上但读不到 beat → unresponsive，且文案说的是「超时」不是「无权限」`
+  —— 它同时断言 `reason` 含「没有读出 beat|超时」且**不含**「无权限|命令不可用」。
+  把旧文案放回去，这条立刻红。
+- 建议归属：已完成。
+
+### DF-092 [fixed] 判活的唯一实现依赖 spawn，而本机任何 spawn 都慢到必超时（DF-028 的根因）
+
+- 发现于：2026-11-24，`--health` 在守护进程明明在跑的时候说「判不了」
+- 位置：`scripts/watch.mjs` 的 `probeStartTimeOf()`（已删除）
+- 证据（全部本机实测，可复现）：
+  ```
+  powershell Get-Process .StartTime   5–24 秒   （超时 5000ms → 每次都杀）
+  累积的 powershell 进程               22 个 / 9 小时 / 约 1.7GB，每个 CPU 8–9 秒
+  where /q node（什么都不干）          2957ms
+  os.getPriority()                     10 = BelowNormal（Process Lasso 压的）
+  A/B：BelowNormal 13759ms → NORMAL 2804ms（即使 NORMAL 仍 2.8–6.3 秒，仍超时）
+  ```
+  结论：**不是 powershell 慢，是这台机器上任何 spawn 都慢**。缩短超时 / 换更轻的命令
+  都没有出路 —— 判活这条路必须不 spawn。
+- 影响：`--health` 的进程层**永远是 `unknown`**，而它的全部意义是区分
+  「进程死了（该重启）」与「进程卡住了（先看日志）」。这条判据存在但从未工作过。
+  `--inbox` 复用同一个判据，被连带打穿；`doctor` 的 watcher 项同理（连带造成 4600ms+ 的墙钟）。
+- 修法（新增 `scripts/proc-liveness.mjs`，`watch.mjs` 的判活改成调它）：
+  1. 守护进程启动时生成随机 **nonce**（12 字节 → 24 个十六进制字符），
+     用它建判活端点：Windows `\.\pipe\untildone-<nonce>`，POSIX `<stateDir>/liveness-<nonce>.sock`；
+  2. nonce / endpoint / pid / startedAt 一起写进 `proc.json`（version 2）；
+  3. **判活 = 连上端点 且读到一个 beat**。只判「连上」不够 —— 实测主线程冻结时
+     OS 仍接受连接（管道对象由内核持有），那会把 DF-023 那类「进程在、没在跑」判成健康；
+  4. 读 beat 的超时是新参数 `BEAT_TIMEOUT_MS = 800`（毫秒级，不是秒级）。
+- 实测（本机）：
+  ```
+  活着的端点：连上 + 读到 beat    首帧 13–35ms，后续 1–4ms
+  已关闭的端点：ENOENT            1–7ms
+  连得上但不应答：按注入的超时返回  300ms 用例实测 431ms 墙钟
+  ```
+- **为什么改成异步**：同步 `fs.openSync` + `fs.readSync` 在「端点存在但不回 beat」时
+  **永久阻塞**（实测 20 秒未返回；Windows 上 `O_NONBLOCK` 对命名管道无效）。
+  那比原来的 5 秒超时**更坏** —— 它会把 `--health` 整个挂死。所以
+  `probeLiveness` / `judgeProcess` / `healthCheck` 全部改成 Promise，三处调用方
+  （`--health` / `--inbox` / TUI）已同步改。
+- **PID 复用免疫（DF-028 的核心，不许为绿而削弱）**：判据从「时间容差」升级为
+  「**端点归属**」。PID 被复用 → 新进程用**它自己的** nonce，旧端点名不存在 →
+  连不上 → 判 `gone`/`unknown`，**与时间无关，没有 2 秒窗口可钻**。
+  时间容差降级为第二道交叉核对（帧里回带 pid / startedAt / nonce，任何一道不符 → `reused`）。
+  代码里**没有任何一条分支**会仅凭「PID 存在」返回 `alive: true`：那条退路配了两条负向用例
+  （端点关掉但 PID 在、nonce 不匹配但时间完全一致），它们都会红。
+- 负向证据（全真跑，见回复正文）：把 `probeLiveness` 改成永远返回 `timeout` →
+  `proc-liveness.test.mjs` **5 条红**，而 `watch.test.mjs` 的 DF-028 组 **12 条仍全绿**
+  （AC-4：逻辑与环境解耦）；`--health` 端到端在有真守护进程跑着时读到了真的 beat
+  （见下条「生产实测」）。
+- 代价：`healthCheck` 从同步变异步（签名不兼容，调用方三处全改）；新增一个模块
+  （14 条测试）。DFS-06/DF-069 等既有用例只加了 `await`，**断言一条未改**。
+- 建议归属：已完成。
+
+### DF-094 [fixed] 我给探针选的超时（800ms）会造出假告警 —— 而它当初的理由是「拍的三倍余量」
+
+- 发现于：2026-11-24 修完 DF-092 后，用真守护进程连探 60 次做验收，其中 **1 次**报
+  `unresponsive`（「进程卡住了，先看日志」），而那个守护进程一切正常
+- 位置：`scripts/proc-liveness.mjs` 的 `BEAT_TIMEOUT_MS`
+- 证据（本机实测，91 次真实 tick 的同步段耗时可复算）：
+  ```
+  p50     约   15ms   （jobs=8ms + probe 未到期）
+  次大   1059 / 1128ms
+  最大   2001ms       （probe=1992ms，一次 L-mid 扫了两个项目）
+  ```
+  第一版注释写的理由是「一次 tick 的同步段在 300ms 以内，取 800 是三倍余量」。
+  **那个 300ms 我没有量过，是估的**，而 91 条真实日志里最长的一次是 2001ms —— 差 6.7 倍。
+- 影响：800ms 会把**正常的慢 tick** 判成 `unresponsive`。这不是小概率：
+  实测 60 次探测里命中 1 次（约 1.7%）；L-mid 每 5 分钟一次、每次 0.4–2 秒，
+  在高峰期这个比例会更高。假告警的代价在本仓有明确判词 ——
+  「一条误报的代价是用户开始忽略所有通知，是断崖式的」。
+- 修法：`BEAT_TIMEOUT_MS` 800 → **3000**。取值有可复核的下界（必须 > 实测最大值 2001）
+  与可说明的余量（1.5 倍，给更慢的机器）。仍远在 AC-1 的 10 秒上限内。
+- **这一条为什么必须单独记**：它是「我用一个没量过的数当判据」的实例，而且是**我自己**
+  在同一次改动里犯的。修复前那版注释还写着「与 healthCheck 里 interval*3 的口径同构」——
+  那是在为一个拍出来的数找一个听起来有出处的说法。本仓反对的正是这个。
+- 负向证据：`proc-liveness.test.mjs` 的「探针默认超时必须是毫秒级」把它钉在
+  `>0 && <5000`；另有「超时判据必须按注入的 timeoutMs 生效」一条钉住它真的被用上。
+  改回 800 时，那条用例不会红（800 也在区间内）—— **这是已知的覆盖缺口**：
+  阈值本身只能靠「拿真实 tick 分布去核」来守，而那需要生产日志，不适合放进单测。
+  所以这条记录就是它的守卫。
+- 建议归属：已完成。
+
+### DF-095 [fixed] 「watch.mjs 只能 spawn 不能 import」是**一条入口守卫写错**造成的假约束，代价是 doctor 永远超预算
+
+- 发现于：2026-11-24 修完 DF-092 后复核 doctor（AC-8 要求 `WATCHER_COST_MS` 与实测同量级）
+- 位置：`scripts/watch.mjs` 的主模块判据；`scripts/overwatch.mjs` 的 `checkWatcherLive()`
+- 证据（本机实测）：
+  ```
+  doctor 的 watcher 那一项     3451ms      ← spawn 一整个 node
+  它问的那个问题（healthCheck）    2ms      ← 判活端点 1–20ms
+  ```
+  1000ms 的硬预算里 3451ms 永远超支 —— `docs/spec/2026-11-14-entry-point.md` §4
+  那句「1000ms 是硬约束」因此一直是假话。
+- 根因：`watch.mjs` 的「我是不是被直接执行」判据是 `/watch\.mjs$/`，而 `overwatch.mjs`
+  **以 `watch.mjs` 结尾** → import 会当场启动守护进程。当年（`2026-11-14`）的处置是
+  「那就 spawn 吧」，并把它写进了规格 §5.1 当作架构约束：
+  > `watcher` 的存活判定走 spawn —— 不能不 spawn，见 §5.1
+- 影响：**一条实现细节的副作用被当成了架构要求**。它的代价不只是慢：`doctor` 的
+  `watcherUnhealthy` / `watcherChecked` 两个结论全靠这一项，而它在默认预算下常常
+  直接被跳过（见下条 DF-096），于是「后台监视没在跑」这件事在 doctor 上大半时候看不见。
+- 修法：判据换成 `render-plan.mjs` / `launch.mjs` / `delivery-verdict.mjs` 已经用的
+  **同一份 realpath 比较**（两边 realpath 相等才算直接执行；失败退回 `resolve()`）。
+  然后 `doctor` 改成**在进程内** `import('./watch.mjs')` 调 `healthCheck()`，
+  只在导出形状变了时退回 spawn（不许猜）。
+- 实测（改后）：watcher 那一项 **3451ms → 34ms**（约 100 倍）；`doctor` 的 `workMs`
+  **762ms**（预算内）。`WATCHER_COST_MS` 420 → 120（420 与 34 差 12 倍，
+  撞 AC-8 的「不得差 10 倍以上」；120 = 34 × 3.5，给慢机器三倍余量）。
+- 负向证据：把守卫改回 `/watch[.]mjs$/` → `★ doctor 不会变成 watch` **红**
+  （实测 `Error: 入口超时或被信号终止（signal=SIGTERM … ETIMEDOUT） args=["doctor","--budget","30000"]`，
+  而手工跑会看到 stdout 里一行行 `tick …` 永不结束）。
+- 规格同步：`2026-11-14-entry-point.md` §5.1 / §5.2 原写着「必须 spawn」，
+  已改成「曾经必须，2026-11-24 修掉了根因」，并把「一条实现细节的副作用被写成架构要求」
+  这句话留在那里 —— 那是这一条真正的教训。
+- 建议归属：已完成。
+
+### DF-096 [fixed] 那条标着 `★` 的守护测试一直是**假绿**：它守的事从来没被执行过
+
+- 发现于：2026-11-24 做 DF-095 的负向验证时（把守卫改坏，它居然还是绿的）
+- 位置：`scripts/overwatch.test.mjs` 的 `★ doctor 不会变成 watch`
+- 证据：把 `watch.mjs` 的守卫改回 `/watch[.]mjs$/`（也就是把它改坏）后：
+  ```
+  ✔ ★ doctor 不会变成 watch … (2705ms)   ← 仍然是绿的
+  而手工跑：timeout 40 node scripts/overwatch.mjs --budget 30000 → exit 124，stdout 里 tick 一直刷
+  ```
+- 根因是**两个前置条件都没满足**，缺一不可：
+  1. 原来跑的是 `run(['doctor'])`（默认预算 1000ms），而 `watcher` 那一项在
+     「剩余 < `WATCHER_COST_MS`」时**整个被跳过** —— `checkWatcherLive` 根本没调；
+  2. 就算给了预算，`checkWatcherLive` 在「数据目录没有 `state.json`」时也**提前 return**
+     （「从未运行过」的正常分支），而 import 那一步在它**之后**。临时目录里当然没有 state.json。
+- 影响：这是本仓最该有牙齿的一条测试（它守的是「自检命令别把自己变成守护进程」），
+  而它**从来没有牙齿**。它绿的时候，读者会以为这件事被守住了。
+- 修法：夹具补上 `state.json`、预算给 30000，并**加一条前置断言**
+  （`watcher` 那一行必须出现在输出里、且不是「预算内没时间跑」）——
+  这样「测试没跑到」与「测试通过了」在报告里不同形。判据本身一字未改。
+- 负向证据：改坏守卫 → 该条 **红**，原话
+  `Error: 入口超时或被信号终止（signal=SIGTERM error=spawnSync … ETIMEDOUT）`。
+- **这一条与 DF-090 同构**：一条测试绿了，而它守的那件事根本没被执行。
+  区别是 DF-090 是硬门盖章（文档说全绿而没跑），这条是测试自己静默跳过自己的前置条件。
+- 建议归属：已完成。
+
+### DF-097 [fixed] 判活修好之后，同一个假告警从另一个原因又冒出来：`asked` 层把事件循环占住 70–103 秒
+
+- 发现于：2026-11-24 用真守护进程做 AC-1 验收（连探 90 秒），
+  `--health` 报 `3000ms 内没有读出 beat — 进程可能还在，但它的主循环没有响应`
+- 位置：`scripts/watch.mjs` `runTick()` 的 L-mid 段，`scanAll()` 的调用点
+- 证据（全部实测）：
+  ```
+  scanAll() 单次耗时                72306ms / 70039ms      （本机 1.3 GB transcript）
+  守护进程 tick 间隔 top2           103000ms / 97000ms     （正常 15000ms）
+  同期 --health                     3000ms 内没有读出 beat
+  ```
+  而 `--health` 那条结论是**对的** —— 事件循环真的被占住了 70 秒。
+  也就是说：`DF-092` 换掉探针之后，**判活第一次有能力看见这个既有缺陷**；
+  旧探针从未报过它（旧探针自己就超时，永远是 `unknown`，掩盖了这件事）。
+- 影响：`asked` 层每 5 分钟把守护进程冻住 70–100 秒。这段时间里：
+  · 判活端点答不出 beat（`unresponsive`，用户被告知「先看日志」）；
+  · L-fast（15 秒一次）的 job 探测**被整段跳过** —— DF-023 那一类「进程在、没在跑」
+    每 5 分钟复发一次，每次 70 秒。
+- 修法：把 `scanAll()` 挪到**子进程**（`runAskedScanInChild()`，跑 `asked.mjs --json`）。
+  判据一个字没动 —— 子进程跑的是同一个 `scanAll`，这里只换了执行位置。
+  同时给 `asked.mjs` 的 CLI 加三个注入点（`--projects-root` / `--sessions-root` / `--now`），
+  让子进程扫**同一个**语料、用**同一个**时钟（不传就会去扫真实语料，重现「同一轮两个时钟」）。
+  `--no-save`：历史文件由守护进程侧统一管，子进程不竞争写它。
+- 实测（改后）：tick 间隔 top5 = **17000 / 16000 / 16000 / 16000 / 16000**
+  （正常值）；150 秒内连探 **630 次，0 次非 beat，最大延迟 995ms**。
+- 失败语义：子进程没跑成时返回 `{ __failed }` 而不是空数组 —— 空数组会把
+  「我读不到」说成「没有人在问」，并且会推进 `lastAskedScanAt`，让下一次重试再等一个
+  `changed`。这是 `DF-089` 同一条纪律：**「没读到」与「读到空的」不许同形**。
+- 建议归属：已完成。
+
+### DF-098 [fixed] `readonly: true` 只是注释，5 个只读角色仍持有 `Write` —— 而给这个缺口做担保的那句「靠外壳检查兜住」是假的
+
+- 发现于：2026-11-24 用户问「锐评为什么在改文件」时，主线程核对角色定义；
+  2026-11-25 继续收 open 项时找到真正的形态。
+- 证据（实测，逐份 frontmatter）：
+  ```
+  oversight-acceptor    readonly=true   tools=Read, Grep, Glob, Write
+  oversight-critic      readonly=true   tools=Read, Grep, Glob, Write
+  oversight-redteam     readonly=true   tools=Read, Grep, Glob, Write
+  oversight-review      readonly=true   tools=Read, Grep, Glob, Write
+  oversight-verifier    readonly=true   tools=Read, Grep, Glob, Bash, Write
+  oversight-probe       readonly=true   tools=Read, Grep, Glob          ← 无 Write
+  oversight-safety      readonly=true   tools=Read, Grep, Glob          ← 无 Write
+  ```
+- 性质：`readonly` 是**本仓自己的约定字段**，宿主的 `tools` 白名单不知道它。
+  而 `tools:` **是**精确白名单（研究文档 `2026-11-10-agent-roles-audit.md` 已记），
+  所以 `Write` 是一个**真权限** —— 「只读角色」只读是因为它们自觉，不是因为它们不能。
+- **这一轮的真正发现：这把 `Write` 是被一句不存在的担保放行的。**
+  `check-structure.mjs` 的报错文案原本写着
+  「Write 仅限写报告，**且须靠外壳检查兜住**」——
+  而那个「外壳检查」不存在。实测：`pre-write-gate.mjs` 管的是
+  「第一次写之前读过项目没有」，与「这个角色能不能写这个文件」无关，
+  它连角色这个概念都不知道（全文搜 `role` / `critique.md` / `redteam.md` 无命中）。
+  一句不存在的担保比没有担保更坏：它让下一个人以为这里已经有人管了。
+- 第二个发现：放行判据本身**把禁令当成了授权**。
+  原正则 `/只允许写|只能写|只写报告|报告路径|不得修改/` 把两件事混成一个：
+  | | 例子 | 能否支撑「持有 Write」 |
+  |---|---|---|
+  | **授权** | 「你的 Write 只许写 `tasks/runs/<run-id>/critique.md`」 | 能 |
+  | **禁令** | 「不得修改被批判的对象」 | **不能** |
+  拿禁令换权限 = 这个角色可以写任何地方，只要别写被验的那个。
+  实测后果：`oversight-acceptor` 只写了「不得修改被验收的文件」，
+  于是它靠一句禁令拿到了 `Write`，而它从来没说过自己该写哪儿。
+  另外 `报告路径` 单独出现就够 —— 一句「报告路径见下」也能过。
+- 修法（判据变严，不是变松）：
+  正文必须**点名一个具体的 `.md` 路径**，且那句话含授权动词（`只允许写` / `只能写` /
+  `只写` / `写权限` / `仅限`）。这不是新增要求 ——
+  是把原本无人核对的那条边界变成可核对的。
+  - `oversight-acceptor.md` 补上「你的 `Write` 只允许写一个文件 —— `tasks/runs/<run-id>/acceptor.md`」，
+    并写清「禁令不是授权」这件事的原因。
+  - 删掉那句「且须靠外壳检查兜住」，换成说明「Edit 没有任何合法形态；Write 靠正文点名路径」。
+- 为什么不直接删 `Write`：SKILL.md 的 Phase E 要求裁决命令读
+  `tasks/runs/<run-id>/acceptor.md`、`redteam.md`；角色必须能落盘报告。
+  删掉 `Write` 会让验收流程无法产出它自己的输入 —— 那不是修，是换一种坏法。
+- 负向验证（两条）：
+  1. 删掉 acceptor 里那句点名路径 → 硬门红，且**只有它一个红**
+     （另三个本来就点明了路径，说明判据能区分）；
+  2. 造一个只写「报告路径见下 /** 不得修改任何文件 **」的角色 → 红（旧正则会放过它）。
+- **仍然未解决的部分（如实记下）**：判据核的是**角色定义的文字**，
+  不是运行时的写入行为。真正收窄需要在 PreToolUse 里按角色拦路径，
+  而宿主当前不把「我是哪个角色」告诉 hook。
+  所以现在的状态是：**边界从「无人核对」变成「有人核对且与定义一致」**，
+  而不是「物理上不可能越界」。这条差别必须写在这里，否则它又变成一句新的担保。
+- 建议归属：已完成（判据层）。运行时拦截是独立任务。
+
+### DF-099 [fixed] 我自己写的 `startDiff = Infinity` 会把一个**正在应答 beat 的活进程**判成「已退出」
+
+- 发现于：2026-11-24/25 锐评（另一个 Agent 复审 DF-092 的实现时抓到）
+- 位置：`scripts/watch.mjs` 的 `judgeProcess()`，`state === 'beat'` 那条分支
+- 证据：原写法
+  ```js
+  const startDiff = Number.isFinite(f.startedMs) && Number.isFinite(startedAtMs)
+    ? Math.abs(f.startedMs - startedAtMs)
+    : Infinity;
+  if (f.nonce !== nonce || Number(f.pid) !== pid || startDiff > toleranceMs) → reused
+  ```
+  `Infinity > toleranceMs` 恒为 true。于是**只要见证里的 `startedAt` 不可解析**，
+  一个 honestly 应答 beat 的活进程就被判 `alive:false / reused`。
+- 影响：处置方向正好反了 —— 从「先看日志」变成「直接重启」，而重启会把现场丢掉。
+  这正是本仓最反对的那类失效：**不知道被写成了证伪**。
+  更刺眼的是**消息生成处**特意写了 `startDiff !== Infinity` 来避免打印 `Infinity`，
+  却在**判决**上漏了同一个判断 —— 守住了消息，没守住结论。
+- 修法（锐评给的）：时间判不了 → 这一道核对**弃权**，交给 nonce / pid 两道
+  （它们本就足够强：nonce 是每个进程现生成的随机串）。
+  ```js
+  const timeComparable = Number.isFinite(f.startedMs) && Number.isFinite(startedAtMs);
+  const startDiff = timeComparable ? Math.abs(f.startedMs - startedAtMs) : null;
+  const timeMismatch = timeComparable && startDiff > toleranceMs;
+  ```
+- 负向证据：`watch.test.mjs` 的两条
+  - `DF-099：见证里缺 startedAt 时，端点正常应答 ≠ 判成 reused`
+  - `DF-099 反向：时间可判且差太多时，仍然要判 reused（别为了修上一条而削弱判据）`
+  两条一起钉住「弃权不等于放行」。
+- **记这一条的理由**：它是「我自己在同一轮里犯的第二种同型错误」——
+  DF-094 是拿没量过的数当判据，这条是把「判不了」编码成了「证伪」。
+  两者都发生在这次改动里，都被别人量出来 / 看出来，而不是我自己发现的。
+- 建议归属：已完成。
+
+### DF-100 [fixed] 负向验证脚本卡住 3.5 小时，末尾的 `cp 备份 → 原文件` 在文件已被改好之后才执行，把 20 分钟的修复整个盖掉
+
+- 发现于：2026-11-25 用户问「似乎有三个东西还在跑」时排查
+- 位置：我自己的调试脚本，以及 `scripts/watch.mjs`
+- 现场证据（进程的父 bash 命令行还留着）：
+  ```
+  node scripts/overwatch.mjs --budget 30000 > /tmp/neg-doctor.txt 2>&1
+  grep -nE "watch 启动|tick=|watcher " /tmp/neg-doctor.txt | head -5
+  cp /tmp/watch.bak scripts/watch.mjs; echo restored
+  ```
+  前一句把 `watch.mjs` 换成**旧判据**（为了负向验证「doctor 会变成 watch」），
+  中间那句 `node scripts/overwatch.mjs` **真的变成了守护进程**，永远不返回 ——
+  于是 `cp` 那句在 3.5 小时后、文件早已改好之后才执行，用 20:25 的备份覆盖了 21:44 的工作。
+- 损失：DF-099（`startDiff = Infinity`）与 DF-097（`runAskedScanInChild` 接线）两处修复消失。
+  `git diff --stat scripts/watch.mjs` 从 `444 insertions` 掉到 `322 insertions`。
+- **为什么这次能恢复**：`watch.test.mjs` 没有被覆盖，里面两条 DF-099 测试与三条 DF-097 测试
+  仍然描述着正确行为。**测试是唯一忠实于「我们想要什么」的副本**，而它比任何 `.bak` 都可信。
+  找回方式：`/tmp/watch2.bak`（21:44，含 DF-097 缺 DF-099）+ 重新应用 DF-099 + 两条负向验证。
+- 三条教训：
+  1. **负向验证必须用临时副本，不许原地改被测文件。** 原地改的脚本一旦中途卡住，
+     恢复语句就排在一个可能永不返回的命令后面 —— 这不是「运气不好」，
+     是「把清理动作放在了不可靠的续行上」。
+  2. **`cp file.bak file` 是最危险的回滚方式**：它不检查目标有没有更新过。
+     正确的做法是 `git stash` / 独立 worktree / 或者干脆不改树里的文件。
+  3. **备份文件名里的时间戳要当场看，不许凭「它叫 .bak」就当基线。**
+     这次 `/tmp/watch.bak`(20:25) 与 `/tmp/watch2.bak`(21:44) 差了 79 分钟，
+     而我一直以为它们是同一个东西。
+- 附带发现（同日独立记入 DF-101）：9 个 `watch.mjs` 孤儿进程同时在往同一个
+  `state.json` 写，tick 率实测 **4–10 次/分（应为 4）**，而 `claimOwnership` 只 warn 不拦。
+- 建议归属：已完成（文件已恢复 + 全量测试 2111 pass / 0 fail）。
+
+
+### DF-101 [fixed] 没有任何单例保护：9 个 `watch.mjs` 同时跑，共写一份 `state.json`，tick 率 4–10 次/分（应为 4）
+
+- 发现于：2026-11-25 用户报告「执行似乎也做完了，但还有东西在 run」时排查
+- 位置：`scripts/watch.mjs` 的 `claimOwnership()`（只记日志）、`startWatch()` 启动路径
+- 实测现场（2026-11-25 02:30 左右，本机）：
+  ```
+  14476  node scripts\watch.mjs                          常驻，18.5 小时，CPU 16600s
+  49984  node scripts\watch.mjs                          常驻，15.2 小时，CPU 15838s
+  42420/22180/54780/45400/38156/18280/52448  watch.mjs  各 40–4000s CPU
+  50844  node scripts/overwatch.mjs --budget 30000       预算 30 秒，实际跑了 3.5 小时
+  ```
+  其中 7 个能一一对上 `%TEMP%\ow-*\proc.json` —— 是测 DF-092 时用
+  `OVERWATCH_STATE_DIR=$T node scripts/watch.mjs &` 起的，脚本退出后成了孤儿。
+  另外 2 个（14476 / 49984）用的是**真实**数据目录。
+- 后果（实测，不是推测）：
+  - `watch.log` 每分钟 **4–10 条 tick**，而 `tick=15000ms` 只该有 4 条。
+  - `owner.json` 与 `proc.json` **互相覆盖**：查到的瞬间 `owner.json` 写着 PID 50844
+    (`overwatch doctor`)，`proc.json` 写着 PID 49984 —— 两份见证由不同进程各写各的。
+  - `--health` 因此指着一个**不是守护进程**的 PID 做判活，报「端点连上了但没 beat」。
+  - `state.notified` 是读-改-写，两个进程同时跑会互相吞掉对方的通知记录。
+- 修法：`checkSingleton(stateDir)`，**只在有肯定证据时拦**：
+  | 探针结果 | 处置 |
+  |---|---|
+  | `beat` 且 nonce/pid 与见证一致（→ `judgeProcess` 判 `stuck`、`alive:true`） | **拒绝启动**，exit 4 |
+  | `not-found` / `refused` / `closed`（→ `gone`） | 放行（该接手） |
+  | `timeout` / `eperm` / `parse-failed` / `error`（**判不了**） | 放行，只 warn |
+  | 旧版见证没有端点（只剩 PID） | 放行，只 warn |
+  | 见证里的 PID 就是自己 | 放行（`--once` 先 claim 时不许自锁） |
+- **为什么「判不了」也放行**：`--health` 那条路要「宁可说不知道」，这一条路要
+  「宁可多跑一个，也不让监控整个停掉」。一个被误判的 `timeout` 如果拦住启动，
+  用户得到的是一台**没有任何监控**的机器，屏幕上还写着「已经有一个在跑」。
+  这条原则在 `state-lost` 的处理里已经用过一次（不退出，从空状态继续）。
+- **为什么拒绝而不是接管**：接管会让「哪个进程在管事」变成运行时协商的结果 ——
+  两个进程都以为自己活着时最难查。拒绝把它变成一个当场可见的事实：非零退出 + 一句能照着做的事。
+- **位置是被实测逼出来的**：第一版把守卫放进 `runTick`，端到端测试立刻暴露两个错误 ——
+  第二个实例 ① 先建好自己的判活端点（日志出现「liveness 端点已就绪」）
+  ② 然后每 15 秒被拒一次、**永不退出**（`timeout 40` 杀掉，exit=124）。
+  移到 `startWatch` 最前面（建端点之前、第一轮 tick 之前）后：`exit=4`、5.2 秒返回、无端点日志。
+- 退出码选 4 而不是 0：0 会让 `install-watcher install`、开机自启、用户手敲把
+  「什么都没启动」当成成功，而屏幕上那句日志通常没人看 —— 又回到静默失效。
+- 测试 8 条（`DF-101：…` ×7 + 一条接线断言）。接线那条钉的是**位置**：
+  守卫必须在 `startLivenessServer` 之前，且全文件只许出现一次（放进 `runTick` 就会永久重试）。
+- 负向验证（两条，都执行了）：
+  1. `checkSingleton` 恒放行 → 「拒绝启动」那条转红，其余 7 条仍绿；
+  2. 在 `runTick` 里多插一份 → 接线测试转红。
+- 端到端验证（真进程，三个场景）：起第一个 → 起第二个 `exit=4` 且无端点日志 →
+  杀掉第一个再起第三个 → 放行。
+- 附带发现：端到端时第一次遇到的「拒绝」是真的 —— PID 47176 是上一轮漏杀的孤儿，
+  `Get-Process` 确认它活着。守卫抓的是真货，不是误判。
+- 建议归属：已完成。
+
+### DF-102 [fixed] 一轮 tick 跑 200 秒时 `--health` 说「卡住了」，而它手上明明有一条更强的证据
+
+- 发现于：2026-11-25，重启守护进程时实测到的 —— 20:55:42 启动，第一个 tick
+  扫全量语料到 **20:59:02** 才结束，整整 200 秒。这 200 秒里：
+
+  ```
+  ✗ proc   进程还在（PID 59128，判活端点应答了第 2 次 beat），但心跳已停
+           —— 它卡住了，重启前先看日志
+  ```
+
+- 锐评 2026-11-24 的原话是「最该重做的一条」，它当时的判断是对的。
+- **要害不是阈值太小，是结论没有用上已有的证据**：
+  - 判据采到的事实是真的：jobs 心跳确实 200 秒没动，上限 45 秒。
+  - 但它同时采到了**判活端点在应答第 2 次 beat**。asked 扫描在子进程里跑
+    （DF-097），事件循环是通的 —— 这正是「一轮正在推进」的确证。
+  - 结论那一句却只看第一件事，于是把「正在干活」说成「卡住了」，
+    处置从「等」变成「先看日志、准备重启」——**方向相反**。
+  这和 DF-099（`startDiff = Infinity`）是同一形态：证据采对了，判决那一步没重新想。
+- 修法：tick 开头写 `tickStartedAt`；`healthCheck` 判据是**时间先后**
+  （`tickStartedAt` 晚于该层最后一次推进 → 这一轮正在补它），产出 `running` 层。
+  `formatHealth` 用 `…` 而非 `✗`，结论是「正在跑一轮，已经 X」「什么都别做，等它跑完」。
+- **为什么不用「把上限调大」**：那会把真的卡死一起放过 —— 一个卡死 3 小时的进程
+  同样满足「没超过大上限」。要区分的是「在推进」与「没推进」，不是「多久」。
+- 反向防护（同批三个测试，缺一不可）：
+  - `真卡死时仍然要说卡死` —— 标记与心跳同龄 = 那一轮没跑完就死了，不许免责
+  - `残留标记不许被认成进行中` —— 标记早于心跳 = 上一轮的残留，判据是时间先后
+  - 负向验证已执行：把 `running` 恒置 false（修复前行为）→ 两条正向测试转红
+- 附带修的：`askedMs` 早就算出来了却**没拼进 tick 日志行**，于是一个 200 秒的 tick
+  在日志里只显示 `jobs=7ms probe=232ms`。现在有 `asked=…ms`。
+- 建议归属：已完成。测试 4 条（`DF-102：…`）。
+### DF-103 [fixed] `README-EN.md` 不在任何数字对账里，于是它停在 1792 而中文版已经 2125
+
+- 发现于：2026-11-25，继续收 open 项时顺手核了一遍两份 README
+- 位置：`scripts/check-structure.mjs` 的 `TALLY_SITES` 与 `EXEC_CLAIM_DOCS`
+- 实测差异（修前）：
+  | 位置 | README-EN 写的 | 实际 |
+  |---|---|---|
+  | 测试徽章 | 1792 passing | 2125 |
+  | 硬门条数（两处） | 23 checks | 30 |
+  | 生产脚本 | 54 | 62 |
+  | 测试文件 | 43 | 57 |
+  | 角色定义 | 12 | 13 |
+  | md 文件数 | 170 | 174 |
+- 根因不是笔误，是**判据的覆盖面**：`TALLY_SITES` 只列了 5 处（README 中文 / CLAUDE / GUIDE / CI），
+  英文版一处都没有。同一份文档的两个语言版本，只有一份被核对 —— 那另一份必然漂，
+  而且漂得再久也没人知道（它恰恰是英文访客最先看到的那份）。
+- 修法：
+  1. `TALLY_SITES` 增加 README-EN 的两处（徽章 + 正文），`required: false`
+     —— 与中文徽章同一个理由：没有徽章的项目不该被这条规矩判红。
+  2. 六处数字逐个改正（上表）。
+- 负向验证：把徽章改回 `1792` → 硬门红，消息点名 `README-EN.md` 与实跑值。
+- **附带的一个判断**：我查过 README-EN 有没有裸的「测试全绿」这类执行断言，
+  只有一处 `1341 tests green`，在代码块里（示例输出），`executionClaims` 本来就跳过围栏。
+  所以没有把它加进 `EXEC_CLAIM_DOCS` —— **不为了对称而加一个没有对象的检查**。
+- 建议归属：已完成。
+
+### DF-104 [fixed] `doctor` 把「预算不够没数成」编码成了「0 份 transcript」——这是那条长期 flaky 测试的根因
+
+- 发现于：2026-11-25。`overwatch.test.mjs` 的「有根且有 transcript」偶发变红，
+  此前一直按 DF-026 记成「并发下偶发」。这次拿到失败输出才发现不是偶发：
+  ```
+  transcripts …\ow-entry-GMBsfu\projects · 1 个（未完）项目 · 0 份 .jsonl（下限）
+  ```
+- 根因（`overwatch.mjs` 的 `checkTranscripts`）：
+  ```js
+  const sliceEnd = Math.min(Date.now() + ENUM_SLICE_MS, deadline);
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    projects++;
+    if (Date.now() > sliceEnd) { complete = false; break; }   // ← 位置错了
+  ```
+  机器被压满时，走到这里 `Date.now()` 已经超过 `sliceEnd` →
+  **首个目录都没读**就 break。于是「没时间数」被说成「0 份」。
+- 为什么这是真缺陷而不是测试问题：这两件事的**处置相反**。
+  - 「0 份」= 这台机器没有会话记录 → 用户该去装 Claude Code；
+  - 「没数完」= 我不知道有几份 → 用户不该下任何结论。
+  本仓反复反对的正是这个形态（DF-099 把「判不了」编码成「证伪」，DF-102 把
+  「正在跑」编码成「卡住」）。这是同一个月里的第三次同型错误。
+- 修法：`if (files > 0 && Date.now() > sliceEnd)` —— 判据改成「已经数到过东西了吗」。
+  有文件时提前停仍然允许（那是切片的本来目的），但**一个都没数到就不许停**。
+- 负向验证（确定性，不靠负载碰运气）：同样两个 `.jsonl`、同样 `--budget 1`
+  - 旧判据：`1 个（未完）项目 · 0 份 .jsonl（下限） · 没有可读的时间戳`
+  - 修复后：`1 个项目 · 2 份 .jsonl · 最新一份 11 秒前`
+- 新增测试 `DF-104`：用 `--budget 1` **确定性复现**这个条件。
+  不靠「机器忙的时候偶尔红」—— 那种测试没人会去修，只会被 skip 掉。
+- 副产品：DF-026 里「两条 overwatch 测试在并发下偶发红」的**其中一条至此有了根因**。
+  另一条仍未复现，继续挂 open。
+- 建议归属：已完成。
+
+### DF-105 [fixed] 测试夹具把 `spawnSync` 超时伪装成「输出为空」，于是失败信息指向错误的方向
+
+- 发现于：2026-11-25，全量并发跑到 `pre-write-gate.test.mjs` 的
+  `e2e：status 子命令读得懂现状` 偶发变红（耗时 29 秒，正常约 8 秒）
+- 失败原文：
+  ```
+  The input did not match the regular expression /marker state: exists/. Input: ''
+  ```
+- 它在说两件事中的哪一件？**看输出看不出来**：
+  - 「脚本没打印那一行」→ 去查 `pre-write-gate.mjs` 的 `status` 输出；
+  - 「`spawnSync` 被 20 秒超时 kill」→ 去查机器负载 / 并发度。
+  两件事处置相反，而空输出让它们**长得一模一样**。实测单跑 3/3 绿、全量并发下才红，
+  说明是后者 —— 但要先把 `signal` / `error` 打出来才能确认，这是 29 秒的代价。
+- 修法：`runHookProcess` 检查 `r.error || r.signal`，命中就抛一条说明
+  「这不是脚本的输出问题，是它没能跑完」并带上 signal/error。
+- 与既有条目的关系：**同一个月里的第四次同型错误** ——
+  DF-099（`startDiff = Infinity` 把「判不了」编码成「证伪」）、
+  DF-102（长 tick 被编码成「卡住了」）、DF-104（预算不够被编码成「0 份」），
+  加上这一条（超时被编码成「空输出」）。
+  四条的共同点都不是判据算错，而是**判据采到了真事实、结论那一步换了一种说法**。
+- 负向验证：这条的「负向」就是它自己 —— 修复前那条失败信息里没有 signal 字样；
+  修复后再遇到同样的超时，第一句就会是 `hook 进程超时或被信号终止（signal=SIGTERM …）`。
+- 建议归属：已完成。

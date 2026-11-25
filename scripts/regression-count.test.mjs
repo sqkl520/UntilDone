@@ -248,6 +248,11 @@ test('丙', () => {});
 test('删掉声明本身也要红——「没人再核它」比写错更坏', () => {
   const d = tmpRepo();
   try {
+    // 「必须声明测试数」是 **product 域**的规矩（DF-051）：它是本产品对外的自证位置。
+    // 别人的项目 README 里没有这个数，不是缺陷 —— 所以那条规则只在 productRepo=true 时判。
+    // 本用例要验的正是「本产品自己的仓库删掉声明会不会红」，因此显式声明 productRepo。
+    mkdirSync(join(d, '.untildone'), { recursive: true });
+    writeFileSync(join(d, '.untildone', 'checks.json'), JSON.stringify({ productRepo: true }, null, 2));
     const scripts = join(d, 'scripts');
     mkdirSync(scripts, { recursive: true });
     writeFileSync(join(scripts, 'a.test.mjs'), `
@@ -258,5 +263,90 @@ test('甲', () => {});
     const r = runGateIn(d);
     assert.match(`${r.out}`, /找不到回归测试数声明/,
       `文档里删掉数字必须红（否则数字漂了也没人知道）：\n${r.out}`);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+// ── 4. 硬门不许认证「执行结果」（DF-090）─────────────────────────────
+//
+// 2026-11-24 现场：`docs/GUIDE.md` 写着「2080 项全绿（2078 条 pass）」，实测
+// 2071 pass / 7 fail —— 而 `checkTestCount()` 给它盖了绿章，因为它**只核条数**。
+// 这一节钉两件事：
+//   1. 文档里出现「测试全绿 / N 条 pass」→ 硬门红（上面那条假话会被抓住）；
+//   2. 只是**规矩陈述**（「全绿才能提交」）或**围栏里的反例**不误报 ——
+//      判据过宽会让下一个人把整句删掉，而不是把断言改软。
+
+/** 这份 fixture 里 `productRepo` 必须为 true：那四份自证文档是**本产品自身的**
+ *  产物，别人的项目里没有它们是正常的（DF-051）。不声明它，那道检查在临时仓库里
+ *  整条不跑（`requireProduct()` 走 `productMissing`），于是本用例会**因为检查没跑**
+ *  而「通过」—— 那正是本仓吃过多次亏的自证。 */
+const EXEC_CLAIM_VIOLATION = /出现「[^」]*」—— 这是对\*\*执行结果\*\*的断言/;
+
+function execClaimFixture(readmeBody) {
+  const d = tmpRepo();
+  mkdirSync(join(d, '.untildone'), { recursive: true });
+  writeFileSync(join(d, '.untildone', 'checks.json'), JSON.stringify({ productRepo: true }, null, 2));
+  const scripts = join(d, 'scripts');
+  mkdirSync(scripts, { recursive: true });
+  writeFileSync(join(scripts, 'a.test.mjs'), `
+import { test } from 'node:test';
+test('甲', () => {});
+`);
+  // 条数声明必须存在且正确，否则「缺数字」那条违规会混进来（本用例只验执行结果那条）。
+  writeFileSync(join(d, 'README.md'),
+    `# 假仓库\n\n跑法：\`node --test scripts/\`（1 条回归测试；数字由硬门对账）。\n\n${readmeBody}\n`);
+  return d;
+}
+
+test('文档声称「测试全绿」而硬门只核条数 → 必须红（这就是 GUIDE 那句假话的形态）', () => {
+  const d = execClaimFixture('**1 个测试文件，1 项全绿**（其中 1 条 pass）');
+  try {
+    const r = runGateIn(d);
+    assert.match(r.out, EXEC_CLAIM_VIOLATION,
+      `「测试全绿」必须被拦下 —— 硬门跑不了用例，它没有资格认证这句话：\n${r.out}`);
+    assert.notEqual(r.code, 0, '有违规时退出码必须非 0');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('「2078 条 pass」这种带数的执行结果断言同样必须红', () => {
+  const d = execClaimFixture('全量回归跑完是 2078 条 pass、2 条 skip。');
+  try {
+    const r = runGateIn(d);
+    assert.match(r.out, EXEC_CLAIM_VIOLATION,
+      `「N 条 pass」也是对执行结果的断言，必须红：\n${r.out}`);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('负向：条件式「全绿才能提交」不是断言当前状态 —— 不许误报', () => {
+  // 判据过宽的失效方式是**逼人写更模糊的话**：把「全绿才能提交」也判红，
+  // 下一步就是有人把它整句删掉，而那条规矩是真的、值得留着。
+  const d = execClaimFixture('硬门和全量测试两者都绿才能提交。');
+  try {
+    const r = runGateIn(d);
+    assert.doesNotMatch(r.out, EXEC_CLAIM_VIOLATION,
+      `「才能提交」是提交门槛，不是「此刻已经绿了」——不许误报：\n${r.out}`);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('负向：围栏代码块里的反例不许误报（README 那张「AI 说 BUILD SUCCESS」就是这种）', () => {
+  // README 的真身里有一段被批判的假话示例：
+  //     AI 说：「## 交付完成：BUILD SUCCESS — 1341 例全绿」
+  // 它是**反例**，不是对仓库的断言。判据若不跳过围栏，会逼人删掉本产品最核心的那张图。
+  const d = execClaimFixture(['```', 'AI 说：「## 交付完成：BUILD SUCCESS — 1341 例全绿」', '```'].join('\n'));
+  try {
+    const r = runGateIn(d);
+    assert.doesNotMatch(r.out, EXEC_CLAIM_VIOLATION,
+      `围栏内的示例不是断言 —— 不许误报：\n${r.out}`);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('负向：讨论「这条测试为什么失败」不是执行结果断言 —— 不误报', () => {
+  // 「通过 / 失败」这两个词本身是正常内容（GUIDE 整节都在讲怎么读失败输出）。
+  // 被禁的是**带数或带绝对判断**的形态。判据写成「出现 fail 就红」会把
+  // 本仓最有用的一节变成不能写的东西。
+  const d = execClaimFixture('这条测试失败时先判断哪边对——测试也可能过期。');
+  try {
+    const r = runGateIn(d);
+    assert.doesNotMatch(r.out, EXEC_CLAIM_VIOLATION,
+      `讨论失败原因不是断言执行结果：\n${r.out}`);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
